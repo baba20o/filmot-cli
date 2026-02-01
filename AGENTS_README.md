@@ -245,6 +245,32 @@ Instead of single terms, combine related concepts:
 filmot search '"AI safety" regulation|"AI governance" policy' --full --lang en
 ```
 
+### Tip 8: Title Search for Proper Nouns/Neologisms (Critical!)
+**This is crucial for tracking viral phenomena or brand names.** 
+
+Phonetic transcription doesn't reliably capture proper nouns, brand names, or neologisms. For example, "Clawdbot" might be transcribed as "clawd bot", "claude bot", or missed entirely.
+
+**The workaround:** Use generic transcript terms combined with the `--title` filter:
+
+```bash
+# WRONG: Direct search often returns nothing
+filmot search "clawdbot" --full
+
+# RIGHT: Search generic terms, filter by title
+filmot search 'AI|robot|open source' --title "clawdbot" --full
+```
+
+**Important limitation:** The CLI returns results weighted by relevance/views, which means it will **miss zero-view origin videos**. For true viral archaeology (finding the first video ever made on a topic), you may need:
+1. The Filmot website's date sort (oldest first)
+2. A CSV export from Filmot website
+
+**Real example:** Tracking Clawdbot's viral rise
+- CLI search found 169 videos but missed the true origin
+- Website date-sorted search revealed: **Jan 15, 2026** - "Open Source Friday with Clawdbot 🦀" by Andrea Griffiths (0 views, 151 subs) - the inventor's first interview
+- The CLI missed this because: 0 views = low relevance, no transcript = no matches
+
+**Key insight:** When researching viral phenomena, the CLI excels at finding the *explosion* (high-view videos), but the website excels at finding the *spark* (origin videos).
+
 ---
 
 ## Understanding Search Results
