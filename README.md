@@ -112,18 +112,19 @@ Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The
 | **AND** | `word1 word2` | Both words must appear (implicit) | `python tutorial` |
 | **OR** | `word1 \| word2` | Either word can match | `"9 11" \| "nine eleven"` |
 | **Phrase** | `"exact phrase"` | Words must appear adjacent, in order | `"machine learning"` |
+| **Grouping** | `(expr1 \| expr2)` | Group expressions for complex queries | `python ("tutorial" \| "course")` |
 
 #### Advanced Operators
 
 | Operator | Syntax | Description | Example |
 |----------|--------|-------------|---------|
 | **Proximity** | `"words here"~N` | Words within N words of each other | `"cat dog"~5` |
-| **NEAR** | `word1 NEAR/N word2` | Words within N words, any order | `hello NEAR/3 world` |
-| **NOTNEAR** | `word1 NOTNEAR/N word2` | word1 NOT within N words of word2 | `python NOTNEAR/10 beginner` |
+| **NEAR** | `word1 NEAR/N word2` | Words within N words, any order (max 500) | `hello NEAR/3 world` |
+| **NOTNEAR** | `word1 NOTNEAR/N word2` | word1 NOT within N words of word2 (max 500) | `python NOTNEAR/10 beginner` |
 | **NOT** | `-word` | Exclude videos containing word (global) | `python -beginner` |
-| **Wildcard** | `word*` | Prefix matching | `program*` matches programming, programmer |
-| **Quorum** | `"word1 word2 word3"/N` | At least N of the words must match | `"the world is wonderful"/3` |
-| **Strict Order** | `word1 << word2` | word1 must appear before word2 | `introduction << conclusion` |
+| **Wildcard** | `"word * word"` | Match exactly one word in between | `"sentiment * shared"` |
+
+> **⚠️ Not Supported:** Prefix wildcards (`thermo*`), Quorum (`"words"/N`), and Strict Order (`<<`) are not currently supported by the Filmot API.
 
 > **💡 NOTNEAR vs NOT:** The NOT operator (`-word`) excludes the **entire video** if the excluded word appears **anywhere** in the transcript. NOTNEAR is usually more practical — it only excludes matches where the terms appear close together. For example, `python NOTNEAR/10 beginner` finds "python" mentions that aren't in a beginner context (max distance: 500 words).
 
@@ -142,7 +143,9 @@ filmot search '"artificial intelligence" | "A.I." | "AI"'
 filmot search '"iPhone" | "i phone" | "i-phone"'
 ```
 
-#### Combining Operators
+#### Combining Operators with Grouping
+
+Use parentheses `()` to build complex queries combining multiple operators:
 
 ```bash
 # Python AND (tutorial OR course)
@@ -156,6 +159,9 @@ filmot search '"deep learning" "tensorflow"~5'
 
 # Find Python content that's NOT in a beginner context
 filmot search 'python NOTNEAR/10 beginner'
+
+# Complex: Find Filmot mentions near YouTube-related terms (with spelling variations)
+filmot search '("filmot" | "philmot" | "filmont") NEAR/50 ("youtube" | "transcript" | "subtitle")'
 
 # Find advanced Python discussions (exclude videos with "beginner" anywhere)
 filmot search 'python "advanced" -beginner'
