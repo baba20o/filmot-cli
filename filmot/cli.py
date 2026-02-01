@@ -799,6 +799,200 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
         _display_subtitle_results(results, query)
 
 
+# ========== TRANSCRIPT DOWNLOAD ==========
+
+@cli.command()
+@click.argument("video_id")
+@click.option("--lang", "-l", default=None, help="Preferred language code (e.g., en, es, de)")
+@click.option("--timestamps", "-t", is_flag=True, help="Include timestamps for each segment")
+@click.option("--chunk", "-c", default=None, type=float, help="Chunk transcript into N-minute segments")
+@click.option("--raw", is_flag=True, help="Output raw JSON response")
+@click.option("--output", "-o", default=None, help="Save transcript to file")
+@click.option("--full", is_flag=True, help="Output complete transcript text (for AI processing)")
+def transcript(video_id: str, lang: str, timestamps: bool, chunk: float, 
+               raw: bool, output: str, full: bool):
+    """Download full YouTube transcript for deep analysis.
+    
+    This command fetches the complete transcript of a YouTube video,
+    enabling AI agents to go beyond search snippets and truly understand
+    video content.
+    
+    VIDEO_ID can be:
+    
+    \b
+      - Just the ID: dQw4w9WgXcQ
+      - Full URL: https://youtube.com/watch?v=dQw4w9WgXcQ
+      - Short URL: https://youtu.be/dQw4w9WgXcQ
+    
+    Examples:
+    
+    \b
+        filmot transcript dQw4w9WgXcQ
+        
+        filmot transcript "https://youtube.com/watch?v=VIDEO_ID" --full
+        
+        filmot transcript VIDEO_ID --timestamps --chunk 5
+        
+        filmot transcript VIDEO_ID -o transcript.txt
+        
+        filmot transcript VIDEO_ID --raw > data.json
+    """
+    from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp
+    import json
+    
+    with console.status(f"[bold green]Fetching transcript..."):
+        languages = [lang] if lang else None
+        
+        if chunk:
+            result = get_transcript_with_timestamps(video_id, languages, chunk_minutes=chunk)
+        else:
+            result = get_transcript(video_id, languages)
+    
+    if "error" in result:
+        console.print(f"[red]Error: {result['error']}[/red]")
+        console.print(f"[dim]Video ID: {result.get('video_id', video_id)}[/dim]")
+        return
+    
+    # Raw JSON output
+    if raw:
+        import json
+        print(json.dumps(result, indent=2))
+        return
+    
+    # Save to file
+    if output:
+        try:
+            with open(output, 'w', encoding='utf-8') as f:
+                if output.endswith('.json'):
+                    import json
+                    json.dump(result, f, indent=2)
+                else:
+                    # Plain text output
+                    if timestamps and 'segments' in result:
+                        for seg in result['segments']:
+                            ts = format_timestamp(seg['start'])
+                            f.write(f"[{ts}] {seg['text']}\n")
+                    else:
+                        f.write(result['full_text'])
+            console.print(f"[green]✓ Saved transcript to: {output}[/green]")
+            return
+        except Exception as e:
+            console.print(f"[red]Error saving file: {e}[/red]")
+            return
+    
+    # Full text output (for AI agents)
+    if full:
+        # Print metadata header
+        console.print(Panel(
+            f"[bold]Video ID:[/bold] {result['video_id']}\n"
+            f"[bold]Language:[/bold] {result['language']} {'(auto-generated)' if result.get('is_generated') else '(manual)'}\n"
+            f"[bold]Duration:[/bold] {format_timestamp(result.get('duration_seconds', 0))}\n"
+            f"[bold]Segments:[/bold] {result.get('segment_count', 0)}",
+            title="Transcript Info"
+        ))
+        
+        # Print full transcript
+        if chunk and 'chunks' in result:
+            for c in result['chunks']:
+                console.print(f"\n[bold cyan][{c['start_formatted']}][/bold cyan]")
+                console.print(c['text'])
+        else:
+            console.print(f"\n{result['full_text']}")
+        return
+    
+    # Default: Show with timestamps if available
+    if timestamps and 'segments' in result:
+        console.print(Panel(
+            f"[bold]Video ID:[/bold] {result['video_id']}\n"
+            f"[bold]Language:[/bold] {result['language']} {'(auto-generated)' if result.get('is_generated') else '(manual)'}\n"
+            f"[bold]Duration:[/bold] {format_timestamp(result.get('duration_seconds', 0))}\n"
+            f"[bold]Segments:[/bold] {result.get('segment_count', 0)}",
+            title="Transcript"
+        ))
+        for seg in result['segments']:
+            ts = format_timestamp(seg['start'])
+            console.print(f"[dim][{ts}][/dim] {seg['text']}")
+    elif chunk and 'chunks' in result:
+        console.print(Panel(
+            f"[bold]Video ID:[/bold] {result['video_id']}\n"
+            f"[bold]Language:[/bold] {result['language']}\n"
+            f"[bold]Chunks:[/bold] {len(result['chunks'])} × {result['chunk_minutes']} min",
+            title="Chunked Transcript"
+        ))
+        for c in result['chunks']:
+            console.print(f"\n[bold yellow]━━━ {c['start_formatted']} ━━━[/bold yellow]")
+            console.print(c['text'][:500] + "..." if len(c['text']) > 500 else c['text'])
+    else:
+        # Just show summary and excerpt
+        console.print(Panel(
+            f"[bold]Video ID:[/bold] {result['video_id']}\n"
+            f"[bold]Language:[/bold] {result['language']} {'(auto-generated)' if result.get('is_generated') else '(manual)'}\n"
+            f"[bold]Duration:[/bold] {format_timestamp(result.get('duration_seconds', 0))}\n"
+            f"[bold]Characters:[/bold] {len(result.get('full_text', ''))}",
+            title="Transcript Summary"
+        ))
+        text = result.get('full_text', '')
+        if len(text) > 1000:
+            console.print(f"\n{text[:1000]}...\n")
+            console.print("[dim]Use --full to see complete transcript[/dim]")
+        else:
+            console.print(f"\n{text}")
+
+
+@cli.command()
+@click.argument("video_id")
+@click.argument("query")
+@click.option("--context", "-c", default=2, type=int, help="Number of segments for context (default: 2)")
+@click.option("--lang", "-l", default=None, help="Preferred language code")
+def transcript_search(video_id: str, query: str, context: int, lang: str):
+    """Search within a video's transcript.
+    
+    Finds all occurrences of a term within a video and shows context.
+    Useful for navigating to specific parts of long videos.
+    
+    Examples:
+    
+    \b
+        filmot transcript-search VIDEO_ID "fusion"
+        
+        filmot transcript-search VIDEO_ID "reactor" --context 3
+    """
+    from .transcript import search_in_transcript
+    
+    with console.status(f"[bold green]Searching transcript for '{query}'..."):
+        languages = [lang] if lang else None
+        result = search_in_transcript(video_id, query, context, languages)
+    
+    if "error" in result:
+        console.print(f"[red]Error: {result['error']}[/red]")
+        return
+    
+    console.print(Panel(
+        f"[bold]Video ID:[/bold] {result['video_id']}\n"
+        f"[bold]Query:[/bold] {result['query']}\n"
+        f"[bold]Matches:[/bold] {result['match_count']}",
+        title="Transcript Search"
+    ))
+    
+    if result['match_count'] == 0:
+        console.print("[yellow]No matches found in transcript.[/yellow]")
+        return
+    
+    for i, match in enumerate(result['matches'], 1):
+        console.print(f"\n[bold cyan]Match {i} @ {match['timestamp']}[/bold cyan]")
+        # Highlight the query in context
+        highlighted = match['context'].replace(
+            query, f"[bold red]{query}[/bold red]"
+        ).replace(
+            query.lower(), f"[bold red]{query.lower()}[/bold red]"
+        ).replace(
+            query.upper(), f"[bold red]{query.upper()}[/bold red]"
+        ).replace(
+            query.capitalize(), f"[bold red]{query.capitalize()}[/bold red]"
+        )
+        console.print(f"  {highlighted}")
+
+
 def main():
     """Entry point for the CLI."""
     cli()

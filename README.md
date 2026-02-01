@@ -8,6 +8,7 @@ A powerful command-line interface for the [Filmot](https://filmot.com/) YouTube 
 - 🔍 **Subtitle Search** — Find videos by transcript/subtitle content with 24 filter options
 - 📺 **Video Metadata** — Get comprehensive details for any YouTube video
 - 📢 **Channel Discovery** — Search and explore YouTube channels by name or handle
+- 📝 **Transcript Download** — Fetch full YouTube transcripts for deep content analysis
 - 🎨 **Rich Terminal UI** — Beautiful formatted output with tables, colors, and clickable links
 - 🤖 **AI Agent Mode** — Full output mode with no truncation for LLM/agent workflows
 - 📤 **Raw JSON Mode** — Export raw API responses for scripting and automation
@@ -110,7 +111,6 @@ Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The
 |----------|--------|-------------|---------|
 | **AND** | `word1 word2` | Both words must appear (implicit) | `python tutorial` |
 | **OR** | `word1 \| word2` | Either word can match | `"9 11" \| "nine eleven"` |
-| **NOT** | `-word` or `!word` | Word must NOT appear | `python -beginner` |
 | **Phrase** | `"exact phrase"` | Words must appear adjacent, in order | `"machine learning"` |
 
 #### Advanced Operators
@@ -120,7 +120,7 @@ Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The
 | **Proximity** | `"words here"~N` | Words within N words of each other | `"cat dog"~5` |
 | **NEAR** | `word1 NEAR/N word2` | Words within N words, any order | `hello NEAR/3 world` |
 | **Wildcard** | `word*` | Prefix matching | `program*` matches programming, programmer |
-| **Quorum** | `"word1 word2 word3"/2` | At least N of the words must match | `"the world is wonderful"/3` |
+| **Quorum** | `"word1 word2 word3"/N` | At least N of the words must match | `"the world is wonderful"/3` |
 | **Strict Order** | `word1 << word2` | word1 must appear before word2 | `introduction << conclusion` |
 
 #### OR with Phrases (Handling Transcription Variations)
@@ -141,8 +141,8 @@ filmot search '"iPhone" | "i phone" | "i-phone"'
 #### Combining Operators
 
 ```bash
-# Must mention Python, either tutorial or course, but not beginner
-filmot search 'python ("tutorial" | "course") -beginner'
+# Python AND (tutorial OR course)
+filmot search 'python ("tutorial" | "course")'
 
 # Find "machine learning" near "neural network" within 10 words
 filmot search '"machine learning" NEAR/10 "neural network"'
@@ -197,6 +197,47 @@ python main.py video "dQw4w9WgXcQ,abc123def,xyz789ghi"
 # Raw JSON output
 python main.py video dQw4w9WgXcQ --raw
 ```
+
+### Download Transcripts
+
+Fetch full YouTube transcripts for deep content analysis. This goes beyond search snippets — get the **complete** video content:
+
+```bash
+# Get transcript summary (shows excerpt)
+filmot transcript VIDEO_ID
+
+# Get FULL transcript (for AI processing)
+filmot transcript VIDEO_ID --full
+
+# Chunk transcript into 10-minute segments (easier to navigate)
+filmot transcript VIDEO_ID --chunk 10
+
+# Include timestamps for each segment
+filmot transcript VIDEO_ID --timestamps
+
+# Save to file
+filmot transcript VIDEO_ID -o transcript.txt
+
+# Export as JSON
+filmot transcript VIDEO_ID --raw > data.json
+
+# Works with YouTube URLs too
+filmot transcript "https://youtube.com/watch?v=VIDEO_ID" --full
+```
+
+### Search Within Transcripts
+
+Find specific terms within a video's transcript with context:
+
+```bash
+# Find all mentions of "fusion" in a video
+filmot transcript-search VIDEO_ID "fusion"
+
+# Get more context around matches
+filmot transcript-search VIDEO_ID "reactor" --context 3
+```
+
+This is perfect for navigating long videos — jump directly to the relevant timestamps!
 
 ### Search Channels
 

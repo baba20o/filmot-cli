@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "filmot-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "A powerful CLI for searching YouTube transcripts via the Filmot API"
 readme = "README.md"
 license = {text = "MIT"}
@@ -32,6 +32,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "click>=8.0.0",
     "rich>=13.0.0",
+    "youtube-transcript-api>=0.6.0",
 ]
 
 [project.optional-dependencies]
