@@ -158,11 +158,11 @@ class FilmotClient:
             min_likes: Minimum like count
             max_likes: Maximum like count
             country: Country code (integer, e.g., 153=UK, 217=US)
-            channel_id: Limit search to specific channel ID
+            channel_id: Limit search to specific channel ID(s). Accepts multiple comma-delimited IDs.
             title: Filter by video title
             start_duration: Minimum video duration in seconds
             end_duration: Maximum video duration in seconds
-            search_manual_subs: Set to 1 to search manual subtitles (default: auto)
+            search_manual_subs: 0=auto subtitles (default), 1=manual subtitles only. Cannot search both.
             start_date: Start date filter (yyyy-mm-dd)
             end_date: End date filter (yyyy-mm-dd)
             sort_field: Sort by field (e.g., "viewcount")

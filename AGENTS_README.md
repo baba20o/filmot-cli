@@ -88,6 +88,9 @@ Search within a specific channel or find top channels on a topic:
 # Search specific channel by ID
 filmot search 'AI safety' --channel-id UCxxxxxx --full --lang en
 
+# Search multiple channels at once (comma-delimited)
+filmot search 'AI safety' --channel-id UCxxxxxx,UCyyyyyy,UCzzzzzz --full --lang en
+
 # Find top channels discussing a topic, then search those
 filmot search 'machine learning' --channel "programming" --channel-count 5 --full --lang en
 ```
@@ -98,6 +101,8 @@ Find popular content on a topic:
 ```bash
 filmot search 'prompt injection' --min-views 100000 --sort viewcount --order desc --full --lang en
 ```
+
+**Available sort fields:** `viewcount`, `likecount`, `uploaddate`, `duration`, `chanrank`, `id`
 
 ### 9. Duration Filtering
 Find long-form content (deep dives) or short explainers:
@@ -245,7 +250,20 @@ Instead of single terms, combine related concepts:
 filmot search '"AI safety" regulation|"AI governance" policy' --full --lang en
 ```
 
-### Tip 8: Title Search for Proper Nouns/Neologisms (Critical!)
+### Tip 8: Manual vs Auto Subtitles
+By default, Filmot searches **auto-generated subtitles** (YouTube's speech-to-text). Use `--manual-subs` to search **manually uploaded subtitles** only:
+
+```bash
+# Search auto subs (default) - better coverage
+filmot search 'quantum computing' --full --lang en
+
+# Search manual subs only - often higher quality
+filmot search 'quantum computing' --manual-subs --full --lang en
+```
+
+**Important:** You cannot search both in the same request. Auto subs have far more coverage; manual subs are rarer but more accurate.
+
+### Tip 9: Title Search for Proper Nouns/Neologisms (Critical!)
 **This is crucial for tracking viral phenomena or brand names.** 
 
 Phonetic transcription doesn't reliably capture proper nouns, brand names, or neologisms. For example, "Clawdbot" might be transcribed as "clawd bot", "claude bot", or missed entirely.
@@ -428,6 +446,19 @@ Some videos are region-locked, deleted, or private. Move on to another source.
 ### No transcript available
 Some videos don't have transcripts (live streams, music, etc.). The command will return an error.
 
+### IP Blocked
+YouTube may block your IP for transcript requests. Use proxy options:
+
+```bash
+# Use a specific proxy
+filmot transcript VIDEO_ID --proxy http://user:pass@host:port --full
+
+# Or set WEBSHARE_PROXY_USERNAME and WEBSHARE_PROXY_PASSWORD in .env
+
+# To bypass proxy and connect directly (even if env vars are set)
+filmot transcript VIDEO_ID --no-proxy --full
+```
+
 ### Rate limiting
 If making many requests, you might hit API limits. Space out requests if needed.
 
@@ -457,6 +488,9 @@ The power of this tool is **finding what people actually said**, not what videos
 
 | Task | Command |
 |------|---------|
+| Multi-channel search | `filmot search "query" --channel-id UC1,UC2,UC3 --full` |
+| Sort by likes | `filmot search "query" --sort likecount --order desc --full` |
+| Manual subs only | `filmot search "query" --manual-subs --full` |
 | Basic search | `filmot search "query" --full --lang en` |
 | Phrase search | `filmot search '"exact phrase"' --full --lang en` |
 | OR search | `filmot search 'term1\|term2' --full --lang en` |

@@ -130,6 +130,19 @@ def get_api() -> YouTubeTranscriptApi:
     return _api
 
 
+def disable_proxy() -> None:
+    """
+    Disable proxy and use direct connection.
+    
+    Useful when you want to bypass proxy settings from environment
+    variables and connect directly.
+    """
+    global _api, _proxy_configured, _initialized
+    _api = YouTubeTranscriptApi()
+    _proxy_configured = False
+    _initialized = True
+
+
 def is_proxy_configured() -> bool:
     """Check if a proxy is configured."""
     _init_api()

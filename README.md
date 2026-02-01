@@ -177,7 +177,7 @@ filmot search 'python "advanced" -beginner'
 | `--page, -p` | Page number (50 results/page) | `--page 2` |
 | `--category, -c` | Video category | `--category "Education"` |
 | `--exclude` | Exclude categories (comma-separated) | `--exclude "Music,Gaming"` |
-| `--channel-id` | Limit to specific channel ID | `--channel-id UCxyz...` |
+| `--channel-id` | Limit to specific channel ID(s), comma-delimited | `--channel-id UCxyz...,UCabc...` |
 | `--channel` | Search within channels matching text | `--channel "tech"` |
 | `--channel-count` | Max channels for `--channel` (default 10) | `--channel-count 5` |
 | `--title` | Filter by video title | `--title "review"` |
@@ -191,9 +191,9 @@ filmot search 'python "advanced" -beginner'
 | `--end-date` | Videos before date (yyyy-mm-dd) | `--end-date 2024-12-31` |
 | `--country` | Country code (see table below) | `--country 217` |
 | `--license` | 1=Standard, 2=Creative Commons | `--license 2` |
-| `--sort` | Sort by: `viewcount` or `date` | `--sort viewcount` |
+| `--sort` | Sort by: `viewcount`, `likecount`, `uploaddate`, `duration`, `chanrank`, `id` | `--sort viewcount` |
 | `--order` | Order: `asc` or `desc` | `--order desc` |
-| `--manual-subs` | Search manual subtitles only | `--manual-subs` |
+| `--manual-subs` | Search manual subtitles only (default: auto subs). Cannot search both. | `--manual-subs` |
 | `--max-query-time` | Max query time (4-15000 ms) | `--max-query-time 5000` |
 | `--hit-format` | 0=context snippets, 1=full lines | `--hit-format 1` |
 | `--full` | Show all matches (no truncation) | `--full` |

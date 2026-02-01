@@ -57,9 +57,9 @@ def cli():
 @click.option("--end-date", default=None, help="End date (yyyy-mm-dd)")
 @click.option("--country", default=None, type=int, help="Country code (e.g., 217=US, 153=UK)")
 @click.option("--license", "license_type", default=None, type=click.Choice(["1", "2"]), help="License: 1=Standard, 2=Creative Commons")
-@click.option("--sort", default=None, type=click.Choice(["viewcount", "date"]), help="Sort field")
+@click.option("--sort", default=None, type=click.Choice(["viewcount", "likecount", "uploaddate", "duration", "chanrank", "id"]), help="Sort field")
 @click.option("--order", default=None, type=click.Choice(["asc", "desc"]), help="Sort order")
-@click.option("--manual-subs", is_flag=True, help="Search manual subtitles instead of auto")
+@click.option("--manual-subs", is_flag=True, help="Search manual subtitles only (default: auto subs). Cannot search both in same request.")
 @click.option("--max-query-time", default=None, type=int, help="Max query time in ms (4-15000)")
 @click.option("--hit-format", default=None, type=click.Choice(["0", "1"]), help="Hit format: 0=context, 1=full lines")
 @click.option("--full", is_flag=True, help="Show all matches (no truncation) - useful for AI agents")
@@ -825,9 +825,10 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
 @click.option("--output", "-o", default=None, help="Save transcript to file")
 @click.option("--full", is_flag=True, help="Output complete transcript text (for AI processing)")
 @click.option("--proxy", default=None, help="HTTP/HTTPS proxy URL (e.g., http://user:pass@host:port)")
+@click.option("--no-proxy", is_flag=True, help="Disable proxy (ignore env vars, connect directly)")
 @click.pass_context
 def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float, 
-               raw: bool, output: str, full: bool, proxy: str):
+               raw: bool, output: str, full: bool, proxy: str, no_proxy: bool):
     """Download full YouTube transcript for deep analysis.
     
     This command fetches the complete transcript of a YouTube video,
@@ -850,6 +851,8 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
       3. Set WEBSHARE_PROXY_USERNAME and WEBSHARE_PROXY_PASSWORD in .env
          (for Webshare.io rotating residential proxies)
     
+    To bypass proxy settings and connect directly, use --no-proxy.
+    
     Examples:
     
     \b
@@ -865,11 +868,14 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         
         filmot transcript VIDEO_ID --raw > data.json
     """
-    from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp, configure_proxy, is_proxy_configured
+    from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp, configure_proxy, is_proxy_configured, disable_proxy
     import json
     
-    # Configure proxy if provided via flag
-    if proxy:
+    # Handle proxy configuration
+    if no_proxy:
+        disable_proxy()
+        console.print(f"[dim]Proxy disabled, using direct connection[/dim]")
+    elif proxy:
         try:
             configure_proxy(http_proxy=proxy)
             console.print(f"[dim]Using proxy: {proxy.split('@')[-1] if '@' in proxy else proxy}[/dim]")
