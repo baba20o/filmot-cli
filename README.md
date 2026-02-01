@@ -1,6 +1,6 @@
 # Filmot CLI
 
-A powerful command-line interface for the [Filmot Tube Metadata Archive API](https://rapidapi.com/nicchk/api/filmot-tube-metadata-archive) — Search YouTube video transcripts, get video metadata, and discover channels.
+A powerful command-line interface for the [Filmot](https://filmot.com/) YouTube transcript search engine — Search YouTube video transcripts, get video metadata, and discover channels.
 
 ## 🌟 Features
 
@@ -64,7 +64,7 @@ RAPIDAPI_KEY=your_rapidapi_key_here
 RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com
 ```
 
-Get your API key from [RapidAPI - Filmot API](https://rapidapi.com/nicchk/api/filmot-tube-metadata-archive).
+Get your API key from [Filmot API on RapidAPI](https://filmot.com/api).
 
 ## 📖 Usage
 
@@ -178,7 +178,7 @@ python main.py config
 | 35 | Canada | 13 | Australia | 116 | Japan |
 | 189 | South Korea | 166 | Russia | 155 | Mexico |
 
-> See the [Filmot API documentation](https://rapidapi.com/nicchk/api/filmot-tube-metadata-archive) for a complete list of 250+ country codes.
+> See the [Filmot API documentation](https://filmot.com/api) for a complete list of 250+ country codes.
 
 ## 📁 Project Structure
 
@@ -378,7 +378,7 @@ filmot> quit              # Exit REPL
 This CLI requires a RapidAPI key for the Filmot Tube Metadata Archive API:
 
 1. Create a free account at [RapidAPI](https://rapidapi.com/)
-2. Subscribe to the [Filmot API](https://rapidapi.com/nicchk/api/filmot-tube-metadata-archive)
+2. Subscribe to the [Filmot API](https://filmot.com/api)
 3. Copy your API key from the dashboard
 4. Add it to your `.env` file
 
