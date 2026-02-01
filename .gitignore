@@ -63,3 +63,6 @@ queries_template.*
 # Filmot user data
 .filmot_cache/
 .filmot_data/
+
+# Research & Insights (private local research)
+Insights/
