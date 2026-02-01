@@ -119,9 +119,13 @@ Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The
 |----------|--------|-------------|---------|
 | **Proximity** | `"words here"~N` | Words within N words of each other | `"cat dog"~5` |
 | **NEAR** | `word1 NEAR/N word2` | Words within N words, any order | `hello NEAR/3 world` |
+| **NOTNEAR** | `word1 NOTNEAR/N word2` | word1 NOT within N words of word2 | `python NOTNEAR/10 beginner` |
+| **NOT** | `-word` | Exclude videos containing word (global) | `python -beginner` |
 | **Wildcard** | `word*` | Prefix matching | `program*` matches programming, programmer |
 | **Quorum** | `"word1 word2 word3"/N` | At least N of the words must match | `"the world is wonderful"/3` |
 | **Strict Order** | `word1 << word2` | word1 must appear before word2 | `introduction << conclusion` |
+
+> **💡 NOTNEAR vs NOT:** The NOT operator (`-word`) excludes the **entire video** if the excluded word appears **anywhere** in the transcript. NOTNEAR is usually more practical — it only excludes matches where the terms appear close together. For example, `python NOTNEAR/10 beginner` finds "python" mentions that aren't in a beginner context (max distance: 500 words).
 
 #### OR with Phrases (Handling Transcription Variations)
 
@@ -149,6 +153,12 @@ filmot search '"machine learning" NEAR/10 "neural network"'
 
 # Exact phrase with proximity - words within 5 words of each other
 filmot search '"deep learning" "tensorflow"~5'
+
+# Find Python content that's NOT in a beginner context
+filmot search 'python NOTNEAR/10 beginner'
+
+# Find advanced Python discussions (exclude videos with "beginner" anywhere)
+filmot search 'python "advanced" -beginner'
 ```
 
 > **Note:** When using `|` (OR) in PowerShell, wrap your query in single quotes to prevent shell interpretation.
