@@ -29,7 +29,7 @@ VIDEO_ID = VideoIdType()
 
 
 @click.group()
-@click.version_option(version="0.2.0", prog_name="filmot")
+@click.version_option(version="0.3.0", prog_name="filmot")
 def cli():
     """Filmot CLI - Search YouTube transcripts and metadata."""
     pass
@@ -828,9 +828,10 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
 @click.option("--raw", is_flag=True, help="Output raw JSON response")
 @click.option("--output", "-o", default=None, help="Save transcript to file")
 @click.option("--full", is_flag=True, help="Output complete transcript text (for AI processing)")
+@click.option("--proxy", default=None, help="HTTP/HTTPS proxy URL (e.g., http://user:pass@host:port)")
 @click.pass_context
 def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float, 
-               raw: bool, output: str, full: bool):
+               raw: bool, output: str, full: bool, proxy: str):
     """Download full YouTube transcript for deep analysis.
     
     This command fetches the complete transcript of a YouTube video,
@@ -845,6 +846,14 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
       - Short URL: https://youtu.be/dQw4w9WgXcQ
       - IDs starting with dash: -O1bjFPgRQM (just use it directly)
     
+    If you get IP blocked, you can:
+    
+    \b
+      1. Set proxy via --proxy flag
+      2. Set HTTP_PROXY/HTTPS_PROXY environment variables
+      3. Set WEBSHARE_PROXY_USERNAME and WEBSHARE_PROXY_PASSWORD in .env
+         (for Webshare.io rotating residential proxies)
+    
     Examples:
     
     \b
@@ -856,10 +865,23 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         
         filmot transcript VIDEO_ID -o transcript.txt
         
+        filmot transcript VIDEO_ID --proxy http://user:pass@host:port
+        
         filmot transcript VIDEO_ID --raw > data.json
     """
-    from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp
+    from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp, configure_proxy, is_proxy_configured
     import json
+    
+    # Configure proxy if provided via flag
+    if proxy:
+        try:
+            configure_proxy(http_proxy=proxy)
+            console.print(f"[dim]Using proxy: {proxy.split('@')[-1] if '@' in proxy else proxy}[/dim]")
+        except Exception as e:
+            console.print(f"[red]Proxy error: {e}[/red]")
+            return
+    elif is_proxy_configured():
+        console.print(f"[dim]Using proxy from environment[/dim]")
     
     with console.status(f"[bold green]Fetching transcript..."):
         languages = [lang] if lang else None
@@ -872,6 +894,10 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
     if "error" in result:
         console.print(f"[red]Error: {result['error']}[/red]")
         console.print(f"[dim]Video ID: {result.get('video_id', video_id)}[/dim]")
+        if "IpBlocked" in str(result.get('error', '')) or "blocked" in str(result.get('error', '')).lower():
+            console.print("\n[yellow]Tip: Your IP is blocked by YouTube. Try using a proxy:[/yellow]")
+            console.print("  filmot transcript VIDEO_ID --proxy http://user:pass@host:port")
+            console.print("  Or set WEBSHARE_PROXY_USERNAME/PASSWORD in .env for rotating proxies")
         return
     
     # Raw JSON output
@@ -1012,6 +1038,87 @@ def transcript_search(video_id: str, query: str, context: int, lang: str):
             query.capitalize(), f"[bold red]{query.capitalize()}[/bold red]"
         )
         console.print(f"  {highlighted}")
+
+
+# ========== YOUTUBE API SEARCH ==========
+
+@cli.command("yt-search")
+@click.argument("query")
+@click.option("--days", "-d", default=7, type=int, help="Search videos from last N days (default: 7)")
+@click.option("--max-results", "-n", default=25, type=int, help="Maximum results (default: 25)")
+@click.option("--order", "-o", default="date", type=click.Choice(["date", "relevance", "viewCount", "rating"]), help="Sort order")
+@click.option("--transcript", "-t", is_flag=True, help="Also fetch and search transcript content")
+@click.option("--transcript-query", default=None, help="Different query for transcript search (uses main query if not set)")
+def yt_search(query: str, days: int, max_results: int, order: str, transcript: bool, transcript_query: str):
+    """Search YouTube directly for recent videos (bypasses Filmot).
+    
+    Use this when searching for very recent content that Filmot 
+    may not have indexed yet. Requires YOUTUBE_API_KEY in .env file.
+    
+    Examples:
+    
+    \b
+        filmot yt-search "moltbook" --days 7
+        
+        filmot yt-search "clawdbot" --days 3 --order relevance
+        
+        filmot yt-search "AI agents" --transcript --transcript-query "security"
+    """
+    try:
+        from .youtube_search import search_recent, format_duration, validate_youtube_api
+        
+        validate_youtube_api()
+        
+        with console.status(f"[bold green]Searching YouTube for '{query}' (last {days} days)..."):
+            results = search_recent(
+                query=query,
+                days_back=days,
+                max_results=max_results,
+                order=order,
+            )
+        
+        if not results:
+            console.print(f"[yellow]No videos found for '{query}' in the last {days} days.[/yellow]")
+            return
+        
+        console.print(Panel(
+            f"[bold]Found {len(results)} videos for:[/bold] {query}\n"
+            f"[bold]Period:[/bold] Last {days} days | [bold]Order:[/bold] {order}",
+            title="YouTube Search Results"
+        ))
+        
+        for i, video in enumerate(results, 1):
+            duration = format_duration(video.get('duration', ''))
+            views = f"{video.get('views', 0):,}"
+            published = video.get('published_at', '')[:10]  # Just the date
+            
+            console.print(f"\n[bold cyan]{i}. {video['title']}[/bold cyan]")
+            console.print(f"   Channel: [green]{video['channel_title']}[/green]")
+            console.print(f"   Views: {views} | Duration: {duration} | Published: {published}")
+            console.print(f"   [link={video['url']}]{video['url']}[/link]")
+            
+            # Optionally fetch and search transcript
+            if transcript:
+                from .transcript import get_transcript, search_in_transcript
+                
+                search_term = transcript_query or query
+                with console.status(f"   Fetching transcript..."):
+                    try:
+                        result = search_in_transcript(video['video_id'], search_term)
+                        if result.get('match_count', 0) > 0:
+                            console.print(f"   [bold green]✓ Found {result['match_count']} transcript matches for '{search_term}'[/bold green]")
+                            for match in result['matches'][:3]:  # Show first 3 matches
+                                console.print(f"      [{match['timestamp']}] ...{match['context'][:100]}...")
+                        else:
+                            console.print(f"   [dim]No transcript matches for '{search_term}'[/dim]")
+                    except Exception as e:
+                        console.print(f"   [dim]Transcript unavailable[/dim]")
+                        
+    except ValueError as e:
+        console.print(f"[red]Configuration Error: {e}[/red]")
+        console.print("[yellow]Add YOUTUBE_API_KEY to your .env file[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
 
 
 def main():

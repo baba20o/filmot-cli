@@ -14,10 +14,134 @@ from youtube_transcript_api._errors import (
 )
 from typing import Optional
 import re
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Global API instance - can be reconfigured with proxy
+_api = None
+_proxy_configured = False
+_initialized = False
 
 
-# Create a single API instance
-_api = YouTubeTranscriptApi()
+def _init_api() -> None:
+    """Initialize the API, checking for proxy config in environment."""
+    global _api, _proxy_configured, _initialized
+    
+    if _initialized:
+        return
+    
+    # Check for proxy configuration in environment
+    # Option 1: Webshare proxy (recommended for residential rotating proxies)
+    webshare_user = os.getenv("WEBSHARE_PROXY_USERNAME")
+    webshare_pass = os.getenv("WEBSHARE_PROXY_PASSWORD")
+    
+    if webshare_user and webshare_pass:
+        try:
+            from youtube_transcript_api.proxies import WebshareProxyConfig
+            _api = YouTubeTranscriptApi(
+                proxy_config=WebshareProxyConfig(
+                    proxy_username=webshare_user,
+                    proxy_password=webshare_pass,
+                )
+            )
+            _proxy_configured = True
+            _initialized = True
+            return
+        except ImportError:
+            pass
+    
+    # Option 2: Generic HTTP/HTTPS proxy
+    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    
+    if http_proxy or https_proxy:
+        try:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+            _api = YouTubeTranscriptApi(
+                proxy_config=GenericProxyConfig(
+                    http_url=http_proxy,
+                    https_url=https_proxy or http_proxy,
+                )
+            )
+            _proxy_configured = True
+            _initialized = True
+            return
+        except ImportError:
+            pass
+    
+    # No proxy configured, use default API
+    _api = YouTubeTranscriptApi()
+    _initialized = True
+
+
+def configure_proxy(
+    webshare_username: Optional[str] = None,
+    webshare_password: Optional[str] = None,
+    http_proxy: Optional[str] = None,
+    https_proxy: Optional[str] = None,
+) -> None:
+    """
+    Configure the transcript API to use a proxy.
+    
+    This helps bypass IP blocks by routing requests through different IPs.
+    
+    For Webshare (recommended - rotating residential proxies):
+        configure_proxy(webshare_username="user", webshare_password="pass")
+    
+    For generic HTTP/HTTPS proxy:
+        configure_proxy(http_proxy="http://user:pass@host:port")
+    
+    Args:
+        webshare_username: Webshare.io proxy username
+        webshare_password: Webshare.io proxy password
+        http_proxy: Generic HTTP proxy URL
+        https_proxy: Generic HTTPS proxy URL (defaults to http_proxy if not set)
+    """
+    global _api, _proxy_configured, _initialized
+    
+    if webshare_username and webshare_password:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        _api = YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=webshare_username,
+                proxy_password=webshare_password,
+            )
+        )
+    elif http_proxy:
+        from youtube_transcript_api.proxies import GenericProxyConfig
+        _api = YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(
+                http_url=http_proxy,
+                https_url=https_proxy or http_proxy,
+            )
+        )
+    else:
+        raise ValueError("Must provide either Webshare credentials or proxy URL")
+    
+    _proxy_configured = True
+    _initialized = True
+
+
+def get_api() -> YouTubeTranscriptApi:
+    """Get the configured API instance."""
+    _init_api()
+    return _api
+
+
+def is_proxy_configured() -> bool:
+    """Check if a proxy is configured."""
+    _init_api()
+    return _proxy_configured
+
+
+def reset_api() -> None:
+    """Reset to default API without proxy."""
+    global _api, _proxy_configured, _initialized
+    _api = YouTubeTranscriptApi()
+    _proxy_configured = False
+    _initialized = True
 
 
 def extract_video_id(video_input: str) -> str:
@@ -79,12 +203,13 @@ def get_transcript(
         languages = ['en', 'en-US', 'en-GB']
     
     try:
+        api = get_api()
         # Try the simple fetch first
         try:
-            transcript = _api.fetch(video_id, languages=languages, preserve_formatting=preserve_formatting)
+            transcript = api.fetch(video_id, languages=languages, preserve_formatting=preserve_formatting)
         except NoTranscriptFound:
             # Try to list and translate
-            transcript_list = _api.list(video_id)
+            transcript_list = api.list(video_id)
             translated = None
             for t in transcript_list:
                 if t.is_translatable:
