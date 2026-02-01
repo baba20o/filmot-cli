@@ -100,6 +100,59 @@ python main.py search "AI" --full --hit-format 1
 python main.py search "AI" --raw > results.json
 ```
 
+### 🔤 Query Syntax (Full-Text Operators)
+
+Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The following operators are supported in your search queries:
+
+#### Basic Operators
+
+| Operator | Syntax | Description | Example |
+|----------|--------|-------------|---------|
+| **AND** | `word1 word2` | Both words must appear (implicit) | `python tutorial` |
+| **OR** | `word1 \| word2` | Either word can match | `"9 11" \| "nine eleven"` |
+| **NOT** | `-word` or `!word` | Word must NOT appear | `python -beginner` |
+| **Phrase** | `"exact phrase"` | Words must appear adjacent, in order | `"machine learning"` |
+
+#### Advanced Operators
+
+| Operator | Syntax | Description | Example |
+|----------|--------|-------------|---------|
+| **Proximity** | `"words here"~N` | Words within N words of each other | `"cat dog"~5` |
+| **NEAR** | `word1 NEAR/N word2` | Words within N words, any order | `hello NEAR/3 world` |
+| **Wildcard** | `word*` | Prefix matching | `program*` matches programming, programmer |
+| **Quorum** | `"word1 word2 word3"/2` | At least N of the words must match | `"the world is wonderful"/3` |
+| **Strict Order** | `word1 << word2` | word1 must appear before word2 | `introduction << conclusion` |
+
+#### OR with Phrases (Handling Transcription Variations)
+
+YouTube auto-captions transcribe words inconsistently. Use OR (`|`) with phrases to catch all variations:
+
+```bash
+# Find all mentions of "9/11" regardless of how it was transcribed
+filmot search '"9 11" | "nine eleven" | "september 11" | "9/11"'
+
+# Find references to "AI" with variations
+filmot search '"artificial intelligence" | "A.I." | "AI"'
+
+# Brand name variations
+filmot search '"iPhone" | "i phone" | "i-phone"'
+```
+
+#### Combining Operators
+
+```bash
+# Must mention Python, either tutorial or course, but not beginner
+filmot search 'python ("tutorial" | "course") -beginner'
+
+# Find "machine learning" near "neural network" within 10 words
+filmot search '"machine learning" NEAR/10 "neural network"'
+
+# Exact phrase with proximity - words within 5 words of each other
+filmot search '"deep learning" "tensorflow"~5'
+```
+
+> **Note:** When using `|` (OR) in PowerShell, wrap your query in single quotes to prevent shell interpretation.
+
 ### Search Options Reference
 
 | Option | Description | Example |
