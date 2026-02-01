@@ -13,8 +13,23 @@ from .api import FilmotClient
 console = Console()
 
 
+class VideoIdType(click.ParamType):
+    """Custom type for YouTube video IDs that handles IDs starting with dashes."""
+    name = "video_id"
+    
+    def convert(self, value, param, ctx):
+        if value is None:
+            return None
+        # Just pass through - the transcript module handles extraction
+        return str(value)
+
+
+# Global video ID type instance
+VIDEO_ID = VideoIdType()
+
+
 @click.group()
-@click.version_option(version="0.1.0", prog_name="filmot")
+@click.version_option(version="0.2.0", prog_name="filmot")
 def cli():
     """Filmot CLI - Search YouTube transcripts and metadata."""
     pass
@@ -801,15 +816,20 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
 
 # ========== TRANSCRIPT DOWNLOAD ==========
 
-@cli.command()
-@click.argument("video_id")
+@cli.command(context_settings=dict(
+    ignore_unknown_options=True,
+    allow_extra_args=True,
+    allow_interspersed_args=False,
+))
+@click.argument("video_id", nargs=1)
 @click.option("--lang", "-l", default=None, help="Preferred language code (e.g., en, es, de)")
 @click.option("--timestamps", "-t", is_flag=True, help="Include timestamps for each segment")
 @click.option("--chunk", "-c", default=None, type=float, help="Chunk transcript into N-minute segments")
 @click.option("--raw", is_flag=True, help="Output raw JSON response")
 @click.option("--output", "-o", default=None, help="Save transcript to file")
 @click.option("--full", is_flag=True, help="Output complete transcript text (for AI processing)")
-def transcript(video_id: str, lang: str, timestamps: bool, chunk: float, 
+@click.pass_context
+def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float, 
                raw: bool, output: str, full: bool):
     """Download full YouTube transcript for deep analysis.
     
@@ -823,6 +843,7 @@ def transcript(video_id: str, lang: str, timestamps: bool, chunk: float,
       - Just the ID: dQw4w9WgXcQ
       - Full URL: https://youtube.com/watch?v=dQw4w9WgXcQ
       - Short URL: https://youtu.be/dQw4w9WgXcQ
+      - IDs starting with dash: -O1bjFPgRQM (just use it directly)
     
     Examples:
     
