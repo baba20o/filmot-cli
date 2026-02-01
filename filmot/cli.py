@@ -816,11 +816,7 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
 
 # ========== TRANSCRIPT DOWNLOAD ==========
 
-@cli.command(context_settings=dict(
-    ignore_unknown_options=True,
-    allow_extra_args=True,
-    allow_interspersed_args=False,
-))
+@cli.command("transcript")
 @click.argument("video_id", nargs=1)
 @click.option("--lang", "-l", default=None, help="Preferred language code (e.g., en, es, de)")
 @click.option("--timestamps", "-t", is_flag=True, help="Include timestamps for each segment")
@@ -1045,11 +1041,56 @@ def transcript_search(video_id: str, query: str, context: int, lang: str):
 @cli.command("yt-search")
 @click.argument("query")
 @click.option("--days", "-d", default=7, type=int, help="Search videos from last N days (default: 7)")
-@click.option("--max-results", "-n", default=25, type=int, help="Maximum results (default: 25)")
-@click.option("--order", "-o", default="date", type=click.Choice(["date", "relevance", "viewCount", "rating"]), help="Sort order")
+@click.option("--max-results", "-n", default=25, type=int, help="Maximum results (default: 25, max: 50)")
+@click.option("--order", "-o", default="date", 
+              type=click.Choice(["date", "relevance", "viewCount", "rating", "title"]), 
+              help="Sort order")
+@click.option("--published-after", default=None, help="Only videos after this date (YYYY-MM-DD)")
+@click.option("--published-before", default=None, help="Only videos before this date (YYYY-MM-DD)")
+@click.option("--channel-id", default=None, help="Filter by channel ID")
+@click.option("--region", default=None, help="Region code (e.g., US, GB, DE)")
+@click.option("--lang", "-l", default=None, help="Relevance language code (e.g., en, es, de)")
+@click.option("--safe-search", default=None, 
+              type=click.Choice(["none", "moderate", "strict"]),
+              help="Safe search filtering")
+@click.option("--caption", default=None,
+              type=click.Choice(["any", "closedCaption", "none"]),
+              help="Filter by caption availability")
+@click.option("--category", default=None, help="YouTube category ID")
+@click.option("--definition", default=None,
+              type=click.Choice(["any", "high", "standard"]),
+              help="Video definition (high=HD, standard=SD)")
+@click.option("--dimension", default=None,
+              type=click.Choice(["any", "2d", "3d"]),
+              help="Video dimension")
+@click.option("--duration", default=None,
+              type=click.Choice(["any", "short", "medium", "long"]),
+              help="Duration: short (<4m), medium (4-20m), long (>20m)")
+@click.option("--embeddable", is_flag=True, help="Only embeddable videos")
+@click.option("--license", "video_license", default=None,
+              type=click.Choice(["any", "creativeCommon", "youtube"]),
+              help="Video license type")
+@click.option("--syndicated", is_flag=True, help="Only syndicated videos")
+@click.option("--type", "video_type", default=None,
+              type=click.Choice(["any", "episode", "movie"]),
+              help="Video type")
+@click.option("--event-type", default=None,
+              type=click.Choice(["completed", "live", "upcoming"]),
+              help="Live stream event type")
+@click.option("--location", default=None, help="Lat,Long coordinates (e.g., 37.42,-122.08)")
+@click.option("--location-radius", default=None, help="Radius around location (e.g., 50km, 100mi)")
+@click.option("--topic-id", default=None, help="Freebase topic ID")
 @click.option("--transcript", "-t", is_flag=True, help="Also fetch and search transcript content")
-@click.option("--transcript-query", default=None, help="Different query for transcript search (uses main query if not set)")
-def yt_search(query: str, days: int, max_results: int, order: str, transcript: bool, transcript_query: str):
+@click.option("--transcript-query", default=None, help="Different query for transcript search")
+@click.option("--show-description", is_flag=True, help="Show video descriptions")
+def yt_search(query: str, days: int, max_results: int, order: str, 
+              published_after: str, published_before: str, channel_id: str,
+              region: str, lang: str, safe_search: str, caption: str,
+              category: str, definition: str, dimension: str, duration: str,
+              embeddable: bool, video_license: str, syndicated: bool,
+              video_type: str, event_type: str, location: str, 
+              location_radius: str, topic_id: str, transcript: bool, 
+              transcript_query: str, show_description: bool):
     """Search YouTube directly for recent videos (bypasses Filmot).
     
     Use this when searching for very recent content that Filmot 
@@ -1062,12 +1103,30 @@ def yt_search(query: str, days: int, max_results: int, order: str, transcript: b
         
         filmot yt-search "clawdbot" --days 3 --order relevance
         
-        filmot yt-search "AI agents" --transcript --transcript-query "security"
+        filmot yt-search "AI agents" --duration long --definition high
+        
+        filmot yt-search "tutorial" --caption closedCaption --lang en
+        
+        filmot yt-search "news" --region US --safe-search strict
+        
+        filmot yt-search "live coding" --event-type live
+        
+        filmot yt-search "AI" --license creativeCommon
+        
+        filmot yt-search "tech" --transcript --transcript-query "security"
     """
     try:
         from .youtube_search import search_recent, format_duration, validate_youtube_api
         
         validate_youtube_api()
+        
+        # Convert date strings to ISO format if provided
+        pub_after = None
+        pub_before = None
+        if published_after:
+            pub_after = f"{published_after}T00:00:00Z"
+        if published_before:
+            pub_before = f"{published_before}T23:59:59Z"
         
         with console.status(f"[bold green]Searching YouTube for '{query}' (last {days} days)..."):
             results = search_recent(
@@ -1075,27 +1134,70 @@ def yt_search(query: str, days: int, max_results: int, order: str, transcript: b
                 days_back=days,
                 max_results=max_results,
                 order=order,
+                published_after=pub_after,
+                published_before=pub_before,
+                channel_id=channel_id,
+                region_code=region,
+                relevance_language=lang,
+                safe_search=safe_search,
+                video_caption=caption,
+                video_category_id=category,
+                video_definition=definition,
+                video_dimension=dimension,
+                video_duration=duration,
+                video_embeddable="true" if embeddable else None,
+                video_license=video_license,
+                video_syndicated="true" if syndicated else None,
+                video_type=video_type,
+                event_type=event_type,
+                location=location,
+                location_radius=location_radius,
+                topic_id=topic_id,
             )
         
         if not results:
             console.print(f"[yellow]No videos found for '{query}' in the last {days} days.[/yellow]")
             return
         
+        # Build summary line
+        filters = []
+        if region:
+            filters.append(f"Region: {region}")
+        if lang:
+            filters.append(f"Lang: {lang}")
+        if duration:
+            filters.append(f"Duration: {duration}")
+        if definition:
+            filters.append(f"Definition: {definition}")
+        if caption:
+            filters.append(f"Caption: {caption}")
+        if event_type:
+            filters.append(f"Event: {event_type}")
+        
+        filter_text = " | ".join(filters) if filters else ""
+        
         console.print(Panel(
             f"[bold]Found {len(results)} videos for:[/bold] {query}\n"
-            f"[bold]Period:[/bold] Last {days} days | [bold]Order:[/bold] {order}",
+            f"[bold]Period:[/bold] Last {days} days | [bold]Order:[/bold] {order}"
+            + (f"\n[bold]Filters:[/bold] {filter_text}" if filter_text else ""),
             title="YouTube Search Results"
         ))
         
         for i, video in enumerate(results, 1):
-            duration = format_duration(video.get('duration', ''))
+            duration_str = format_duration(video.get('duration', ''))
             views = f"{video.get('views', 0):,}"
-            published = video.get('published_at', '')[:10]  # Just the date
+            published = video.get('published_at', '')[:10]
             
             console.print(f"\n[bold cyan]{i}. {video['title']}[/bold cyan]")
             console.print(f"   Channel: [green]{video['channel_title']}[/green]")
-            console.print(f"   Views: {views} | Duration: {duration} | Published: {published}")
+            console.print(f"   Views: {views} | Duration: {duration_str} | Published: {published}")
             console.print(f"   [link={video['url']}]{video['url']}[/link]")
+            
+            if show_description and video.get('description'):
+                desc = video['description'][:200]
+                if len(video.get('description', '')) > 200:
+                    desc += "..."
+                console.print(f"   [dim]{desc}[/dim]")
             
             # Optionally fetch and search transcript
             if transcript:
@@ -1107,7 +1209,7 @@ def yt_search(query: str, days: int, max_results: int, order: str, transcript: b
                         result = search_in_transcript(video['video_id'], search_term)
                         if result.get('match_count', 0) > 0:
                             console.print(f"   [bold green]✓ Found {result['match_count']} transcript matches for '{search_term}'[/bold green]")
-                            for match in result['matches'][:3]:  # Show first 3 matches
+                            for match in result['matches'][:3]:
                                 console.print(f"      [{match['timestamp']}] ...{match['context'][:100]}...")
                         else:
                             console.print(f"   [dim]No transcript matches for '{search_term}'[/dim]")

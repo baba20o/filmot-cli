@@ -34,11 +34,27 @@ def search_videos(
     max_results: int = 25,
     published_after: Optional[datetime] = None,
     published_before: Optional[datetime] = None,
-    order: str = "date",  # date, rating, relevance, title, viewCount
+    order: str = "date",
     channel_id: Optional[str] = None,
+    region_code: Optional[str] = None,
+    relevance_language: Optional[str] = None,
+    safe_search: Optional[str] = None,
+    video_caption: Optional[str] = None,
+    video_category_id: Optional[str] = None,
+    video_definition: Optional[str] = None,
+    video_dimension: Optional[str] = None,
+    video_duration: Optional[str] = None,
+    video_embeddable: Optional[str] = None,
+    video_license: Optional[str] = None,
+    video_syndicated: Optional[str] = None,
+    video_type: Optional[str] = None,
+    event_type: Optional[str] = None,
+    location: Optional[str] = None,
+    location_radius: Optional[str] = None,
+    topic_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Search YouTube for videos matching a query.
+    Search YouTube for videos matching a query with full API parameter support.
     
     Args:
         query: Search terms (supports YouTube search operators)
@@ -47,6 +63,22 @@ def search_videos(
         published_before: Only videos published before this date
         order: Sort order - date, rating, relevance, title, viewCount
         channel_id: Limit search to specific channel
+        region_code: ISO 3166-1 alpha-2 country code (e.g., 'US', 'GB')
+        relevance_language: ISO 639-1 language code for relevance ranking
+        safe_search: 'none', 'moderate', 'strict'
+        video_caption: 'any', 'closedCaption', 'none'
+        video_category_id: YouTube video category ID
+        video_definition: 'any', 'high' (HD), 'standard' (SD)
+        video_dimension: 'any', '2d', '3d'
+        video_duration: 'any', 'short' (<4min), 'medium' (4-20min), 'long' (>20min)
+        video_embeddable: 'any', 'true'
+        video_license: 'any', 'creativeCommon', 'youtube'
+        video_syndicated: 'any', 'true'
+        video_type: 'any', 'episode', 'movie'
+        event_type: 'completed', 'live', 'upcoming' (for live streams)
+        location: Lat/long coordinates (e.g., '37.42307,-122.08427')
+        location_radius: Radius around location (e.g., '50km', '100mi')
+        topic_id: Freebase topic ID
         
     Returns:
         List of video metadata dictionaries
@@ -62,12 +94,64 @@ def search_videos(
         "order": order,
     }
     
+    # Date filtering
     if published_after:
-        params["publishedAfter"] = published_after.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if isinstance(published_after, datetime):
+            params["publishedAfter"] = published_after.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            params["publishedAfter"] = published_after
     if published_before:
-        params["publishedBefore"] = published_before.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if isinstance(published_before, datetime):
+            params["publishedBefore"] = published_before.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            params["publishedBefore"] = published_before
+    
+    # Channel filter
     if channel_id:
         params["channelId"] = channel_id
+    
+    # Region/language
+    if region_code:
+        params["regionCode"] = region_code
+    if relevance_language:
+        params["relevanceLanguage"] = relevance_language
+    
+    # Safe search
+    if safe_search:
+        params["safeSearch"] = safe_search
+    
+    # Video filters
+    if video_caption:
+        params["videoCaption"] = video_caption
+    if video_category_id:
+        params["videoCategoryId"] = video_category_id
+    if video_definition:
+        params["videoDefinition"] = video_definition
+    if video_dimension:
+        params["videoDimension"] = video_dimension
+    if video_duration:
+        params["videoDuration"] = video_duration
+    if video_embeddable:
+        params["videoEmbeddable"] = video_embeddable
+    if video_license:
+        params["videoLicense"] = video_license
+    if video_syndicated:
+        params["videoSyndicated"] = video_syndicated
+    if video_type:
+        params["videoType"] = video_type
+    
+    # Live events
+    if event_type:
+        params["eventType"] = event_type
+    
+    # Location-based search
+    if location:
+        params["location"] = location
+        params["locationRadius"] = location_radius or "50km"
+    
+    # Topic
+    if topic_id:
+        params["topicId"] = topic_id
     
     response = requests.get(YOUTUBE_SEARCH_URL, params=params)
     response.raise_for_status()
@@ -142,27 +226,86 @@ def search_recent(
     days_back: int = 7,
     max_results: int = 25,
     order: str = "date",
+    published_after: Optional[str] = None,
+    published_before: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    region_code: Optional[str] = None,
+    relevance_language: Optional[str] = None,
+    safe_search: Optional[str] = None,
+    video_caption: Optional[str] = None,
+    video_category_id: Optional[str] = None,
+    video_definition: Optional[str] = None,
+    video_dimension: Optional[str] = None,
+    video_duration: Optional[str] = None,
+    video_embeddable: Optional[str] = None,
+    video_license: Optional[str] = None,
+    video_syndicated: Optional[str] = None,
+    video_type: Optional[str] = None,
+    event_type: Optional[str] = None,
+    location: Optional[str] = None,
+    location_radius: Optional[str] = None,
+    topic_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Convenience function to search for recent videos.
+    Search for recent videos with full parameter support.
     
     Args:
         query: Search terms
-        days_back: How many days back to search
+        days_back: How many days back to search (ignored if published_after set)
         max_results: Maximum results
-        order: Sort order
+        order: Sort order - date, rating, relevance, title, viewCount
+        published_after: ISO 8601 date string (overrides days_back)
+        published_before: ISO 8601 date string
+        channel_id: Limit to specific channel
+        region_code: ISO 3166-1 alpha-2 country code
+        relevance_language: ISO 639-1 language code
+        safe_search: 'none', 'moderate', 'strict'
+        video_caption: 'any', 'closedCaption', 'none'
+        video_category_id: YouTube category ID
+        video_definition: 'any', 'high', 'standard'
+        video_dimension: 'any', '2d', '3d'
+        video_duration: 'any', 'short', 'medium', 'long'
+        video_embeddable: 'any', 'true'
+        video_license: 'any', 'creativeCommon', 'youtube'
+        video_syndicated: 'any', 'true'
+        video_type: 'any', 'episode', 'movie'
+        event_type: 'completed', 'live', 'upcoming'
+        location: Lat/long (e.g., '37.42307,-122.08427')
+        location_radius: Radius (e.g., '50km')
+        topic_id: Freebase topic ID
         
     Returns:
         List of video metadata with full details
     """
-    published_after = datetime.utcnow() - timedelta(days=days_back)
+    # Calculate published_after from days_back if not explicitly set
+    if not published_after:
+        after_dt = datetime.utcnow() - timedelta(days=days_back)
+        published_after = after_dt
     
     # First get search results
     search_results = search_videos(
         query=query,
         max_results=max_results,
         published_after=published_after,
+        published_before=published_before,
         order=order,
+        channel_id=channel_id,
+        region_code=region_code,
+        relevance_language=relevance_language,
+        safe_search=safe_search,
+        video_caption=video_caption,
+        video_category_id=video_category_id,
+        video_definition=video_definition,
+        video_dimension=video_dimension,
+        video_duration=video_duration,
+        video_embeddable=video_embeddable,
+        video_license=video_license,
+        video_syndicated=video_syndicated,
+        video_type=video_type,
+        event_type=event_type,
+        location=location,
+        location_radius=location_radius,
+        topic_id=topic_id,
     )
     
     if not search_results:
