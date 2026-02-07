@@ -64,12 +64,13 @@ def cli():
 @click.option("--hit-format", default=None, type=click.Choice(["0", "1"]), help="Hit format: 0=context, 1=full lines")
 @click.option("--full", is_flag=True, help="Show all matches (no truncation) - useful for AI agents")
 @click.option("--raw", is_flag=True, help="Output raw JSON response")
+@click.option("--bulk-download", default=None, help="Download top N transcripts to TOPIC (e.g., --bulk-download prompt-injection:10)")
 def search(query: str, lang: str, page: int, category: str, exclude: str, 
            channel_id: str, channel: str, channel_count: int, title: str, 
            min_views: int, max_views: int, min_likes: int, max_likes: int,
            min_duration: int, max_duration: int, start_date: str, end_date: str,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
-           max_query_time: int, hit_format: str, full: bool, raw: bool):
+           max_query_time: int, hit_format: str, full: bool, raw: bool, bulk_download: str):
     """Search for videos by subtitle/transcript content.
     
     Examples:
@@ -120,6 +121,11 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
         
         if raw:
             console.print(JSON.from_data(results))
+            return
+        
+        # Bulk download mode
+        if bulk_download:
+            _bulk_download_transcripts(results, bulk_download, console)
             return
         
         # Display formatted results
@@ -195,6 +201,91 @@ def _format_count(count: int) -> str:
         return f"{count / 1_000:.1f}K"
     else:
         return str(count)
+
+
+def _bulk_download_transcripts(results: dict, bulk_download: str, console):
+    """Download transcripts from search results to library.
+    
+    Args:
+        results: Search results from Filmot API
+        bulk_download: Format "TOPIC:N" or just "TOPIC" (defaults to 10)
+        console: Rich console for output
+    """
+    from .library import get_library
+    from .transcript import get_transcript
+    
+    # Parse bulk_download format: "topic:10" or just "topic"
+    if ":" in bulk_download:
+        topic, count_str = bulk_download.rsplit(":", 1)
+        try:
+            max_count = int(count_str)
+        except ValueError:
+            topic = bulk_download
+            max_count = 10
+    else:
+        topic = bulk_download
+        max_count = 10
+    
+    videos = results.get("result", results.get("videos", results.get("items", [])))
+    
+    if not videos:
+        console.print("[yellow]No videos to download.[/yellow]")
+        return
+    
+    # Limit to max_count
+    videos_to_download = videos[:max_count]
+    
+    library = get_library()
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    
+    console.print(f"\n[bold]Bulk downloading {len(videos_to_download)} transcripts to '{topic}'...[/bold]\n")
+    
+    for i, video in enumerate(videos_to_download, 1):
+        video_id = video.get("id") or video.get("videoid")
+        title = video.get("title", "Unknown")
+        channel = video.get("channeltitle", video.get("channel", "Unknown"))
+        
+        # Check if already cached
+        if library.exists(video_id, topic):
+            console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {video_id} - already in library")
+            skip_count += 1
+            continue
+        
+        try:
+            result = get_transcript(video_id)
+            
+            if "error" in result:
+                console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {result['error']}")
+                fail_count += 1
+                continue
+            
+            # Save to library
+            metadata = {
+                "title": title,
+                "channel": channel,
+                "language": result.get("language"),
+                "is_generated": result.get("is_generated"),
+                "duration_seconds": result.get("duration_seconds"),
+                "segment_count": result.get("segment_count"),
+                "views": video.get("viewcount"),
+            }
+            library.save(
+                video_id=video_id,
+                topic=topic,
+                transcript_text=result.get('full_text', ''),
+                metadata=metadata,
+            )
+            console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {title[:50]}...")
+            success_count += 1
+            
+        except Exception as e:
+            console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}")
+            fail_count += 1
+    
+    console.print(f"\n[bold]Complete:[/bold] {success_count} saved, {skip_count} skipped, {fail_count} failed")
+    console.print(f"[dim]View with: filmot library list {topic}[/dim]")
 
 
 def _display_subtitle_results(results: dict, query: str, full: bool = False):
@@ -826,9 +917,11 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
 @click.option("--full", is_flag=True, help="Output complete transcript text (for AI processing)")
 @click.option("--proxy", default=None, help="HTTP/HTTPS proxy URL (e.g., http://user:pass@host:port)")
 @click.option("--no-proxy", is_flag=True, help="Disable proxy (ignore env vars, connect directly)")
+@click.option("--save-to", default=None, help="Save transcript to library under TOPIC (e.g., --save-to prompt-injection)")
+@click.option("--fallback/--no-fallback", default=False, help="Use AWS Transcribe if YouTube captions unavailable")
 @click.pass_context
 def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float, 
-               raw: bool, output: str, full: bool, proxy: str, no_proxy: bool):
+               raw: bool, output: str, full: bool, proxy: str, no_proxy: bool, save_to: str, fallback: bool):
     """Download full YouTube transcript for deep analysis.
     
     This command fetches the complete transcript of a YouTube video,
@@ -853,6 +946,13 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
     
     To bypass proxy settings and connect directly, use --no-proxy.
     
+    AWS Transcribe Fallback:
+    
+    \b
+      Use --fallback to auto-transcribe when YouTube captions are unavailable.
+      Requires: yt-dlp, boto3, AWS profile 'APIBoss' with Transcribe access.
+      Flow: Download audio → Upload S3 → Transcribe → Cleanup
+    
     Examples:
     
     \b
@@ -867,8 +967,10 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         filmot transcript VIDEO_ID --proxy http://user:pass@host:port
         
         filmot transcript VIDEO_ID --raw > data.json
+        
+        filmot transcript VIDEO_ID --fallback  # AWS fallback if no captions
     """
-    from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp, configure_proxy, is_proxy_configured, disable_proxy
+    from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp, configure_proxy, is_proxy_configured, disable_proxy, get_transcript_with_fallback
     import json
     
     # Handle proxy configuration
@@ -885,11 +987,24 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
     elif is_proxy_configured():
         console.print(f"[dim]Using proxy from environment[/dim]")
     
+    # Progress callback for AWS fallback
+    def aws_progress(stage: str, msg: str):
+        console.print(f"[cyan][AWS][/cyan] {msg}")
+    
     with console.status(f"[bold green]Fetching transcript..."):
         languages = [lang] if lang else None
         
         if chunk:
+            # Chunked mode doesn't support fallback (needs timestamps)
             result = get_transcript_with_timestamps(video_id, languages, chunk_minutes=chunk)
+        elif fallback:
+            # Use fallback-enabled fetch
+            result = get_transcript_with_fallback(
+                video_id, 
+                languages, 
+                use_aws_fallback=True,
+                aws_progress_callback=aws_progress
+            )
         else:
             result = get_transcript(video_id, languages)
     
@@ -900,7 +1015,37 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             console.print("\n[yellow]Tip: Your IP is blocked by YouTube. Try using a proxy:[/yellow]")
             console.print("  filmot transcript VIDEO_ID --proxy http://user:pass@host:port")
             console.print("  Or set WEBSHARE_PROXY_USERNAME/PASSWORD in .env for rotating proxies")
+        if not fallback:
+            console.print("\n[yellow]Tip: Use --fallback to try AWS Transcribe when captions unavailable[/yellow]")
         return
+    
+    # Show source if using fallback
+    source = result.get('source', 'youtube')
+    if source == 'aws_transcribe':
+        console.print(f"[cyan]Transcribed via AWS Transcribe (language: {result.get('language', 'unknown')})[/cyan]")
+    
+    # Save to library if --save-to specified
+    if save_to:
+        from .library import get_library
+        library = get_library()
+        
+        # Check if already cached
+        if library.exists(result['video_id'], save_to):
+            console.print(f"[yellow]Already in library: {save_to}/{result['video_id']}[/yellow]")
+        else:
+            metadata = {
+                "language": result.get("language"),
+                "is_generated": result.get("is_generated"),
+                "duration_seconds": result.get("duration_seconds"),
+                "segment_count": result.get("segment_count"),
+            }
+            saved_path = library.save(
+                video_id=result['video_id'],
+                topic=save_to,
+                transcript_text=result.get('full_text', ''),
+                metadata=metadata,
+            )
+            console.print(f"[green]✓ Saved to library: {save_to}/{result['video_id']}[/green]")
     
     # Raw JSON output
     if raw:
@@ -1227,6 +1372,205 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         console.print("[yellow]Add YOUTUBE_API_KEY to your .env file[/yellow]")
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
+
+
+# ========== TRANSCRIPT LIBRARY ==========
+
+@cli.group()
+def library():
+    """Manage local transcript library.
+    
+    The library stores transcripts organized by topic/keyword for 
+    building curated knowledge bases.
+    
+    Examples:
+    
+    \b
+        filmot library list                    # List all topics
+        filmot library list prompt-injection   # List transcripts in topic
+        filmot library search "attack"         # Search across all transcripts
+        filmot library context prompt-injection # Get all text for LLM context
+        filmot library stats                   # Show library statistics
+    """
+    pass
+
+
+@library.command("list")
+@click.argument("topic", required=False)
+def library_list(topic: str):
+    """List topics or transcripts in a topic.
+    
+    Without arguments, lists all topics.
+    With a topic name, lists all transcripts in that topic.
+    """
+    from .library import get_library
+    lib = get_library()
+    
+    if topic:
+        # List transcripts in topic
+        transcripts = lib.list_transcripts(topic)
+        if not transcripts:
+            console.print(f"[yellow]No transcripts in topic: {topic}[/yellow]")
+            return
+        
+        table = Table(title=f"Transcripts in '{topic}'")
+        table.add_column("Video ID", style="cyan")
+        table.add_column("Title", style="white", max_width=50)
+        table.add_column("Channel", style="green")
+        table.add_column("Size", style="dim")
+        table.add_column("Saved", style="dim")
+        
+        for t in transcripts:
+            size = f"{t['char_count']:,} chars"
+            saved = t['saved_at'][:10] if t.get('saved_at') else "Unknown"
+            title = t.get('title', 'Unknown')
+            if len(title) > 47:
+                title = title[:47] + "..."
+            table.add_row(t['video_id'], title, t.get('channel', 'Unknown'), size, saved)
+        
+        console.print(table)
+        console.print(f"\n[dim]Total: {len(transcripts)} transcripts[/dim]")
+    else:
+        # List all topics
+        topics = lib.list_topics()
+        if not topics:
+            console.print("[yellow]Library is empty. Use 'filmot transcript VIDEO_ID --save-to TOPIC' to add.[/yellow]")
+            return
+        
+        table = Table(title="Transcript Library")
+        table.add_column("Topic", style="cyan")
+        table.add_column("Transcripts", style="white", justify="right")
+        
+        for t in topics:
+            table.add_row(t['topic'], str(t['count']))
+        
+        console.print(table)
+        total = sum(t['count'] for t in topics)
+        console.print(f"\n[dim]Total: {len(topics)} topics, {total} transcripts[/dim]")
+
+
+@library.command("search")
+@click.argument("query")
+@click.option("--topic", "-t", default=None, help="Limit search to specific topic")
+def library_search(query: str, topic: str):
+    """Search for text across saved transcripts.
+    
+    Searches all transcripts in the library for the query text
+    and shows matches with context.
+    """
+    from .library import get_library
+    lib = get_library()
+    
+    with console.status(f"Searching library for '{query}'..."):
+        results = lib.search(query, topic=topic)
+    
+    if not results:
+        console.print(f"[yellow]No matches for '{query}'[/yellow]")
+        if not topic:
+            console.print("[dim]Try searching within a specific topic: --topic NAME[/dim]")
+        return
+    
+    total_matches = sum(r['match_count'] for r in results)
+    console.print(f"\n[bold]Found {total_matches} matches across {len(results)} transcripts[/bold]\n")
+    
+    for r in results[:10]:  # Show top 10 transcripts
+        console.print(f"[bold cyan]{r['video_id']}[/bold cyan] ({r['match_count']} matches)")
+        console.print(f"  Topic: [green]{r['topic']}[/green] | {r.get('title', 'Unknown')} - {r.get('channel', 'Unknown')}")
+        
+        for match in r['matches'][:2]:  # Show first 2 matches per transcript
+            # Highlight query in match
+            console.print(f"  [dim]...{match}[/dim]")
+        console.print()
+
+
+@library.command("context")
+@click.argument("topic")
+@click.option("--max-chars", "-m", default=None, type=int, help="Maximum total characters")
+@click.option("--output", "-o", default=None, help="Save to file instead of printing")
+def library_context(topic: str, max_chars: int, output: str):
+    """Get all transcripts in a topic as combined text.
+    
+    Useful for providing LLM context. Concatenates all transcripts
+    with headers separating each video.
+    """
+    from .library import get_library
+    lib = get_library()
+    
+    with console.status(f"Building context from '{topic}'..."):
+        context = lib.get_context(topic, max_chars=max_chars)
+    
+    if not context:
+        console.print(f"[yellow]No transcripts in topic: {topic}[/yellow]")
+        return
+    
+    if output:
+        try:
+            with open(output, 'w', encoding='utf-8') as f:
+                f.write(context)
+            console.print(f"[green]✓ Saved context to: {output}[/green]")
+            console.print(f"[dim]Size: {len(context):,} characters[/dim]")
+        except Exception as e:
+            console.print(f"[red]Error saving file: {e}[/red]")
+    else:
+        console.print(context)
+
+
+@library.command("stats")
+def library_stats():
+    """Show library statistics."""
+    from .library import get_library
+    lib = get_library()
+    
+    stats = lib.stats()
+    
+    console.print(Panel(
+        f"[bold]Topics:[/bold] {stats['total_topics']}\n"
+        f"[bold]Transcripts:[/bold] {stats['total_transcripts']}\n"
+        f"[bold]Total Size:[/bold] {stats['total_size_mb']} MB",
+        title="Library Statistics"
+    ))
+    
+    if stats['topics']:
+        console.print("\n[bold]By Topic:[/bold]")
+        for t in stats['topics']:
+            console.print(f"  {t['topic']}: {t['count']} transcripts")
+
+
+@library.command("delete")
+@click.argument("target")
+@click.option("--topic", "-t", default=None, help="Delete from specific topic only")
+@click.option("--all", "delete_all", is_flag=True, help="Delete entire topic (use with topic as TARGET)")
+@click.confirmation_option(prompt="Are you sure you want to delete?")
+def library_delete(target: str, topic: str, delete_all: bool):
+    """Delete a transcript or entire topic.
+    
+    TARGET is either a video ID or topic name (with --all).
+    
+    Examples:
+    
+    \b
+        filmot library delete VIDEO_ID              # Delete from all topics
+        filmot library delete VIDEO_ID -t TOPIC    # Delete from specific topic
+        filmot library delete TOPIC --all          # Delete entire topic
+    """
+    from .library import get_library
+    lib = get_library()
+    
+    if delete_all:
+        # Delete entire topic
+        count = lib.delete_topic(target)
+        if count > 0:
+            console.print(f"[green]✓ Deleted topic '{target}' ({count} transcripts)[/green]")
+        else:
+            console.print(f"[yellow]Topic not found or empty: {target}[/yellow]")
+    else:
+        # Delete single transcript
+        deleted = lib.delete(target, topic=topic)
+        if deleted:
+            scope = f"from {topic}" if topic else "from all topics"
+            console.print(f"[green]✓ Deleted transcript {target} {scope}[/green]")
+        else:
+            console.print(f"[yellow]Transcript not found: {target}[/yellow]")
 
 
 def main():

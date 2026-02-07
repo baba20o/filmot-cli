@@ -418,3 +418,99 @@ def search_in_transcript(
         'language': result['language'],
         'is_generated': result['is_generated'],
     }
+
+
+def get_transcript_with_fallback(
+    video_id: str,
+    languages: Optional[list[str]] = None,
+    preserve_formatting: bool = False,
+    use_aws_fallback: bool = True,
+    aws_progress_callback=None,
+) -> dict:
+    """
+    Fetch transcript with AWS Transcribe fallback.
+    
+    Attempts to get transcript using youtube-transcript-api first.
+    If that fails (captions disabled, video unavailable, etc.) and
+    use_aws_fallback is True, falls back to AWS Transcribe.
+    
+    AWS Transcribe flow:
+    1. Download audio using yt-dlp
+    2. Upload to S3
+    3. Start transcription job with language auto-detection
+    4. Poll for completion
+    5. Fetch result and cleanup
+    
+    Requires:
+    - AWS credentials configured (profile 'APIBoss')
+    - yt-dlp installed
+    - boto3 and requests packages
+    
+    Args:
+        video_id: YouTube video ID or URL
+        languages: Preferred languages for youtube-transcript-api
+        preserve_formatting: Keep original line breaks
+        use_aws_fallback: Enable AWS Transcribe fallback
+        aws_progress_callback: Optional callback(stage, message) for AWS progress
+    
+    Returns:
+        dict with:
+            - video_id: The video ID
+            - language: Language code
+            - is_generated: Whether it's auto-generated (True for AWS)
+            - full_text: Complete transcript
+            - source: 'youtube' or 'aws_transcribe'
+            - segments: List of segments (empty for AWS)
+            - error: Error message if both methods fail
+    """
+    video_id = extract_video_id(video_id)
+    
+    # Try YouTube transcript API first
+    result = get_transcript(video_id, languages, preserve_formatting)
+    
+    if 'error' not in result:
+        result['source'] = 'youtube'
+        return result
+    
+    youtube_error = result.get('error', 'Unknown error')
+    
+    # If fallback disabled, return the error
+    if not use_aws_fallback:
+        return result
+    
+    # Try AWS Transcribe fallback
+    try:
+        from .aws_transcribe import transcribe_video, check_dependencies, AWSTranscribeError
+        
+        # Check dependencies first
+        deps_ok, deps_msg = check_dependencies()
+        if not deps_ok:
+            return {
+                'error': f"YouTube error: {youtube_error}. AWS fallback unavailable: {deps_msg}",
+                'video_id': video_id,
+            }
+        
+        # Run transcription
+        transcript_text, detected_language = transcribe_video(
+            video_id,
+            identify_language=True,
+            cleanup=True,
+            progress_callback=aws_progress_callback,
+        )
+        
+        return {
+            'video_id': video_id,
+            'language': detected_language or 'unknown',
+            'is_generated': True,
+            'segments': [],  # AWS doesn't provide timestamps in simple mode
+            'full_text': transcript_text,
+            'duration_seconds': 0,
+            'segment_count': 0,
+            'source': 'aws_transcribe',
+        }
+        
+    except Exception as e:
+        return {
+            'error': f"YouTube error: {youtube_error}. AWS fallback error: {str(e)}",
+            'video_id': video_id,
+        }

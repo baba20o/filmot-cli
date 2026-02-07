@@ -35,6 +35,87 @@ filmot transcript VIDEO_ID --full
 
 The `--full` flag outputs continuous text optimized for AI processing.
 
+### Save to Library
+```bash
+filmot transcript VIDEO_ID --full --save-to prompt-injection
+```
+
+Save transcripts to a topic folder for future reference.
+
+### Bulk Download from Search
+```bash
+filmot search "prompt injection" --bulk-download prompt-injection:10
+```
+
+Download top 10 transcripts from search results to the library.
+
+---
+
+## Transcript Library
+
+The library stores transcripts organized by topic/keyword. This is powerful because:
+
+1. **Persistent context** — Build curated knowledge bases on any topic
+2. **Local cache** — No re-fetching transcripts you already have
+3. **Cross-search** — Find content across all saved transcripts
+4. **LLM context** — Export combined text for AI consumption
+
+### Library Commands
+
+```bash
+# List all topics
+filmot library list
+
+# List transcripts in a topic
+filmot library list prompt-injection
+
+# Search across all saved transcripts
+filmot library search "attack vector"
+
+# Get combined text for LLM context
+filmot library context prompt-injection
+
+# Get combined text limited to 50K chars
+filmot library context prompt-injection --max-chars 50000
+
+# Save context to file
+filmot library context prompt-injection -o context.txt
+
+# Show library statistics
+filmot library stats
+
+# Delete a transcript
+filmot library delete VIDEO_ID
+
+# Delete entire topic
+filmot library delete topic-name --all
+```
+
+### Research Workflow with Library
+
+1. **Search** — Find videos on a topic
+2. **Bulk download** — Save top results to library
+3. **Review** — List what you saved
+4. **Deep dive** — Search within saved transcripts
+5. **Export** — Get combined context for LLM
+
+```bash
+# Step 1: Search
+filmot search "quantum computing" --min-views 10000 --sort viewcount
+
+# Step 2: Bulk download top 15 results
+filmot search "quantum computing" --min-views 10000 --sort viewcount --bulk-download quantum-computing:15
+
+# Step 3: See what we got
+filmot library list quantum-computing
+
+# Step 4: Find specific info in saved transcripts
+filmot library search "qubit error correction"
+
+# Step 5: Export all context for deep analysis
+filmot library context quantum-computing -o quantum_context.txt
+```
+
 ---
 
 ## Search Syntax That Actually Works
@@ -444,7 +525,25 @@ filmot transcript ai9Az88t2-s --full  # Tesla factory conversion news
 Some videos are region-locked, deleted, or private. Move on to another source.
 
 ### No transcript available
-Some videos don't have transcripts (live streams, music, etc.). The command will return an error.
+Some videos don't have transcripts (live streams, music, etc.). Use AWS Transcribe fallback:
+
+```bash
+# Auto-transcribe when YouTube captions unavailable
+filmot transcript VIDEO_ID --fallback --full
+
+# This will:
+# 1. Try YouTube captions first
+# 2. If unavailable, download audio via yt-dlp
+# 3. Upload to S3 and start AWS Transcribe job
+# 4. Poll for completion (typically 1-3 minutes)
+# 5. Return transcript with auto-detected language
+```
+
+**Requirements for AWS fallback:**
+- `yt-dlp` installed: `pip install yt-dlp`
+- `boto3` and `requests`: `pip install boto3 requests`
+- AWS profile `APIBoss` configured with Transcribe access
+- S3 bucket `gpttransscripts` accessible
 
 ### IP Blocked
 YouTube may block your IP for transcript requests. Use proxy options:
@@ -497,6 +596,13 @@ The power of this tool is **finding what people actually said**, not what videos
 | Date filter | `filmot search "query" --start-date YYYY-MM-DD --end-date YYYY-MM-DD --full` |
 | Get transcript | `filmot transcript VIDEO_ID --full` |
 | Save transcript | `filmot transcript VIDEO_ID --full -o filename.txt` |
+| Save to library | `filmot transcript VIDEO_ID --full --save-to TOPIC` |
+| Bulk download | `filmot search "query" --bulk-download TOPIC:10` |
+| List library | `filmot library list` |
+| List topic | `filmot library list TOPIC` |
+| Search library | `filmot library search "term"` |
+| Get LLM context | `filmot library context TOPIC -o context.txt` |
+| Library stats | `filmot library stats` |
 | Limit output | `filmot transcript VIDEO_ID --full 2>&1 \| Select-Object -First 200` |
 
 ---
