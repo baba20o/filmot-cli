@@ -37,6 +37,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+aws = [
+    "boto3>=1.26.0",
+    "yt-dlp>=2023.1.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",

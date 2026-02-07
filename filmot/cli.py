@@ -65,12 +65,14 @@ def cli():
 @click.option("--full", is_flag=True, help="Show all matches (no truncation) - useful for AI agents")
 @click.option("--raw", is_flag=True, help="Output raw JSON response")
 @click.option("--bulk-download", default=None, help="Download top N transcripts to TOPIC (e.g., --bulk-download prompt-injection:10)")
+@click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback during bulk download when captions unavailable")
 def search(query: str, lang: str, page: int, category: str, exclude: str, 
            channel_id: str, channel: str, channel_count: int, title: str, 
            min_views: int, max_views: int, min_likes: int, max_likes: int,
            min_duration: int, max_duration: int, start_date: str, end_date: str,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
-           max_query_time: int, hit_format: str, full: bool, raw: bool, bulk_download: str):
+           max_query_time: int, hit_format: str, full: bool, raw: bool, bulk_download: str,
+           fallback: bool):
     """Search for videos by subtitle/transcript content.
     
     Examples:
@@ -125,7 +127,7 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
         
         # Bulk download mode
         if bulk_download:
-            _bulk_download_transcripts(results, bulk_download, console)
+            _bulk_download_transcripts(results, bulk_download, console, fallback=fallback)
             return
         
         # Display formatted results
@@ -203,16 +205,17 @@ def _format_count(count: int) -> str:
         return str(count)
 
 
-def _bulk_download_transcripts(results: dict, bulk_download: str, console):
+def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallback: bool = False):
     """Download transcripts from search results to library.
     
     Args:
         results: Search results from Filmot API
         bulk_download: Format "TOPIC:N" or just "TOPIC" (defaults to 10)
         console: Rich console for output
+        fallback: If True, use AWS Transcribe when YouTube captions unavailable
     """
     from .library import get_library
-    from .transcript import get_transcript
+    from .transcript import get_transcript, get_transcript_with_fallback
     
     # Parse bulk_download format: "topic:10" or just "topic"
     if ":" in bulk_download:
@@ -254,7 +257,10 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console):
             continue
         
         try:
-            result = get_transcript(video_id)
+            if fallback:
+                result = get_transcript_with_fallback(video_id, use_aws_fallback=True)
+            else:
+                result = get_transcript(video_id)
             
             if "error" in result:
                 console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {result['error']}")
