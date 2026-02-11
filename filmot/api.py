@@ -33,6 +33,9 @@ class FilmotClient:
         
         # Rate limiting
         self.rate_limiter = get_rate_limiter(rate_limit, burst_size)
+
+        # Track cache hits for caller feedback
+        self.last_cache_hit = False
     
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None, 
                  data: Optional[Dict] = None, skip_cache: bool = False) -> Dict[str, Any]:
@@ -46,9 +49,11 @@ class FilmotClient:
             params = {}
         
         # Check cache first (only for GET requests)
+        self.last_cache_hit = False
         if method == "GET" and self.use_cache and self.cache and not skip_cache:
             cached = self.cache.get(endpoint, params)
             if cached is not None:
+                self.last_cache_hit = True
                 return cached
         
         # Apply rate limiting

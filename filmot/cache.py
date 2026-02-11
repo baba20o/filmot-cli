@@ -21,7 +21,23 @@ class Cache:
         self.cache_dir = Path(cache_dir)
         self.ttl = ttl
         self.cache_dir.mkdir(exist_ok=True)
+        self._auto_purge()
     
+    def _auto_purge(self) -> None:
+        """Silently remove expired entries on startup to prevent unbounded growth."""
+        current_time = time.time()
+        for cache_file in self.cache_dir.glob("*.json"):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached = json.load(f)
+                if current_time - cached.get("timestamp", 0) > self.ttl:
+                    cache_file.unlink()
+            except (json.JSONDecodeError, IOError, OSError):
+                try:
+                    cache_file.unlink()
+                except OSError:
+                    pass
+
     def _get_cache_key(self, endpoint: str, params: Dict[str, Any]) -> str:
         """Generate a unique cache key from endpoint and params."""
         # Sort params for consistent hashing

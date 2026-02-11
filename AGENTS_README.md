@@ -13,22 +13,132 @@ Filmot CLI searches **YouTube transcripts** (not titles, not descriptions—the 
 1. You can find discussions that aren't in video titles
 2. You get the exact context of what was said
 3. You can download full transcripts for deep analysis
-4. Date filtering lets you research current events in near-real-time
+4. You can build curated knowledge bases and cross-reference claims across sources
+5. Date filtering lets you research current events in near-real-time
 
 **Think of it as:** Google for what people *say* in YouTube videos.
 
 ---
 
-## Quick Start
+## Quick Start: The One-Command Research Workflow
+
+The fastest way to research any topic:
+
+```bash
+# Single command: searches, downloads, deduplicates, and summarizes
+filmot research "nuclear fusion energy" --depth 12 --dedupe --min-matches 2 --sort density
+```
+
+This will:
+1. Search for videos with "nuclear fusion energy" in both title and transcript
+2. Filter to only videos with 2+ subtitle matches
+3. Sort by relevance density (matches per minute) instead of views
+4. Download top 12 transcripts, skipping duplicates
+5. Save everything to your local library under the topic name
+6. Print a summary: X saved, Y skipped, Z failed, total characters
+
+Then cross-reference what your sources say:
+
+```bash
+# Compare how different sources discuss a specific claim
+filmot library compare "tritium" --sort density
+
+# Search for specific terms across all saved transcripts
+filmot library search "tokamak"
+
+# Export everything as structured markdown for deep analysis
+filmot library context nuclear-fusion-energy --format structured
+```
+
+---
+
+## The Research Command
+
+`filmot research` is the compound command that orchestrates the full workflow in one step.
+
+```bash
+filmot research "your topic" [OPTIONS]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-n, --depth N` | Number of transcripts to download | 10 |
+| `--min-views N` | Minimum view count filter | None |
+| `-l, --lang` | Language code | en |
+| `--fallback` | Use AWS Transcribe when captions unavailable | Off |
+| `--dedupe` | Skip duplicate/near-duplicate transcripts | Off |
+| `--min-matches N` | Only download videos with N+ subtitle matches | None |
+| `--sort [viewcount\|density]` | Sort by views or matches-per-minute | viewcount |
+
+### Recommended Settings
+
+```bash
+# For most research topics — gets the most relevant, unique content
+filmot research "your topic" --depth 12 --dedupe --min-matches 2 --sort density
+
+# For popular topics with lots of content — be more selective
+filmot research "artificial intelligence" --depth 15 --dedupe --min-matches 3 --min-views 50000 --sort density
+
+# For niche topics — cast a wider net
+filmot research "polymetallic nodules" --depth 20 --fallback
+```
+
+---
+
+## Search Command
 
 ### Basic Search
+
 ```bash
 filmot search "your query" --full --lang en
 ```
 
 Always use `--full` to see all matches without truncation. Add `--lang en` for English videos.
 
+### Key Search Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--min-matches N` | Only show videos with N+ subtitle matches | `--min-matches 3` |
+| `--sort density` | Sort by matches-per-minute (client-side) | `--sort density` |
+| `--dedupe` | Skip duplicates during bulk download | `--dedupe` |
+| `--title TEXT` | Filter by video title (supports operators) | `--title "fusion energy"` |
+| `--min-views N` | Minimum view count | `--min-views 10000` |
+| `--bulk-download TOPIC:N` | Download top N transcripts to library | `--bulk-download fusion:10` |
+| `--start-date` / `--end-date` | Date range filter (yyyy-mm-dd) | `--start-date 2026-01-01` |
+| `--sort` | Sort: `viewcount`, `likecount`, `uploaddate`, `duration`, `chanrank`, `id`, `density` | `--sort viewcount` |
+
+### Density Scoring
+
+Search results automatically show **density scoring** — matches per minute of video. This tells you how focused a video is on your topic:
+
+```
+Matches (12): Density: 2.4/min
+```
+
+A 5-minute video with 12 matches (2.4/min) is more relevant than a 3-hour video with 4 matches (0.02/min). Use `--sort density` to sort by this metric.
+
+### Search Syntax
+
+```bash
+# Phrase search (exact words in order)
+filmot search '"prompt injection"' --full --lang en
+
+# OR search (any term)
+filmot search 'OpenAI|Anthropic|DeepMind' --full --lang en
+
+# Proximity search (words within N words of each other)
+filmot search '"artificial intelligence" NEAR/20 "job displacement"'
+
+# Title + content filter (precision lever)
+filmot search "cobalt" --title "deep sea mining" --min-views 10000
+
+# Title supports operators too
+filmot search "cobalt" --title 'deep sea (mining | extraction)'
+```
+
 ### Get Full Transcript
+
 ```bash
 filmot transcript VIDEO_ID --full
 ```
@@ -36,29 +146,22 @@ filmot transcript VIDEO_ID --full
 The `--full` flag outputs continuous text optimized for AI processing.
 
 ### Save to Library
+
 ```bash
 filmot transcript VIDEO_ID --full --save-to prompt-injection
 ```
 
-Save transcripts to a topic folder for future reference.
-
 ### Bulk Download from Search
-```bash
-filmot search "prompt injection" --bulk-download prompt-injection:10
-```
 
-Download top 10 transcripts from search results to the library.
+```bash
+filmot search "prompt injection" --bulk-download prompt-injection:10 --dedupe
+```
 
 ---
 
 ## Transcript Library
 
-The library stores transcripts organized by topic/keyword. This is powerful because:
-
-1. **Persistent context** — Build curated knowledge bases on any topic
-2. **Local cache** — No re-fetching transcripts you already have
-3. **Cross-search** — Find content across all saved transcripts
-4. **LLM context** — Export combined text for AI consumption
+The library stores transcripts organized by topic/keyword. This is your persistent knowledge base.
 
 ### Library Commands
 
@@ -69,17 +172,20 @@ filmot library list
 # List transcripts in a topic
 filmot library list prompt-injection
 
-# Search across all saved transcripts
+# Search across all saved transcripts (word-boundary by default)
 filmot library search "attack vector"
+
+# Cross-source comparison — how different sources discuss a term
+filmot library compare "dark oxygen" --topic deep-sea-mining
 
 # Get combined text for LLM context
 filmot library context prompt-injection
 
+# Structured markdown with metadata headers (auto-saves to file)
+filmot library context prompt-injection --format structured
+
 # Get combined text limited to 50K chars
 filmot library context prompt-injection --max-chars 50000
-
-# Save context to file
-filmot library context prompt-injection -o context.txt
 
 # Show library statistics
 filmot library stats
@@ -91,29 +197,128 @@ filmot library delete VIDEO_ID
 filmot library delete topic-name --all
 ```
 
-### Research Workflow with Library
+### Library Search: Word-Boundary Matching
 
-1. **Search** — Find videos on a topic
-2. **Bulk download** — Save top results to library
-3. **Review** — List what you saved
-4. **Deep dive** — Search within saved transcripts
-5. **Export** — Get combined context for LLM
+Library search uses **word-boundary matching** by default. This prevents false positives:
+
+- Searching "ore" won't match "more", "before", "explore"
+- Searching "patent" won't match "patents" — but **auto-fallback kicks in**
+
+**Auto-fallback behavior:** When word-boundary search finds zero results, it automatically retries with substring matching and shows a hint:
+
+```
+No exact word matches. Showing substring matches (plurals/inflections):
+```
+
+This catches plurals, verb forms, and inflections (e.g., "patent" finds "patents", "laser" finds "lasers"). Use `--substring` flag to force substring matching from the start.
+
+### Library Compare: Cross-Source Verification
+
+This is the power feature for fact-checking and analysis. Search for a term across all saved transcripts and see how each source discusses it:
 
 ```bash
-# Step 1: Search
-filmot search "quantum computing" --min-views 10000 --sort viewcount
+filmot library compare "tritium" --sort density
 
-# Step 2: Bulk download top 15 results
-filmot search "quantum computing" --min-views 10000 --sort viewcount --bulk-download quantum-computing:15
+# Output:
+# Source 1: "The Future of Fusion" by Real Engineering
+#   [3 mentions] Density: 1.2/min
+#   "...tritium is the limiting factor in fusion power because..."
+# Source 2: "Fusion Energy Explained" by Kurzgesagt
+#   [1 mention] Density: 0.4/min
+#   "...the fuel for fusion is deuterium and tritium, both..."
+```
 
-# Step 3: See what we got
-filmot library list quantum-computing
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--topic, -t` | Limit to specific topic | All topics |
+| `--context, -c N` | Characters of context around matches | 300 |
+| `--sort [mentions\|density]` | Sort by mention count or mentions-per-minute | mentions |
 
-# Step 4: Find specific info in saved transcripts
-filmot library search "qubit error correction"
+**Tip:** Use `--sort density` to find sources that discuss a term most intensely, not just most frequently. A 10-minute deep dive with 5 mentions is more useful than a 2-hour podcast with 6 passing mentions.
 
-# Step 5: Export all context for deep analysis
-filmot library context quantum-computing -o quantum_context.txt
+### Structured Context Export
+
+For deep LLM analysis, export your library as structured markdown:
+
+```bash
+filmot library context nuclear-fusion-energy --format structured
+```
+
+This auto-saves to `{topic}-context.md` with full metadata headers:
+
+```markdown
+# Topic: nuclear-fusion-energy
+## Video 1: "The Truth about Fusion" by Real Engineering
+- Video ID: 73mXXJpEjRI
+- Duration: 15m 32s | Views: 1,874,577
+- Saved: 2026-02-11
+
+[transcript text]
+
+---
+## Video 2: ...
+```
+
+---
+
+## Pipeline Mode
+
+For advanced workflows, pipe search results into the download command:
+
+```bash
+# Search with raw output, pipe to download
+filmot search "deep sea mining" --title "deep sea mining" --raw | filmot download -t deep-sea --dedupe
+
+# Multi-page search piped to download
+filmot search-all "AI safety" --pages 5 --raw > results.json
+type results.json | filmot download -t ai-safety --dedupe -n 20
+```
+
+---
+
+## The Full Research Workflow (Step by Step)
+
+If you want more control than `filmot research`, here's the manual workflow:
+
+### Step 1: Research Command (Fastest Path)
+```bash
+filmot research "solid state batteries" --depth 15 --dedupe --min-matches 2 --sort density
+```
+
+### Step 2: Explore What You Have
+```bash
+# See what was saved
+filmot library list solid-state-batteries
+
+# Library stats
+filmot library stats
+```
+
+### Step 3: Cross-Reference Claims
+```bash
+# How do sources discuss specific claims?
+filmot library compare "energy density" --sort density
+filmot library compare "Toyota" --sort density
+filmot library compare "safety" --sort density
+filmot library compare "cost" --sort density
+```
+
+### Step 4: Targeted Follow-Up Search
+```bash
+# Found a specific claim? Search more broadly
+filmot search '"solid state battery" breakthrough' --min-views 10000 --sort density --min-matches 3
+
+# Get a specific video's full transcript
+filmot transcript VIDEO_ID --full
+```
+
+### Step 5: Export for Deep Analysis
+```bash
+# Structured markdown with metadata (auto-saves to file)
+filmot library context solid-state-batteries --format structured
+
+# Plain text with char limit
+filmot library context solid-state-batteries --max-chars 100000 -o context.txt
 ```
 
 ---
@@ -121,17 +326,12 @@ filmot library context quantum-computing -o quantum_context.txt
 ## Search Syntax That Actually Works
 
 ### 1. Phrase Search (Most Useful)
-Wrap phrases in double quotes to find exact matches:
-
 ```bash
 filmot search '"prompt injection"' --full --lang en
 ```
-
-Note: Use single quotes around the entire query to preserve the inner double quotes in shell.
+Note: Use single quotes around the entire query to preserve inner double quotes in shell.
 
 ### 2. OR Search with Pipe
-Find videos mentioning any of multiple terms:
-
 ```bash
 filmot search 'OpenAI|Anthropic|DeepMind' --full --lang en
 ```
@@ -146,210 +346,44 @@ filmot search '"Tesla Optimus"|"Boston Dynamics"|"Figure AI"' --full --lang en
 filmot search '"prompt injection"' --start-date 2025-12-01 --end-date 2026-02-01 --full --lang en
 ```
 
-Format: `yyyy-mm-dd`. This is essential for researching recent developments.
-
-### 5. Multi-word Concepts
+### 5. Proximity Search (The Killer Feature)
 ```bash
-filmot search '"humanoid robot" factory|"humanoid robot" manufacturing' --full --lang en
+filmot search '"artificial intelligence" NEAR/20 "job displacement"' --full
 ```
+Finds moments where two concepts are discussed together, not just videos containing both words.
 
-### 6. Title Filtering
-Search transcripts but only in videos with specific title keywords:
-
+### 6. Title Filtering (Precision Lever)
 ```bash
 filmot search 'security' --title "CES 2026" --full --lang en
 ```
-
-This finds videos with "CES 2026" in the title that mention "security" in the transcript. Great for finding specific conference talks or series.
+Title supports operators: `--title 'deep sea (mining | extraction)'`
 
 ### 7. Channel Filtering
-Search within a specific channel or find top channels on a topic:
-
 ```bash
 # Search specific channel by ID
 filmot search 'AI safety' --channel-id UCxxxxxx --full --lang en
 
-# Search multiple channels at once (comma-delimited)
-filmot search 'AI safety' --channel-id UCxxxxxx,UCyyyyyy,UCzzzzzz --full --lang en
+# Search multiple channels (comma-delimited)
+filmot search 'AI safety' --channel-id UCxxxxxx,UCyyyyyy --full --lang en
 
-# Find top channels discussing a topic, then search those
-filmot search 'machine learning' --channel "programming" --channel-count 5 --full --lang en
+# Find top channels discussing a topic
+filmot search 'machine learning' --channel "programming" --channel-count 5 --full
 ```
 
-### 8. View/Engagement Filtering
-Find popular content on a topic:
-
+### 8. View/Duration Filtering
 ```bash
-filmot search 'prompt injection' --min-views 100000 --sort viewcount --order desc --full --lang en
+# Popular content
+filmot search 'prompt injection' --min-views 100000 --sort viewcount --full
+
+# Long-form deep dives (30+ minutes)
+filmot search 'humanoid robots' --min-duration 1800 --full
+
+# Short explainers (under 10 minutes)
+filmot search 'prompt injection' --max-duration 600 --full
 ```
 
-**Available sort fields:** `viewcount`, `likecount`, `uploaddate`, `duration`, `chanrank`, `id`
-
-### 9. Duration Filtering
-Find long-form content (deep dives) or short explainers:
-
-```bash
-# Long videos (over 30 minutes)
-filmot search 'humanoid robots' --min-duration 1800 --full --lang en
-
-# Short videos (under 10 minutes)  
-filmot search 'prompt injection' --max-duration 600 --full --lang en
-```
-
----
-
-## Real Research Examples
-
-Here are actual queries I ran during research sessions:
-
-### Researching AI Company News
-```bash
-# OpenAI current events
-filmot search 'OpenAI|"Sam Altman"' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
-
-# Anthropic developments  
-filmot search 'Anthropic|"Dario Amodei"|Claude' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
-```
-
-### Researching Security Topics
-```bash
-# Prompt injection attacks
-filmot search '"prompt injection" attack|"indirect prompt injection"' --start-date 2024-01-01 --end-date 2026-02-01 --full --lang en
-
-# MCP security concerns
-filmot search '"MCP" vulnerability|"model context protocol" security' --full --lang en
-```
-
-### Researching Technology Trends
-```bash
-# Humanoid robots
-filmot search 'Tesla Optimus|Figure robot|Boston Dynamics|Unitree' --start-date 2025-12-01 --end-date 2026-02-01 --full --lang en
-
-# Specific product launches
-filmot search '"Optimus Gen 3"|"Figure 02"' --full --lang en
-```
-
-### Finding Explainer Content
-```bash
-# How something works
-filmot search '"prompt injection" "how it works"|"prompt injection" explained' --full --lang en
-
-# Tutorials and demonstrations
-filmot search '"prompt injection" tutorial|"prompt injection" demonstration' --full --lang en
-```
-
----
-
-## The Research Workflow
-
-### Step 1: Broad Search
-Start with a broad query to see what's out there:
-
-```bash
-filmot search 'humanoid robot' --start-date 2025-12-01 --end-date 2026-02-01 --full --lang en
-```
-
-Look at: result count, channels appearing, match snippets.
-
-### Step 2: Identify Key Videos
-From the results, note videos that look valuable:
-- High view counts from reputable channels
-- Multiple relevant matches in the same video
-- Expert interviews or conference talks
-
-### Step 3: Get Full Transcripts
-For important videos, download the complete transcript:
-
-```bash
-filmot transcript VIDEO_ID --full
-```
-
-This gives you the entire spoken content for deep analysis.
-
-### Step 4: Targeted Follow-up
-Based on what you learn, do targeted searches:
-
-```bash
-# Found "Shadow Leak" mentioned? Search for it specifically
-filmot search '"shadow leak" attack' --full --lang en
-```
-
-### Step 5: Synthesize
-Combine insights from multiple transcripts into your analysis.
-
----
-
-## Practical Tips
-
-### Tip 1: Pipe to Select-Object for Long Output
-Transcripts can be very long. Use PowerShell to limit output:
-
-```powershell
-filmot transcript VIDEO_ID --full 2>&1 | Select-Object -First 200
-```
-
-Adjust the number based on how much context you need.
-
-### Tip 2: Video IDs Starting with Dash
-Some YouTube video IDs start with `-` (e.g., `-O1bjFPgRQM`). These work directly now:
-
-```bash
-filmot transcript -O1bjFPgRQM --full
-```
-
-### Tip 3: Check Result Count First
-The result count tells you how much content exists:
-- 50-200 results: Good, focused topic
-- 500-2000 results: Broad topic, may need filtering
-- 10,000+ results: Too broad, add more specific terms
-
-### Tip 4: Channel Quality Indicators
-In search results, note:
-- Subscriber counts (higher often = more reliable)
-- View counts (popular = vetted by audience)
-- Channel category (Science & Technology, Education = usually substantive)
-
-### Tip 5: Conference Talks Are Gold
-Search for conference content—it's usually high-quality:
-
-```bash
-filmot search '"CES 2026"|"39C3"|"DEF CON"' --full --lang en
-```
-
-### Tip 6: Use Expert Names
-If you know experts in a field, search for them:
-
-```bash
-filmot search '"Meredith Whitaker"|"Signal president"' --full --lang en
-```
-
-### Tip 7: Combine Concepts for Precision
-Instead of single terms, combine related concepts:
-
-```bash
-# Instead of just "AI safety"
-filmot search '"AI safety" regulation|"AI governance" policy' --full --lang en
-```
-
-### Tip 8: Manual vs Auto Subtitles
-By default, Filmot searches **auto-generated subtitles** (YouTube's speech-to-text). Use `--manual-subs` to search **manually uploaded subtitles** only:
-
-```bash
-# Search auto subs (default) - better coverage
-filmot search 'quantum computing' --full --lang en
-
-# Search manual subs only - often higher quality
-filmot search 'quantum computing' --manual-subs --full --lang en
-```
-
-**Important:** You cannot search both in the same request. Auto subs have far more coverage; manual subs are rarer but more accurate.
-
-### Tip 9: Title Search for Proper Nouns/Neologisms (Critical!)
-**This is crucial for tracking viral phenomena or brand names.** 
-
-Phonetic transcription doesn't reliably capture proper nouns, brand names, or neologisms. For example, "Clawdbot" might be transcribed as "clawd bot", "claude bot", or missed entirely.
-
-**The workaround:** Use generic transcript terms combined with the `--title` filter:
+### 9. Title Search for Proper Nouns (Critical!)
+Phonetic transcription doesn't reliably capture proper nouns or brand names. Use generic transcript terms combined with `--title`:
 
 ```bash
 # WRONG: Direct search often returns nothing
@@ -359,163 +393,80 @@ filmot search "clawdbot" --full
 filmot search 'AI|robot|open source' --title "clawdbot" --full
 ```
 
-**Important limitation:** The CLI returns results weighted by relevance/views, which means it will **miss zero-view origin videos**. For true viral archaeology (finding the first video ever made on a topic), you may need:
-1. The Filmot website's date sort (oldest first)
-2. A CSV export from Filmot website
-
-**Real example:** Tracking Clawdbot's viral rise
-- CLI search found 169 videos but missed the true origin
-- Website date-sorted search revealed: **Jan 15, 2026** - "Open Source Friday with Clawdbot 🦀" by Andrea Griffiths (0 views, 151 subs) - the inventor's first interview
-- The CLI missed this because: 0 views = low relevance, no transcript = no matches
-
-**Key insight:** When researching viral phenomena, the CLI excels at finding the *explosion* (high-view videos), but the website excels at finding the *spark* (origin videos).
-
 ---
 
-## Understanding Search Results
+## Practical Tips
 
-Each result shows:
-```
-1. Video Title
-   Channel: Name (Subscriber count) | Country: XX
-   Views: N | Likes: N | Duration: Xm Ys
-   Category: Category | Language: en | Uploaded: YYYY-MM-DD
-   Video: https://youtube.com/watch?v=VIDEO_ID
-   Matches (N):
-      [MM:SS] ...context around match...
-      [MM:SS] ...another match...
-```
+### Tip 1: Always Use `--dedupe` for Bulk Operations
+Many YouTube channels repackage the same content. `--dedupe` hashes the first 500 characters of each transcript and skips duplicates.
 
-**What to look for:**
-- **Match timestamps**: Shows where in the video the topic appears
-- **Match context**: The actual words spoken—scan for relevance
-- **Multiple matches**: More matches = more substantial coverage
-- **Duration**: Longer videos with many matches = deep dives
+### Tip 2: `--sort density` Over `--sort viewcount`
+Default sort is by views, which biases toward popular channels over focused content. `--sort density` (matches per minute) finds the videos most intensely focused on your topic.
 
----
+### Tip 3: `--min-matches` Cuts Noise
+A video with 1 passing mention is rarely useful. `--min-matches 2` or `--min-matches 3` ensures videos have substantial coverage of your query.
 
-## Transcript Output
+### Tip 4: Library Compare Is Your Fact-Checker
+After building a library on a topic, use `library compare` to see how different sources treat specific claims. This surfaces agreement, contradiction, and context across sources.
 
-When you run `filmot transcript VIDEO_ID --full`, you get:
+### Tip 5: Auto-Fallback Handles Plurals
+Library search uses word-boundary matching but automatically falls back to substring matching when no exact matches are found. You don't need to worry about searching "patent" vs "patents".
 
-```
-┌────────────────────────────── Transcript Info ──────────────────────────────┐
-│ Video ID: XXXXXXXXXXX                                                       │
-│ Language: en (auto-generated or manual)                                     │
-│ Duration: X:XX:XX                                                           │
-│ Segments: N                                                                 │
-└─────────────────────────────────────────────────────────────────────────────┘
+### Tip 6: Structured Context for Long Analysis
+`--format structured` creates well-organized markdown with video metadata headers. It auto-saves to a file so you don't dump 100KB+ to stdout.
 
-[Full transcript text follows as continuous prose...]
+### Tip 7: Conference Talks Are Gold
+```bash
+filmot search '"CES 2026"|"39C3"|"DEF CON"' --full --lang en
 ```
 
-The text is formatted for AI consumption—no timestamps interrupting the flow.
+### Tip 8: Manual vs Auto Subtitles
+Use `--manual-subs` for manually uploaded subtitles (higher quality, less coverage). Default searches auto-generated subtitles (wider coverage). Cannot search both in the same request.
+
+### Tip 9: Pipe to Select-Object for Long Output
+```powershell
+filmot transcript VIDEO_ID --full 2>&1 | Select-Object -First 200
+```
 
 ---
 
 ## Common Research Patterns
 
-### Pattern 1: Current Events Research
+### Pattern 1: Full Topic Research (Recommended)
 ```bash
-# Step 1: What happened this month?
+# One command does it all
+filmot research "brain-computer interfaces" --depth 15 --dedupe --min-matches 2 --sort density
+
+# Then explore
+filmot library compare "Neuralink" --sort density
+filmot library compare "safety" --sort density
+filmot library context brain-computer-interfaces --format structured
+```
+
+### Pattern 2: Current Events
+```bash
 filmot search 'TOPIC' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
-
-# Step 2: Get transcripts of key videos
 filmot transcript VIDEO_ID --full
 ```
 
-### Pattern 2: Technical Deep Dive
+### Pattern 3: Technical Deep Dive
 ```bash
-# Step 1: Find explainer content
-filmot search '"CONCEPT" explained|"CONCEPT" tutorial|"CONCEPT" how works' --full --lang en
-
-# Step 2: Find expert discussions
-filmot search '"CONCEPT"' --full --lang en
-# Look for university channels, conference talks, known experts
-
-# Step 3: Get full transcripts of best matches
+filmot search '"CONCEPT" explained|"CONCEPT" tutorial' --full --lang en --sort density
 filmot transcript VIDEO_ID --full
 ```
 
-### Pattern 3: Controversy/Multiple Perspectives
+### Pattern 4: Multiple Perspectives
 ```bash
-# Search for different viewpoints
-filmot search '"TOPIC" criticism|"TOPIC" problems' --full --lang en
-filmot search '"TOPIC" benefits|"TOPIC" success' --full --lang en
+filmot research "TOPIC" --depth 20 --dedupe --sort density
+filmot library compare "criticism" --sort density
+filmot library compare "benefit" --sort density
 ```
 
-### Pattern 4: Finding Primary Sources
+### Pattern 5: Pipeline for Custom Filtering
 ```bash
-# Company announcements
-filmot search '"COMPANY" announcement|"COMPANY" keynote|"COMPANY" CEO' --full --lang en
-
-# Conference presentations
-filmot search '"PERSON NAME" talk|"PERSON NAME" presentation' --full --lang en
+# Raw search → custom filter → download
+filmot search "your query" --raw | filmot download -t my-topic --dedupe -n 20
 ```
-
----
-
-## What I Researched (Real Examples)
-
-### Session 1: AI Company Analysis
-**Goal:** Understand current state of OpenAI and Anthropic
-
-**Commands run:**
-```bash
-filmot search 'OpenAI|"Sam Altman"' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
-# Found 458 results including Musk lawsuit, financial troubles, PRISM launch
-
-filmot search 'Anthropic|"Dario Amodei"|Claude' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
-# Found 844 results including Dario's essay, Claude psychological issues
-
-# Then got full transcripts of key videos
-filmot transcript kSno1-xOjwI --full  # Security analysis
-filmot transcript TTMOSR-nKjg --full  # Industry news roundup
-```
-
-**Output:** Comprehensive analysis of both companies' financial situations, product launches, and controversies.
-
-### Session 2: Security Research (Prompt Injection)
-**Goal:** Understand how prompt injection attacks work technically
-
-**Commands run:**
-```bash
-filmot search '"prompt injection"' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
-# Found 158 results
-
-filmot search '"prompt injection" "how it works"|"indirect prompt injection"' --full --lang en
-# Found explainer content
-
-# Key transcripts
-filmot transcript rAEqP9VEhe8 --full  # Computerphile technical explanation
-filmot transcript -O1bjFPgRQM --full  # David Bombal zero-click demo
-filmot transcript 0ANECpNdt-4 --full  # 39C3 conference talk
-filmot transcript Qvx2sVgQ-u0 --full  # NetworkChuck hacking tutorial
-```
-
-**Output:** Complete technical understanding of attack vectors, real-world demos, and defense strategies.
-
-### Session 3: Technology Trends (Humanoid Robots)
-**Goal:** What's happening in humanoid robotics right now?
-
-**Commands run:**
-```bash
-filmot search 'humanoid robot|humanoid robots' --start-date 2025-12-01 --end-date 2026-02-01 --full --lang en
-# Found 4,745 results - too broad
-
-filmot search 'Tesla Optimus|Figure robot|Boston Dynamics|Unitree' --start-date 2025-12-01 --end-date 2026-02-01 --full --lang en
-# Found 898 results - more focused
-
-filmot search '"humanoid robot" factory|"humanoid robot" manufacturing' --full --lang en
-# Found deployment news
-
-# Key transcripts
-filmot transcript UrB2tQDVLLo --full  # Musk at Davos
-filmot transcript fadawnuE6n8 --full  # Hyundai/Boston Dynamics CES
-filmot transcript ai9Az88t2-s --full  # Tesla factory conversion news
-```
-
-**Output:** Understanding of current production timelines, pricing, and deployment status across major players.
 
 ---
 
@@ -525,61 +476,29 @@ filmot transcript ai9Az88t2-s --full  # Tesla factory conversion news
 Some videos are region-locked, deleted, or private. Move on to another source.
 
 ### No transcript available
-Some videos don't have transcripts (live streams, music, etc.). Use AWS Transcribe fallback:
-
+Use AWS Transcribe fallback:
 ```bash
-# Auto-transcribe when YouTube captions unavailable
 filmot transcript VIDEO_ID --fallback --full
-
-# This will:
-# 1. Try YouTube captions first
-# 2. If unavailable, download audio via yt-dlp
-# 3. Upload to S3 and start AWS Transcribe job
-# 4. Poll for completion (typically 1-3 minutes)
-# 5. Return transcript with auto-detected language
 ```
-
-**Requirements for AWS fallback:**
-- `yt-dlp` installed: `pip install yt-dlp`
-- `boto3` and `requests`: `pip install boto3 requests`
-- AWS profile `APIBoss` configured with Transcribe access
-- S3 bucket `gpttransscripts` accessible
+Requires: `yt-dlp`, `boto3`, `requests`, and AWS profile `APIBoss` configured.
 
 ### IP Blocked
-YouTube may block your IP for transcript requests. Use proxy options:
-
+YouTube may block your IP for transcript requests:
 ```bash
-# Use a specific proxy
+# Use proxy
 filmot transcript VIDEO_ID --proxy http://user:pass@host:port --full
 
 # Or set WEBSHARE_PROXY_USERNAME and WEBSHARE_PROXY_PASSWORD in .env
 
-# To bypass proxy and connect directly (even if env vars are set)
+# Bypass proxy and connect directly
 filmot transcript VIDEO_ID --no-proxy --full
 ```
 
-### Rate limiting
-If making many requests, you might hit API limits. Space out requests if needed.
-
 ### Very long transcripts
-For 2+ hour videos, the transcript can be 100K+ characters. Use `Select-Object -First N` to get manageable chunks, or save to file:
-
+For 2+ hour videos, use `Select-Object -First N` or save to file:
 ```bash
 filmot transcript VIDEO_ID --full -o transcript.txt
 ```
-
----
-
-## Key Insight
-
-The power of this tool is **finding what people actually said**, not what videos are titled. This means:
-
-1. You can find discussions of topics that weren't the main subject of a video
-2. You can verify claims by finding primary sources
-3. You can research topics that don't have dedicated videos yet (they're discussed inside other content)
-4. You can find expert opinions embedded in interviews and podcasts
-
-**YouTube is the world's largest repository of human knowledge in spoken form. This tool lets you search it.**
 
 ---
 
@@ -587,24 +506,24 @@ The power of this tool is **finding what people actually said**, not what videos
 
 | Task | Command |
 |------|---------|
-| Multi-channel search | `filmot search "query" --channel-id UC1,UC2,UC3 --full` |
-| Sort by likes | `filmot search "query" --sort likecount --order desc --full` |
-| Manual subs only | `filmot search "query" --manual-subs --full` |
-| Basic search | `filmot search "query" --full --lang en` |
-| Phrase search | `filmot search '"exact phrase"' --full --lang en` |
-| OR search | `filmot search 'term1\|term2' --full --lang en` |
-| Date filter | `filmot search "query" --start-date YYYY-MM-DD --end-date YYYY-MM-DD --full` |
-| Get transcript | `filmot transcript VIDEO_ID --full` |
-| Save transcript | `filmot transcript VIDEO_ID --full -o filename.txt` |
-| Save to library | `filmot transcript VIDEO_ID --full --save-to TOPIC` |
-| Bulk download | `filmot search "query" --bulk-download TOPIC:10` |
-| List library | `filmot library list` |
-| List topic | `filmot library list TOPIC` |
-| Search library | `filmot library search "term"` |
-| Get LLM context | `filmot library context TOPIC -o context.txt` |
-| Library stats | `filmot library stats` |
-| Limit output | `filmot transcript VIDEO_ID --full 2>&1 \| Select-Object -First 200` |
+| **Research a topic (one command)** | `filmot research "topic" --depth 12 --dedupe --sort density` |
+| **Compare sources on a claim** | `filmot library compare "claim" --sort density` |
+| **Search library** | `filmot library search "term"` |
+| **Structured export** | `filmot library context TOPIC --format structured` |
+| **Basic search** | `filmot search "query" --full --lang en` |
+| **Phrase search** | `filmot search '"exact phrase"' --full --lang en` |
+| **OR search** | `filmot search 'term1\|term2' --full --lang en` |
+| **Proximity search** | `filmot search '"word1" NEAR/20 "word2"' --full` |
+| **Date filter** | `filmot search "query" --start-date YYYY-MM-DD --end-date YYYY-MM-DD --full` |
+| **Density sort** | `filmot search "query" --sort density --min-matches 3 --full` |
+| **Get transcript** | `filmot transcript VIDEO_ID --full` |
+| **Save to library** | `filmot transcript VIDEO_ID --full --save-to TOPIC` |
+| **Bulk download (dedupe)** | `filmot search "query" --bulk-download TOPIC:10 --dedupe` |
+| **Pipeline download** | `filmot search "query" --raw \| filmot download -t TOPIC --dedupe` |
+| **List library** | `filmot library list` |
+| **Library stats** | `filmot library stats` |
+| **Limit output** | `filmot transcript VIDEO_ID --full 2>&1 \| Select-Object -First 200` |
 
 ---
 
-*This guide was written based on actual research sessions using Filmot CLI. The examples are real queries that produced useful results.*
+*This guide was written based on actual research sessions using Filmot CLI across topics including AI security, nuclear fusion, solid-state batteries, brain-computer interfaces, and humanoid robotics.*

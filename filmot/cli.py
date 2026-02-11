@@ -5,12 +5,13 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich import print as rprint
-from rich.json import JSON
+import json as json_mod
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from .api import FilmotClient
 
 
 console = Console()
+stderr_console = Console(stderr=True)
 
 
 class VideoIdType(click.ParamType):
@@ -57,22 +58,24 @@ def cli():
 @click.option("--end-date", default=None, help="End date (yyyy-mm-dd)")
 @click.option("--country", default=None, type=int, help="Country code (e.g., 217=US, 153=UK)")
 @click.option("--license", "license_type", default=None, type=click.Choice(["1", "2"]), help="License: 1=Standard, 2=Creative Commons")
-@click.option("--sort", default=None, type=click.Choice(["viewcount", "likecount", "uploaddate", "duration", "chanrank", "id"]), help="Sort field")
+@click.option("--sort", default=None, type=click.Choice(["viewcount", "likecount", "uploaddate", "duration", "chanrank", "id", "density"]), help="Sort field (density = client-side matches/min sort)")
 @click.option("--order", default=None, type=click.Choice(["asc", "desc"]), help="Sort order")
 @click.option("--manual-subs", is_flag=True, help="Search manual subtitles only (default: auto subs). Cannot search both in same request.")
 @click.option("--max-query-time", default=None, type=int, help="Max query time in ms (4-15000)")
 @click.option("--hit-format", default=None, type=click.Choice(["0", "1"]), help="Hit format: 0=context, 1=full lines")
 @click.option("--full", is_flag=True, help="Show all matches (no truncation) - useful for AI agents")
 @click.option("--raw", is_flag=True, help="Output raw JSON response")
+@click.option("--min-matches", default=None, type=int, help="Only show videos with at least N subtitle matches")
 @click.option("--bulk-download", default=None, help="Download top N transcripts to TOPIC (e.g., --bulk-download prompt-injection:10)")
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback during bulk download when captions unavailable")
-def search(query: str, lang: str, page: int, category: str, exclude: str, 
-           channel_id: str, channel: str, channel_count: int, title: str, 
+@click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts during bulk download")
+def search(query: str, lang: str, page: int, category: str, exclude: str,
+           channel_id: str, channel: str, channel_count: int, title: str,
            min_views: int, max_views: int, min_likes: int, max_likes: int,
            min_duration: int, max_duration: int, start_date: str, end_date: str,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
-           max_query_time: int, hit_format: str, full: bool, raw: bool, bulk_download: str,
-           fallback: bool):
+           max_query_time: int, hit_format: str, full: bool, raw: bool, min_matches: int,
+           bulk_download: str, fallback: bool, dedupe: bool):
     """Search for videos by subtitle/transcript content.
     
     Examples:
@@ -110,8 +113,8 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
                 end_date=end_date,
                 country=country,
                 license_type=int(license_type) if license_type else None,
-                sort_field=sort,
-                sort_order=order,
+                sort_field=sort if sort != "density" else None,
+                sort_order=order if sort != "density" else None,
                 search_manual_subs=1 if manual_subs else None,
                 max_query_time=max_query_time,
                 hit_format=int(hit_format) if hit_format else None,
@@ -120,16 +123,38 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
         if "error" in results:
             console.print(f"[red]Error: {results['error']}[/red]")
             return
-        
+
+        # Apply --min-matches filter (client-side)
+        if min_matches is not None:
+            videos = results.get("result", [])
+            filtered = [v for v in videos if len(v.get("hits", [])) >= min_matches]
+            original_count = len(videos)
+            results["result"] = filtered
+            if original_count != len(filtered):
+                console.print(f"[dim]Filtered: {original_count} -> {len(filtered)} videos (min {min_matches} matches)[/dim]")
+
+        # Apply --sort density (client-side sort by matches per minute)
+        if sort == "density":
+            videos = results.get("result", [])
+            def _density_key(v):
+                dur = v.get("duration", 0)
+                hits = len(v.get("hits", []))
+                return hits / (dur / 60) if dur > 0 else 0
+            results["result"] = sorted(videos, key=_density_key, reverse=(order != "asc"))
+            console.print(f"[dim]Sorted by density (matches/min)[/dim]")
+
         if raw:
-            console.print(JSON.from_data(results))
+            click.echo(json_mod.dumps(results, indent=2, ensure_ascii=False))
             return
-        
+
+        if client.last_cache_hit:
+            console.print("[dim]Cached response[/dim]")
+
         # Bulk download mode
         if bulk_download:
-            _bulk_download_transcripts(results, bulk_download, console, fallback=fallback)
+            _bulk_download_transcripts(results, bulk_download, console, fallback=fallback, dedupe=dedupe)
             return
-        
+
         # Display formatted results
         _display_subtitle_results(results, query, full=full)
         
@@ -205,18 +230,42 @@ def _format_count(count: int) -> str:
         return str(count)
 
 
-def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallback: bool = False):
+def _backfill_metadata(video_id: str, title: str, channel: str) -> tuple:
+    """Fetch title/channel from Filmot API when search results have Unknown metadata.
+
+    Returns (title, channel) — using the originals if the lookup fails or isn't needed.
+    """
+    if title not in ("Unknown", "") and channel not in ("Unknown", ""):
+        return title, channel
+    try:
+        client = FilmotClient()
+        info = client.get_videos(video_id)
+        videos = info.get("result", info.get("videos", []))
+        if videos:
+            v = videos[0] if isinstance(videos, list) else videos
+            if title in ("Unknown", ""):
+                title = v.get("title", v.get("name", title))
+            if channel in ("Unknown", ""):
+                channel = v.get("channelname", v.get("channeltitle", channel))
+    except Exception:
+        pass
+    return title, channel
+
+
+def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallback: bool = False, dedupe: bool = False):
     """Download transcripts from search results to library.
-    
+
     Args:
         results: Search results from Filmot API
         bulk_download: Format "TOPIC:N" or just "TOPIC" (defaults to 10)
         console: Rich console for output
         fallback: If True, use AWS Transcribe when YouTube captions unavailable
+        dedupe: If True, skip transcripts that are near-duplicates of already downloaded ones
     """
+    import hashlib
     from .library import get_library
     from .transcript import get_transcript, get_transcript_with_fallback
-    
+
     # Parse bulk_download format: "topic:10" or just "topic"
     if ":" in bulk_download:
         topic, count_str = bulk_download.rsplit(":", 1)
@@ -228,45 +277,69 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
     else:
         topic = bulk_download
         max_count = 10
-    
+
     videos = results.get("result", results.get("videos", results.get("items", [])))
-    
+
     if not videos:
         console.print("[yellow]No videos to download.[/yellow]")
         return
-    
+
     # Limit to max_count
     videos_to_download = videos[:max_count]
-    
+
     library = get_library()
     success_count = 0
     skip_count = 0
     fail_count = 0
-    
+    dedupe_count = 0
+
+    # Build dedup hash set from existing library entries
+    seen_hashes = set()
+    if dedupe:
+        for t in library.list_transcripts(topic):
+            data = library.get(t["video_id"], topic)
+            if data:
+                text = data.get("transcript", "")[:500]
+                seen_hashes.add(hashlib.md5(text.encode()).hexdigest())
+
     console.print(f"\n[bold]Bulk downloading {len(videos_to_download)} transcripts to '{topic}'...[/bold]\n")
-    
+
     for i, video in enumerate(videos_to_download, 1):
         video_id = video.get("id") or video.get("videoid")
         title = video.get("title", "Unknown")
-        channel = video.get("channeltitle", video.get("channel", "Unknown"))
-        
+        channel = video.get("channelname", video.get("channeltitle", video.get("channel", "Unknown")))
+
+        # Backfill missing metadata from Filmot video API
+        title, channel = _backfill_metadata(video_id, title, channel)
+
         # Check if already cached
         if library.exists(video_id, topic):
             console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {video_id} - already in library")
             skip_count += 1
             continue
-        
+
         try:
             if fallback:
                 result = get_transcript_with_fallback(video_id, use_aws_fallback=True)
             else:
                 result = get_transcript(video_id)
-            
+
             if "error" in result:
                 console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {result['error']}")
                 fail_count += 1
                 continue
-            
+
+            full_text = result.get('full_text', '')
+
+            # Deduplication check
+            if dedupe and full_text:
+                text_hash = hashlib.md5(full_text[:500].encode()).hexdigest()
+                if text_hash in seen_hashes:
+                    console.print(f"  [{i}/{len(videos_to_download)}] [magenta]Dedupe[/magenta] {video_id} - duplicate content")
+                    dedupe_count += 1
+                    continue
+                seen_hashes.add(text_hash)
+
             # Save to library
             metadata = {
                 "title": title,
@@ -280,17 +353,20 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
             library.save(
                 video_id=video_id,
                 topic=topic,
-                transcript_text=result.get('full_text', ''),
+                transcript_text=full_text,
                 metadata=metadata,
             )
             console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {title[:50]}...")
             success_count += 1
-            
+
         except Exception as e:
             console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}")
             fail_count += 1
-    
-    console.print(f"\n[bold]Complete:[/bold] {success_count} saved, {skip_count} skipped, {fail_count} failed")
+
+    summary = f"\n[bold]Complete:[/bold] {success_count} saved, {skip_count} skipped, {fail_count} failed"
+    if dedupe_count:
+        summary += f", {dedupe_count} deduplicated"
+    console.print(summary)
     console.print(f"[dim]View with: filmot library list {topic}[/dim]")
 
 
@@ -335,10 +411,14 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False):
         console.print(f"   [dim]Video:[/dim] https://youtube.com/watch?v={video_id}")
         console.print(f"   [dim]Channel:[/dim] https://youtube.com/channel/{channel_id}")
         
-        # Display hits (subtitle matches)
+        # Display hits (subtitle matches) with density scoring
         hits = video.get("hits", [])
         if hits:
-            console.print(f"   [bold green]Matches ({len(hits)}):[/bold green]")
+            density_str = ""
+            if duration and duration > 0:
+                density = len(hits) / (duration / 60)
+                density_str = f" | [bold]{density:.1f}/min[/bold]"
+            console.print(f"   [bold green]Matches ({len(hits)}{density_str}):[/bold green]")
             display_hits = hits if full else hits[:3]
             for hit in display_hits:
                 _display_hit(hit, video_id)
@@ -374,12 +454,15 @@ def video(video_ids: str, flags: int, raw: bool):
             return
         
         if raw:
-            console.print(JSON.from_data(result))
+            click.echo(json_mod.dumps(result, indent=2, ensure_ascii=False))
             return
-        
+
+        if client.last_cache_hit:
+            console.print("[dim]Cached response[/dim]")
+
         # Display formatted results
         _display_video_results(result)
-        
+
     except ValueError as e:
         console.print(f"[red]Configuration Error: {e}[/red]")
     except Exception as e:
@@ -433,8 +516,12 @@ def _display_video_results(results):
             table.add_row("Channel Country", channel_country)
         table.add_row("Video URL", f"https://youtube.com/watch?v={video_id}")
         table.add_row("Channel URL", f"https://youtube.com/channel/{channel_id}")
-        
+
         console.print(table)
+
+        # Warn if views/likes are missing (API returns sparse data for some endpoints)
+        if not views and not likes and not category:
+            console.print("[dim]Note: Views, likes, and category not available from this endpoint. Use 'filmot search' for full metadata.[/dim]")
 
 
 # ========== SEARCH CHANNELS ==========
@@ -461,9 +548,12 @@ def channels(term: str, raw: bool):
             return
         
         if raw:
-            console.print(JSON.from_data(result))
+            click.echo(json_mod.dumps(result, indent=2, ensure_ascii=False))
             return
-        
+
+        if client.last_cache_hit:
+            console.print("[dim]Cached response[/dim]")
+
         # Display formatted results
         _display_channel_results(result, term)
         
@@ -977,25 +1067,24 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         filmot transcript VIDEO_ID --fallback  # AWS fallback if no captions
     """
     from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp, configure_proxy, is_proxy_configured, disable_proxy, get_transcript_with_fallback
-    import json
-    
-    # Handle proxy configuration
+
+    # Handle proxy configuration (status messages go to stderr to avoid polluting --raw)
     if no_proxy:
         disable_proxy()
-        console.print(f"[dim]Proxy disabled, using direct connection[/dim]")
+        stderr_console.print(f"[dim]Proxy disabled, using direct connection[/dim]")
     elif proxy:
         try:
             configure_proxy(http_proxy=proxy)
-            console.print(f"[dim]Using proxy: {proxy.split('@')[-1] if '@' in proxy else proxy}[/dim]")
+            stderr_console.print(f"[dim]Using proxy: {proxy.split('@')[-1] if '@' in proxy else proxy}[/dim]")
         except Exception as e:
             console.print(f"[red]Proxy error: {e}[/red]")
             return
     elif is_proxy_configured():
-        console.print(f"[dim]Using proxy from environment[/dim]")
-    
+        stderr_console.print(f"[dim]Using proxy from environment[/dim]")
+
     # Progress callback for AWS fallback
     def aws_progress(stage: str, msg: str):
-        console.print(f"[cyan][AWS][/cyan] {msg}")
+        stderr_console.print(f"[cyan][AWS][/cyan] {msg}")
     
     with console.status(f"[bold green]Fetching transcript..."):
         languages = [lang] if lang else None
@@ -1034,12 +1123,29 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
     if save_to:
         from .library import get_library
         library = get_library()
-        
+
         # Check if already cached
         if library.exists(result['video_id'], save_to):
             console.print(f"[yellow]Already in library: {save_to}/{result['video_id']}[/yellow]")
         else:
+            # Fetch video metadata so library entries have title/channel
+            video_title = "Unknown"
+            video_channel = "Unknown"
+            try:
+                client = FilmotClient()
+                video_info = client.get_videos(result['video_id'])
+                if isinstance(video_info, list) and video_info:
+                    video_title = video_info[0].get("title", "Unknown")
+                    video_channel = video_info[0].get("channelname", "Unknown")
+                elif isinstance(video_info, dict) and "error" not in video_info:
+                    video_title = video_info.get("title", "Unknown")
+                    video_channel = video_info.get("channelname", "Unknown")
+            except Exception:
+                pass  # Metadata fetch is best-effort
+
             metadata = {
+                "title": video_title,
+                "channel": video_channel,
                 "language": result.get("language"),
                 "is_generated": result.get("is_generated"),
                 "duration_seconds": result.get("duration_seconds"),
@@ -1055,8 +1161,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
     
     # Raw JSON output
     if raw:
-        import json
-        print(json.dumps(result, indent=2))
+        click.echo(json_mod.dumps(result, indent=2, ensure_ascii=False))
         return
     
     # Save to file
@@ -1064,8 +1169,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         try:
             with open(output, 'w', encoding='utf-8') as f:
                 if output.endswith('.json'):
-                    import json
-                    json.dump(result, f, indent=2)
+                    json_mod.dump(result, f, indent=2)
                 else:
                     # Plain text output
                     if timestamps and 'segments' in result:
@@ -1458,18 +1562,26 @@ def library_list(topic: str):
 @library.command("search")
 @click.argument("query")
 @click.option("--topic", "-t", default=None, help="Limit search to specific topic")
-def library_search(query: str, topic: str):
+@click.option("--substring", is_flag=True, help="Use substring matching instead of word-boundary matching")
+def library_search(query: str, topic: str, substring: bool):
     """Search for text across saved transcripts.
-    
-    Searches all transcripts in the library for the query text
-    and shows matches with context.
+
+    Uses word-boundary matching by default (searching "ore" won't match "more").
+    Use --substring for the old behavior.
     """
     from .library import get_library
     lib = get_library()
-    
+
     with console.status(f"Searching library for '{query}'..."):
-        results = lib.search(query, topic=topic)
-    
+        results = lib.search(query, topic=topic, substring=substring)
+
+    # Auto-fallback: if word-boundary found nothing, retry with substring
+    # Catches plurals/inflections (e.g., "laser" misses "lasers")
+    if not results and not substring:
+        results = lib.search(query, topic=topic, substring=True)
+        if results:
+            console.print(f"[dim]No exact word matches. Showing substring matches (plurals/inflections):[/dim]")
+
     if not results:
         console.print(f"[yellow]No matches for '{query}'[/yellow]")
         if not topic:
@@ -1493,22 +1605,32 @@ def library_search(query: str, topic: str):
 @click.argument("topic")
 @click.option("--max-chars", "-m", default=None, type=int, help="Maximum total characters")
 @click.option("--output", "-o", default=None, help="Save to file instead of printing")
-def library_context(topic: str, max_chars: int, output: str):
+@click.option("--format", "-f", "fmt", type=click.Choice(["text", "structured"]), default="text", help="Output format: text (plain) or structured (markdown with metadata)")
+def library_context(topic: str, max_chars: int, output: str, fmt: str):
     """Get all transcripts in a topic as combined text.
-    
+
     Useful for providing LLM context. Concatenates all transcripts
     with headers separating each video.
+
+    Use --format structured for markdown with full metadata headers.
     """
     from .library import get_library
     lib = get_library()
-    
+
     with console.status(f"Building context from '{topic}'..."):
-        context = lib.get_context(topic, max_chars=max_chars)
-    
+        if fmt == "structured":
+            context = _build_structured_context(lib, topic, max_chars)
+        else:
+            context = lib.get_context(topic, max_chars=max_chars)
+
     if not context:
         console.print(f"[yellow]No transcripts in topic: {topic}[/yellow]")
         return
-    
+
+    # Auto-generate output filename for structured format (avoids dumping large markdown to stdout)
+    if fmt == "structured" and not output:
+        output = f"{topic}-context.md"
+
     if output:
         try:
             with open(output, 'w', encoding='utf-8') as f:
@@ -1519,6 +1641,51 @@ def library_context(topic: str, max_chars: int, output: str):
             console.print(f"[red]Error saving file: {e}[/red]")
     else:
         console.print(context)
+
+
+def _build_structured_context(lib, topic: str, max_chars=None) -> str:
+    """Build markdown-formatted context with full metadata."""
+    transcripts = lib.list_transcripts(topic)
+    if not transcripts:
+        return ""
+
+    parts = [f"# Topic: {topic}\n"]
+    total_chars = len(parts[0])
+
+    for idx, t in enumerate(transcripts, 1):
+        data = lib.get(t["video_id"], topic)
+        if not data:
+            continue
+
+        metadata = data.get("metadata", {})
+        duration = metadata.get("duration_seconds", 0)
+        duration_str = _format_duration(int(duration)) if duration else "Unknown"
+        views = metadata.get("views", 0)
+        views_str = f"{views:,}" if views else "N/A"
+
+        header = f"\n---\n\n## {idx}. {metadata.get('title', t['video_id'])}\n"
+        header += f"- **Channel:** {metadata.get('channel', 'Unknown')}\n"
+        header += f"- **Video ID:** {t['video_id']}\n"
+        header += f"- **Duration:** {duration_str} | **Views:** {views_str}\n"
+        header += f"- **Language:** {metadata.get('language', 'N/A')}"
+        header += f" (auto-generated)" if metadata.get('is_generated') else ""
+        header += f"\n- **Saved:** {t.get('saved_at', 'Unknown')[:10]}\n\n"
+
+        transcript = data.get("transcript", "")
+
+        content = header + transcript + "\n"
+
+        if max_chars and total_chars + len(content) > max_chars:
+            remaining = max_chars - total_chars
+            if remaining > len(header) + 500:
+                content = content[:remaining] + "\n\n[TRUNCATED]\n"
+                parts.append(content)
+            break
+
+        parts.append(content)
+        total_chars += len(content)
+
+    return "\n".join(parts)
 
 
 @library.command("stats")
@@ -1577,6 +1744,302 @@ def library_delete(target: str, topic: str, delete_all: bool):
             console.print(f"[green]✓ Deleted transcript {target} {scope}[/green]")
         else:
             console.print(f"[yellow]Transcript not found: {target}[/yellow]")
+
+
+@library.command("compare")
+@click.argument("query")
+@click.option("--topic", "-t", default=None, help="Limit to specific topic")
+@click.option("--context", "-c", "context_chars", default=300, type=int, help="Characters of context around matches (default: 300)")
+@click.option("--sort", "sort_by", default="mentions", type=click.Choice(["mentions", "density"]), help="Sort by mention count (default) or density (mentions/min)")
+def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
+    """Compare how different sources discuss a claim or term.
+
+    Searches across library transcripts and presents a structured
+    comparison showing each source's treatment of the topic.
+
+    Examples:
+
+    \b
+        filmot library compare "dark oxygen" --topic deep-sea-mining
+        filmot library compare "moratorium" --context 200
+    """
+    from .library import get_library
+    lib = get_library()
+
+    with console.status(f"Comparing '{query}' across sources..."):
+        results = lib.search(query, topic=topic)
+
+    # Auto-fallback: if word-boundary found nothing, retry with substring
+    if not results:
+        results = lib.search(query, topic=topic, substring=True)
+        if results:
+            console.print(f"[dim]No exact word matches. Showing substring matches (plurals/inflections):[/dim]")
+
+    if not results:
+        console.print(f"[yellow]No sources mention '{query}'[/yellow]")
+        return
+
+    # Sort by density (mentions/min) if requested
+    if sort_by == "density":
+        for r in results:
+            data = lib.get(r['video_id'], r['topic'])
+            dur = data.get("metadata", {}).get("duration_seconds", 0) if data else 0
+            r['_density'] = r['match_count'] / (dur / 60) if dur and dur > 0 else 0
+        results.sort(key=lambda x: x['_density'], reverse=True)
+
+    total_mentions = sum(r['match_count'] for r in results)
+    sort_label = "density (mentions/min)" if sort_by == "density" else "mention count"
+    console.print(Panel(
+        f"[bold]'{query}' mentioned {total_mentions} times across {len(results)} sources[/bold]",
+        title="Cross-Source Comparison"
+    ))
+
+    for r in results:
+        mentions_label = "mention" if r['match_count'] == 1 else "mentions"
+        # Look up duration for density calculation
+        data = lib.get(r['video_id'], r['topic'])
+        density_str = ""
+        if data:
+            duration = data.get("metadata", {}).get("duration_seconds", 0)
+            if duration and duration > 0:
+                density = r['match_count'] / (duration / 60)
+                density_str = f" | [bold]{density:.1f}/min[/bold]"
+
+        console.print(f"\n[bold cyan]{r.get('title', 'Unknown')}[/bold cyan]")
+        console.print(f"  [dim]Channel:[/dim] {r.get('channel', 'Unknown')} | [dim]Topic:[/dim] {r['topic']} | [bold]{r['match_count']} {mentions_label}{density_str}[/bold]")
+        console.print(f"  [dim]Video:[/dim] https://youtube.com/watch?v={r['video_id']}")
+        if data:
+            transcript = data.get("transcript", "")
+            import re as _re
+            pattern = _re.compile(r'\b' + _re.escape(query.lower()) + r'\b')
+            matches = lib._find_matches(transcript, query.lower(), context_chars=context_chars, pattern=pattern, min_gap=context_chars)
+            for match in matches[:3]:
+                # Highlight the query term
+                highlighted = match
+                for variant in [query, query.lower(), query.upper(), query.capitalize()]:
+                    highlighted = highlighted.replace(variant, f"[bold yellow]{variant}[/bold yellow]")
+                console.print(f"  [dim]{highlighted}[/dim]")
+
+    # Summary
+    console.print(f"\n[dim]Sources sorted by {sort_label} (most relevant first)[/dim]")
+
+
+# ========== RESEARCH COMMAND ==========
+
+@cli.command()
+@click.argument("topic")
+@click.option("--depth", "-n", default=10, type=int, help="Number of transcripts to download (default: 10)")
+@click.option("--min-views", default=None, type=int, help="Minimum view count filter")
+@click.option("--lang", "-l", default=None, help="Language code (default: en)")
+@click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback when captions unavailable")
+@click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts")
+@click.option("--min-matches", default=None, type=int, help="Only download videos with at least N subtitle matches")
+@click.option("--sort", "sort_by", default="viewcount", type=click.Choice(["viewcount", "density"]), help="Sort by viewcount (default) or density (matches/min)")
+def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, dedupe: bool, min_matches: int, sort_by: str):
+    """Research a topic: search, download transcripts, build knowledge base.
+
+    Single command that orchestrates the full research workflow:
+    1. Search with --title matching the topic
+    2. Download top N transcripts to library
+    3. Print summary with source list
+
+    Examples:
+
+    \b
+        filmot research "deep sea mining"
+        filmot research "quantum computing" --depth 20 --min-views 50000
+        filmot research "fusion energy" --dedupe --sort density
+    """
+    import hashlib
+    from .library import get_library
+    from .transcript import get_transcript, get_transcript_with_fallback
+
+    library = get_library()
+    normalized_topic = library._normalize_topic(topic)
+
+    try:
+        client = FilmotClient()
+
+        # Step 1: Search with title filter
+        console.print(f"[bold]Researching: {topic}[/bold]\n")
+        api_sort = "viewcount" if sort_by != "density" else None
+        with console.status(f"[bold green]Searching for videos about '{topic}'..."):
+            results = client.search_subtitles(
+                query=topic,
+                title=topic,
+                lang=lang or "en",
+                min_views=min_views,
+                sort_field=api_sort,
+                sort_order="desc" if api_sort else None,
+            )
+
+        if "error" in results:
+            console.print(f"[red]Error: {results['error']}[/red]")
+            return
+
+        videos = results.get("result", [])
+        total = results.get("totalresultcount", len(videos))
+        console.print(f"Found {total:,} dedicated videos about '{topic}'")
+
+        if not videos:
+            console.print("[yellow]No videos found. Try a different topic.[/yellow]")
+            return
+
+        # Client-side density sort
+        if sort_by == "density":
+            def _density_key(v):
+                dur = v.get("duration", 0)
+                hits = len(v.get("hits", []))
+                return hits / (dur / 60) if dur > 0 else 0
+            videos.sort(key=_density_key, reverse=True)
+            console.print(f"[dim]Sorted by density (matches/min)[/dim]")
+
+        # Apply --min-matches filter
+        if min_matches is not None:
+            before = len(videos)
+            videos = [v for v in videos if len(v.get("hits", [])) >= min_matches]
+            if before != len(videos):
+                console.print(f"[dim]Filtered: {before} -> {len(videos)} videos (min {min_matches} matches)[/dim]")
+
+        # Step 2: Download transcripts
+        videos_to_download = videos[:depth]
+        success_count = 0
+        skip_count = 0
+        fail_count = 0
+        dedupe_count = 0
+        total_chars = 0
+
+        seen_hashes = set()
+        if dedupe:
+            for t in library.list_transcripts(normalized_topic):
+                data = library.get(t["video_id"], normalized_topic)
+                if data:
+                    text = data.get("transcript", "")[:500]
+                    seen_hashes.add(hashlib.md5(text.encode()).hexdigest())
+
+        console.print(f"\n[bold]Downloading {len(videos_to_download)} transcripts...[/bold]\n")
+
+        for i, video in enumerate(videos_to_download, 1):
+            video_id = video.get("id") or video.get("videoid")
+            title_str = video.get("title", "Unknown")
+            channel = video.get("channelname", video.get("channeltitle", video.get("channel", "Unknown")))
+
+            # Backfill missing metadata from Filmot video API
+            title_str, channel = _backfill_metadata(video_id, title_str, channel)
+
+            if library.exists(video_id, normalized_topic):
+                console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {title_str[:60]}")
+                skip_count += 1
+                # Count existing chars
+                data = library.get(video_id, normalized_topic)
+                if data:
+                    total_chars += len(data.get("transcript", ""))
+                continue
+
+            try:
+                if fallback:
+                    result = get_transcript_with_fallback(video_id, use_aws_fallback=True)
+                else:
+                    result = get_transcript(video_id)
+
+                if "error" in result:
+                    console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {title_str[:60]}")
+                    fail_count += 1
+                    continue
+
+                full_text = result.get('full_text', '')
+
+                if dedupe and full_text:
+                    text_hash = hashlib.md5(full_text[:500].encode()).hexdigest()
+                    if text_hash in seen_hashes:
+                        console.print(f"  [{i}/{len(videos_to_download)}] [magenta]Dedupe[/magenta] {title_str[:60]}")
+                        dedupe_count += 1
+                        continue
+                    seen_hashes.add(text_hash)
+
+                metadata = {
+                    "title": title_str,
+                    "channel": channel,
+                    "language": result.get("language"),
+                    "is_generated": result.get("is_generated"),
+                    "duration_seconds": result.get("duration_seconds"),
+                    "segment_count": result.get("segment_count"),
+                    "views": video.get("viewcount"),
+                }
+                library.save(
+                    video_id=video_id,
+                    topic=normalized_topic,
+                    transcript_text=full_text,
+                    metadata=metadata,
+                )
+                total_chars += len(full_text)
+                console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {title_str[:60]}")
+                success_count += 1
+
+            except Exception as e:
+                console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}")
+                fail_count += 1
+
+        # Step 3: Summary
+        console.print(f"\n{'='*60}")
+        console.print(f"[bold]Research complete: {normalized_topic}[/bold]")
+        console.print(f"  Saved: {success_count} | Skipped: {skip_count} | Failed: {fail_count}" +
+                      (f" | Deduped: {dedupe_count}" if dedupe_count else ""))
+        console.print(f"  Total content: {total_chars:,} characters ({total_chars / 1024:.0f} KB)")
+
+        # List sources
+        transcripts = library.list_transcripts(normalized_topic)
+        if transcripts:
+            console.print(f"\n[bold]Sources ({len(transcripts)}):[/bold]")
+            for t in transcripts:
+                console.print(f"  - {t.get('title', 'Unknown')} ({t.get('channel', 'Unknown')})")
+
+        console.print(f"\n[dim]Next steps:[/dim]")
+        console.print(f"  filmot library search \"your query\" --topic {normalized_topic}")
+        console.print(f"  filmot library compare \"claim\" --topic {normalized_topic}")
+        console.print(f"  filmot library context {normalized_topic} -o context.txt")
+
+    except ValueError as e:
+        console.print(f"[red]Configuration Error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
+# ========== DOWNLOAD (STDIN) ==========
+
+@cli.command("download")
+@click.option("--topic", "-t", required=True, help="Library topic to save transcripts under")
+@click.option("--count", "-n", default=50, type=int, help="Maximum transcripts to download (default: 50)")
+@click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback")
+@click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts")
+def download(topic: str, count: int, fallback: bool, dedupe: bool):
+    """Download transcripts from piped search results.
+
+    Reads JSON search results from stdin and downloads transcripts
+    to the library. Enables pipeline workflows.
+
+    Examples:
+
+    \b
+        filmot search "deep sea mining" --title "deep sea mining" --raw | filmot download -t deep-sea
+        filmot search-all "AI safety" --pages 5 --raw > results.json
+        type results.json | filmot download -t ai-safety --dedupe
+    """
+    import sys
+
+    try:
+        raw_input = sys.stdin.read()
+        results = json_mod.loads(raw_input)
+    except (json_mod.JSONDecodeError, ValueError) as e:
+        console.print(f"[red]Invalid JSON from stdin: {e}[/red]")
+        console.print("[dim]Pipe search results with --raw: filmot search \"query\" --raw | filmot download -t TOPIC[/dim]")
+        return
+
+    # Wrap in expected format if needed
+    if isinstance(results, list):
+        results = {"result": results}
+
+    _bulk_download_transcripts(results, f"{topic}:{count}", console, fallback=fallback, dedupe=dedupe)
 
 
 def main():

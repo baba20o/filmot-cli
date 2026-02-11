@@ -190,41 +190,52 @@ class TranscriptLibrary:
         
         return transcripts
     
-    def search(self, query: str, topic: Optional[str] = None) -> List[Dict[str, Any]]:
+    def search(self, query: str, topic: Optional[str] = None, substring: bool = False) -> List[Dict[str, Any]]:
         """
         Search for text across saved transcripts.
-        
+
+        Uses word-boundary matching by default to avoid false positives
+        (e.g., searching "ore" won't match "more" or "before").
+
         Args:
             query: Text to search for (case-insensitive)
             topic: Limit search to specific topic (optional)
-            
+            substring: If True, use substring matching instead of word boundaries
+
         Returns:
             List of matches with context
         """
         query_lower = query.lower()
+
+        # Build regex pattern with word boundaries (default) or substring
+        if substring:
+            pattern = re.compile(re.escape(query_lower))
+        else:
+            pattern = re.compile(r'\b' + re.escape(query_lower) + r'\b')
+
         results = []
-        
+
         # Determine which topics to search
         if topic:
             topics_to_search = [self._normalize_topic(topic)]
         else:
-            topics_to_search = [d.name for d in self.transcripts_dir.iterdir() 
+            topics_to_search = [d.name for d in self.transcripts_dir.iterdir()
                                if d.is_dir() and not d.name.startswith('_')]
-        
+
         for topic_name in topics_to_search:
             topic_dir = self.transcripts_dir / topic_name
             if not topic_dir.exists():
                 continue
-                
+
             for file_path in topic_dir.glob("*.json"):
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                    
+
                     transcript = data.get("transcript", "")
-                    if query_lower in transcript.lower():
+                    if pattern.search(transcript.lower()):
                         # Find match positions and extract context
-                        matches = self._find_matches(transcript, query_lower)
+                        matches = self._find_matches(transcript, query_lower, pattern=pattern)
                         results.append({
                             "video_id": data.get("video_id"),
                             "topic": topic_name,
@@ -235,36 +246,48 @@ class TranscriptLibrary:
                         })
                 except (json.JSONDecodeError, IOError):
                     continue
-        
+
         # Sort by match count descending
         results.sort(key=lambda x: x["match_count"], reverse=True)
         return results
-    
-    def _find_matches(self, text: str, query: str, context_chars: int = 100) -> List[str]:
-        """Find all occurrences of query in text with surrounding context."""
+
+    def _find_matches(self, text: str, query: str, context_chars: int = 100, pattern=None, min_gap: int = 0) -> List[str]:
+        """Find all occurrences of query in text with surrounding context.
+
+        Args:
+            min_gap: Minimum character gap between displayed matches to avoid
+                     overlapping context windows. When > 0, skips matches that
+                     fall within min_gap chars of the previous kept match.
+        """
         matches = []
         text_lower = text.lower()
-        query_len = len(query)
-        pos = 0
-        
-        while True:
-            pos = text_lower.find(query, pos)
-            if pos == -1:
-                break
-            
+
+        if pattern is None:
+            pattern = re.compile(r'\b' + re.escape(query) + r'\b')
+
+        last_pos = -(min_gap + 1)  # Ensure first match is always included
+        for m in pattern.finditer(text_lower):
+            pos = m.start()
+
+            # Skip matches whose context would overlap with the previous one
+            if min_gap > 0 and (pos - last_pos) < min_gap:
+                continue
+            last_pos = pos
+
+            query_len = m.end() - m.start()
+
             # Extract context around match
             start = max(0, pos - context_chars)
             end = min(len(text), pos + query_len + context_chars)
-            
+
             context = text[start:end]
             if start > 0:
                 context = "..." + context
             if end < len(text):
                 context = context + "..."
-            
+
             matches.append(context)
-            pos += 1
-        
+
         return matches
     
     def get_context(self, topic: str, max_chars: Optional[int] = None) -> str:
