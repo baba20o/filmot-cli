@@ -280,6 +280,44 @@ filmot search "cobalt" --title 'deep sea (mining | extraction)'
 | `--fallback` | Use AWS Transcribe fallback for bulk download | `--fallback` |
 | `--dedupe` | Skip duplicate transcripts during bulk download | `--dedupe` |
 
+### Multilingual Search
+
+Filmot supports searching transcripts in any language YouTube auto-generates captions for, including Devanagari, Cyrillic, CJK, Arabic, Hebrew, and more.
+
+| Language | Script | `--lang` code | Notes |
+|----------|--------|---------------|-------|
+| English | Latin | `en` | Full support |
+| Spanish | Latin | `es` | 1M+ results |
+| German | Latin | `de` | Handles umlauts |
+| Hindi | Devanagari | `hi` | 10.5K+ results |
+| Russian | Cyrillic | `ru` | 339K+ results |
+| Japanese | CJK | `ja` | 6M+ results |
+| Korean | Hangul | `ko` | 277K+ results |
+| Arabic | Arabic | `ar` | RTL supported |
+| Hebrew | Hebrew | `iw` (not `he`) | YouTube uses legacy code |
+| Chinese | CJK | omit `--lang` | `--lang zh` returns 0 results |
+
+```bash
+# Latin-script languages — use standard codes
+filmot search "inteligencia artificial" --lang es --full
+
+# Japanese, Korean, Arabic — standard codes work
+filmot search "人工知能" --lang ja --full
+filmot search "인공지능" --lang ko --full
+
+# Hebrew — use "iw" (YouTube's legacy code), NOT "he"
+filmot search "בינה מלאכותית" --lang iw --full
+
+# Chinese — omit --lang entirely (zh/zh-Hans don't work)
+filmot search "人工智能" --full
+
+# Hindi, Russian — standard ISO codes work
+filmot search "कृत्रिम बुद्धिमत्ता" --lang hi --full
+filmot search "нейросеть" --lang ru --full
+```
+
+> **Tip:** If a language code isn't returning results, try omitting `--lang` entirely. The API will match your query in transcripts regardless of language tag.
+
 ### Get Video Metadata
 
 Retrieve metadata for one or more YouTube videos:
@@ -408,6 +446,68 @@ python main.py channels "Linus Tech Tips"
 python main.py channels mrbeast --raw
 ```
 
+### Channel Corpus: Download & Mine Entire Channels
+
+Download all transcripts from a YouTube channel to build a local knowledge corpus that can be searched offline with full-text and proximity operators.
+
+#### Download a Channel
+
+```bash
+# Download all transcripts from a channel (by name, handle, or URL)
+filmot channel-download "Chat With Traders"
+
+# Parallel download with 4 workers (3x faster)
+filmot channel-download "Excess Returns" --workers 4
+
+# Limit to most recent 50 videos
+filmot channel-download "All-In Podcast" --limit 50
+
+# Resume interrupted download (automatic — just re-run the same command)
+filmot channel-download "Chat With Traders" --workers 4
+
+# Bypass proxy and connect directly
+filmot channel-download "Excess Returns" --workers 4 --no-proxy
+
+# Force re-download (ignore cached manifest)
+filmot channel-download "Chat With Traders" --fresh
+```
+
+#### Check Download Status
+
+```bash
+# List all downloaded channels
+filmot channel-status
+
+# Detailed stats for a specific channel
+filmot channel-status chat-with-traders
+```
+
+#### Search Within a Channel Corpus
+
+Search locally across all downloaded transcripts. Supports plain text, NEAR/N proximity, and tilde proximity — the same operators available in `filmot search` (API), but running entirely offline against your local corpus.
+
+```bash
+# Plain substring search
+filmot channel-search chat-with-traders "Sharpe ratio"
+
+# NEAR/N — find two phrases within N words of each other
+filmot channel-search chat-with-traders '"risk management" NEAR/10 "position sizing"'
+
+# ~N (tilde) — find words within N words of each other
+filmot channel-search chat-with-traders '"blew up account"~5'
+
+# Limit results
+filmot channel-search excess-returns "diversification" --limit 10
+```
+
+| Operator | Syntax | Example |
+|----------|--------|---------|
+| **Plain** | `"text"` | `"Sharpe ratio"` |
+| **NEAR/N** | `"phrase1" NEAR/N "phrase2"` | `'"risk management" NEAR/10 "position sizing"'` |
+| **Tilde** | `"word1 word2"~N` | `'"blew up account"~5'` |
+
+> **Note:** `channel-search` runs entirely offline against your downloaded corpus. No API calls, no rate limits, no quota. Download once, search forever.
+
 ### View Configuration
 
 Check your current API configuration:
@@ -447,6 +547,7 @@ filmot-cli/
     ├── cache.py            # File-based response caching with auto-purge
     ├── rate_limiter.py     # Token bucket rate limiter
     ├── transcript.py       # YouTube transcript download with proxy support
+    ├── channel_dl.py       # Channel corpus downloader: parallel download, resume, proximity search
     ├── library.py          # Transcript library: storage, search, compare
     ├── export.py           # JSON/CSV export functionality
     ├── watchlist.py        # Local video watchlist management
@@ -464,6 +565,7 @@ filmot-cli/
 | `click` | CLI framework |
 | `rich` | Terminal formatting, tables, colors |
 | `youtube-transcript-api` | YouTube transcript download |
+| `google-api-python-client` | YouTube Data API v3 (channel downloads) |
 
 **Optional dependencies:**
 | Package | Purpose |

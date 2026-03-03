@@ -4,6 +4,8 @@
 
 *Written by an agent, for agents, based on real-world research sessions.*
 
+> **Also read: [AGENTS_RESEARCH_GUIDE.md](AGENTS_RESEARCH_GUIDE.md)** — How to evaluate sources, detect AI misinformation, cross-reference claims, and separate truth from hype. Essential methodology for any serious research task.
+
 ---
 
 ## What This Tool Does
@@ -20,22 +22,51 @@ Filmot CLI searches **YouTube transcripts** (not titles, not descriptions—the 
 
 ---
 
+## The Killer Feature: Proximity Search (`NEAR/N`)
+
+Before anything else, understand this — **proximity search is what makes this tool categorically different** from YouTube search, Google, or any other tool. It finds the exact moment two concepts are discussed together:
+
+```bash
+# Find moments where someone discusses troops in the context of Venezuela
+filmot search '"Venezuela" NEAR/15 "military operation"' --full --lang en --sort density
+
+# Find focused DOGE analysis, not random crypto mentions
+filmot search '"DOGE" NEAR/15 "Elon"' --full --sort density --min-matches 3
+
+# Find the exact moment someone connects AI with job loss
+filmot search '"artificial intelligence" NEAR/20 "job displacement"' --full
+```
+
+The number after `NEAR/` is the word proximity window. `NEAR/15` means the two terms must appear within 15 words of each other. This turns a vague topic search into a surgical probe for **specific contextual relationships**.
+
+**When to use it:**
+- Investigating claims: `'"company" NEAR/10 "lawsuit"'`
+- Finding connections: `'"person" NEAR/15 "scandal"'`
+- Current events: `'"country" NEAR/10 "sanctions"'` with `--start-date`
+- Technical deep dives: `'"concept A" NEAR/20 "concept B"'`
+
+**Combine with `--sort density` and `--min-matches`** for best results. Density (matches per minute) surfaces focused content over passing mentions, and `--min-matches` cuts noise from videos that mention your terms once in a 3-hour podcast.
+
+---
+
 ## Quick Start: The One-Command Research Workflow
 
 The fastest way to research any topic:
 
 ```bash
-# Single command: searches, downloads, deduplicates, and summarizes
-filmot research "nuclear fusion energy" --depth 12 --dedupe --min-matches 2 --sort density
+# Single command: scout YouTube, search Filmot, download, and summarize
+filmot research "nuclear fusion energy" --depth 12 --dedupe
 ```
 
-This will:
-1. Search for videos with "nuclear fusion energy" in both title and transcript
-2. Filter to only videos with 2+ subtitle matches
-3. Sort by relevance density (matches per minute) instead of views
+This runs the **Scout → Search → Synthesize** pipeline:
+1. **Scout** — Quick YouTube API probe for the latest uploads about your topic (last 7 days). Catches breaking news that Filmot hasn't indexed yet.
+2. **Search** — Deep Filmot transcript search with title+transcript matching (auto-falls back to transcript-only if no title matches)
+3. **Synthesize** — Merges both result sets, filters to 2+ subtitle matches (default), sorts by density (matches/min)
 4. Download top 12 transcripts, skipping duplicates
 5. Save everything to your local library under the topic name
-6. Print a summary: X saved, Y skipped, Z failed, total characters
+6. Print a summary with source tags showing which came from scout vs Filmot
+
+**Why this matters:** Filmot indexes transcripts ~24-48 hours after upload. For breaking news, the scout phase finds videos that Filmot can't see yet. Without it, you'd miss same-day developments entirely.
 
 Then cross-reference what your sources say:
 
@@ -67,20 +98,53 @@ filmot research "your topic" [OPTIONS]
 | `-l, --lang` | Language code | en |
 | `--fallback` | Use AWS Transcribe when captions unavailable | Off |
 | `--dedupe` | Skip duplicate/near-duplicate transcripts | Off |
-| `--min-matches N` | Only download videos with N+ subtitle matches | None |
-| `--sort [viewcount\|density]` | Sort by views or matches-per-minute | viewcount |
+| `--min-matches N` | Only download videos with N+ subtitle matches (0 to disable) | 2 |
+| `--sort [viewcount\|density]` | Sort by views or matches-per-minute | density |
+| `--scout / --no-scout` | YouTube API freshness probe for latest uploads | On (if API key set) |
+| `--scout-days N` | How far back the scout looks | 7 |
+| `--probe` | Auto-extract entities from transcripts and run NEAR/N probes to discover related content | Off |
 
 ### Recommended Settings
 
 ```bash
-# For most research topics — gets the most relevant, unique content
-filmot research "your topic" --depth 12 --dedupe --min-matches 2 --sort density
+# For most research topics — scout + density sort + min-matches 2 are defaults
+filmot research "your topic" --depth 12 --dedupe
+
+# Full pipeline: scout + search + probe (discovers content your initial search missed)
+filmot research "Russia Ukraine ceasefire" --probe --depth 10 --dedupe
+
+# For breaking news — narrow the scout window
+filmot research "OpenClaw acquisition" --scout-days 3 --depth 15
 
 # For popular topics with lots of content — be more selective
-filmot research "artificial intelligence" --depth 15 --dedupe --min-matches 3 --min-views 50000 --sort density
+filmot research "artificial intelligence" --depth 15 --dedupe --min-matches 3 --min-views 50000
 
-# For niche topics — cast a wider net
-filmot research "polymetallic nodules" --depth 20 --fallback
+# For niche topics — cast a wider net, disable min-matches filter
+filmot research "polymetallic nodules" --depth 20 --fallback --min-matches 0
+
+# Skip scout if you only want indexed transcripts (faster, no YouTube API needed)
+filmot research "your topic" --no-scout --sort viewcount
+```
+
+### The Probe Phase (--probe)
+
+The `--probe` flag activates Phase 4: automatic NEAR/N discovery. After downloading transcripts, it:
+
+1. **Extracts key entities** — mines your downloaded transcripts for frequent bigrams ("abu dhabi", "donald trump") and significant single words ("elections", "territory"), filtering out stopwords and the topic itself
+2. **Finds co-occurring pairs** — scans text in sliding windows to find which entities appear together most often (e.g., "zelensky" + "elections" co-occur 8 times within 50 words)
+3. **Generates NEAR/N probes** — turns the top pairs into `"entity1" NEAR/15 "entity2"` searches, anchored to your topic via title filtering
+4. **Downloads discoveries** — the top 3 new videos (not already in your library) from the probes are downloaded
+
+**Why this is powerful:** Your initial search finds videos explicitly about your topic. The probe phase finds videos that discuss the *relationships within* your topic — angles, connections, and context your original search missed. Each iteration surfaces new entities that could feed further probing.
+
+```bash
+# Example output:
+# Probing key relationships from 8 transcripts...
+#   Entities: abu dhabi, donald trump, zelensky, elections, donbass, territory...
+#   Probe 1: "donald trump" NEAR/15 "vladimir putin" (co:8) → 115 results (peak: 3.1/min) | 48 new
+#   Probe 2: "moscow" NEAR/15 "sanctions" (co:6) → 198 results (peak: 7.5/min) | 47 new
+#   Downloading 3 probe discoveries...
+#     ✓ Russia Ukraine Ceasefire Deal | Zelensky and Europe Prepare (probe)
 ```
 
 ---
@@ -395,6 +459,76 @@ filmot search 'AI|robot|open source' --title "clawdbot" --full
 
 ---
 
+## Multilingual Search
+
+Filmot searches transcripts in **any language** YouTube auto-generates captions for. This includes Latin, Devanagari, Cyrillic, CJK, Arabic, Hebrew, Hangul, and more.
+
+### Language Compatibility
+
+| Language | Script | `--lang` code | Test Results |
+|----------|--------|---------------|--------------|
+| English | Latin | `en` | Full support |
+| Spanish | Latin | `es` | 1M+ results |
+| German | Latin | `de` | 75K+ results (handles umlauts) |
+| Hindi | Devanagari | `hi` | 10.5K+ results |
+| Russian | Cyrillic | `ru` | 339K+ results |
+| Japanese | CJK | `ja` | 6M+ results |
+| Korean | Hangul | `ko` | 277K+ results |
+| Arabic | Arabic | `ar` | 127K+ results (RTL) |
+| Hebrew | Hebrew | `iw` (not `he`) | 3.4K+ results (RTL) |
+| Chinese | CJK | omit `--lang` | 672K+ results |
+
+### Key Gotchas
+
+1. **Hebrew uses `iw`, not `he`**: YouTube internally uses the legacy ISO 639 code `iw`. The standard `he` returns zero results. Use `--lang iw` or omit the lang filter entirely.
+
+2. **Chinese lang filter doesn't work**: `--lang zh` and `--lang zh-Hans` both return zero results. Omit the `--lang` flag and search Chinese characters directly — works perfectly.
+
+3. **CJK ASR tokenization**: YouTube's auto-captions for Chinese/Japanese insert spaces between individual characters. This doesn't affect search but makes raw transcripts less readable.
+
+4. **RTL scripts work correctly**: Arabic and Hebrew transcripts render and search correctly, including match context extraction.
+
+5. **When in doubt, omit `--lang`**: If a language code isn't returning results, remove the `--lang` filter. The API will match your query characters in any transcript regardless of language tag.
+
+6. **Long Cyrillic queries + sort = 500 error**: `искусственный интеллект` (25 chars) with `--sort uploaddate` causes a server error due to URL-encoded length. Workaround: use shorter synonyms like `нейросеть` (77K results) or `ИИ` (66K results), which sort fine.
+
+7. **Russian AI vocabulary**: Russians say `нейросеть` (neural network) as the everyday term for AI tools — not just the formal `искусственный интеллект`. Search both for comprehensive results.
+
+8. **Hindi uses English loanwords freely**: Hindi YouTube mixes Devanagari and English. Searching `कृत्रिम बुद्धिमत्ता` finds formal Hindi AI content; searching `"AI"` with `--lang hi` finds 41K+ results of Hindi speakers using the English term.
+
+### Examples
+
+```bash
+# Spanish
+filmot search "inteligencia artificial" --lang es --full
+
+# Japanese
+filmot search "人工知能" --lang ja --full
+
+# Hebrew (use "iw", NOT "he")
+filmot search "בינה מלאכותית" --lang iw --full
+
+# Chinese (MUST omit --lang)
+filmot search "人工智能" --full
+
+# Arabic
+filmot search "الذكاء الاصطناعي" --lang ar --full
+
+# Korean
+filmot search "인공지능" --lang ko --full
+
+# Hindi (Devanagari — standard ISO code)
+filmot search "कृत्रिम बुद्धिमत्ता" --lang hi --full
+
+# Russian (Cyrillic — standard ISO code)
+filmot search "нейросеть" --lang ru --full
+
+# Multilingual research workflow
+filmot research "人工知能" --depth 10 --dedupe --sort density
+```
+
+---
+
 ## Practical Tips
 
 ### Tip 1: Always Use `--dedupe` for Bulk Operations
@@ -423,7 +557,10 @@ filmot search '"CES 2026"|"39C3"|"DEF CON"' --full --lang en
 ### Tip 8: Manual vs Auto Subtitles
 Use `--manual-subs` for manually uploaded subtitles (higher quality, less coverage). Default searches auto-generated subtitles (wider coverage). Cannot search both in the same request.
 
-### Tip 9: Pipe to Select-Object for Long Output
+### Tip 9: Non-English Language Codes
+Most languages use standard ISO codes (`es`, `de`, `ja`, `ko`, `ar`, `hi`, `ru`). Two exceptions: **Hebrew** uses `iw` (not `he`), and **Chinese** requires omitting `--lang` entirely. For Russian, use shorter queries like `нейросеть` instead of `искусственный интеллект` when sorting — long Cyrillic URLs cause 500 errors. When in doubt, drop the `--lang` flag — the API matches query characters in any transcript.
+
+### Tip 10: Pipe to Select-Object for Long Output
 ```powershell
 filmot transcript VIDEO_ID --full 2>&1 | Select-Object -First 200
 ```
@@ -434,8 +571,8 @@ filmot transcript VIDEO_ID --full 2>&1 | Select-Object -First 200
 
 ### Pattern 1: Full Topic Research (Recommended)
 ```bash
-# One command does it all
-filmot research "brain-computer interfaces" --depth 15 --dedupe --min-matches 2 --sort density
+# One command does it all (density sort + min-matches 2 are defaults)
+filmot research "brain-computer interfaces" --depth 15 --dedupe
 
 # Then explore
 filmot library compare "Neuralink" --sort density
@@ -443,13 +580,67 @@ filmot library compare "safety" --sort density
 filmot library context brain-computer-interfaces --format structured
 ```
 
-### Pattern 2: Current Events
+### Pattern 2: Current Events / Breaking News
 ```bash
+# research command auto-scouts YouTube for latest uploads
+filmot research "TOPIC" --scout-days 3 --depth 10
+
+# Or manually: yt-search first (headlines), then Filmot (depth)
+filmot yt-search "TOPIC" --days 3 --order relevance
 filmot search 'TOPIC' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
 filmot transcript VIDEO_ID --full
 ```
 
-### Pattern 3: Technical Deep Dive
+**Key insight:** Filmot indexes transcripts ~24-48 hours after upload. For same-day events, `yt-search` (YouTube Data API) finds videos that Filmot can't see yet. The `research` command's `--scout` phase handles this automatically. If you're investigating something that happened today, always start with `yt-search` or use `--scout-days 1`.
+
+### Pattern 3: Deep Discovery (Probe)
+```bash
+# Full pipeline: scout latest, search transcripts, auto-probe for connections
+filmot research "TOPIC" --probe --depth 12 --dedupe
+
+# Then explore what the probe found
+filmot library compare "entity from probe" --topic TOPIC
+filmot library search "new angle" --topic TOPIC
+```
+
+The `--probe` flag is the compounding move. It mines your downloaded transcripts for entity relationships, auto-generates NEAR/N searches, and downloads the best discoveries. Use this when you want the tool to actively find angles you didn't think to search for.
+
+### Pattern 3b: Channel Corpus Mining (Deep Knowledge Base)
+
+Download an entire channel's transcripts and mine them offline. This is the most powerful approach when a single channel is a rich source of domain knowledge (e.g., 300+ episodes of a trading podcast).
+
+```bash
+# 1. Download the full channel (runs in parallel, resumable)
+filmot channel-download "Chat With Traders" --workers 4
+
+# 2. Check status
+filmot channel-status
+
+# 3. Mine the corpus — plain text, NEAR/N, and tilde proximity all work
+filmot channel-search chat-with-traders "blew up"
+filmot channel-search chat-with-traders '"risk management" NEAR/10 "position sizing"'
+filmot channel-search chat-with-traders '"revenge trading"~5'
+
+# 4. Compare patterns across channels
+filmot channel-search excess-returns "blew up"
+filmot channel-search excess-returns '"risk management" NEAR/10 "position sizing"'
+```
+
+**When to use this over `filmot search`:**
+- You want to mine a **specific channel** exhaustively (not just videos that match a query)
+- You need **offline search** — no API calls, no rate limits, no quota
+- You want **cross-channel comparisons** — run the same query across different corpora
+- You're building a knowledge base for an agent to reason over
+
+**Channel search supports the same proximity operators as the API:**
+
+| Operator | Syntax | Example |
+|----------|--------|---------|
+| Plain | `"text"` | `"Sharpe ratio"` |
+| NEAR/N | `"phrase1" NEAR/N "phrase2"` | `'"risk" NEAR/10 "sizing"'` |
+| Tilde | `"word1 word2"~N` | `'"blew up account"~5'` |
+
+### Pattern 4: Technical Deep Dive
 ```bash
 filmot search '"CONCEPT" explained|"CONCEPT" tutorial' --full --lang en --sort density
 filmot transcript VIDEO_ID --full
@@ -506,7 +697,10 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 
 | Task | Command |
 |------|---------|
-| **Research a topic (one command)** | `filmot research "topic" --depth 12 --dedupe --sort density` |
+| **Research a topic (one command)** | `filmot research "topic" --depth 12 --dedupe` |
+| **Deep discovery research** | `filmot research "topic" --probe --depth 12 --dedupe` |
+| **Breaking news research** | `filmot research "topic" --scout-days 3 --depth 10` |
+| **Search latest YouTube uploads** | `filmot yt-search "topic" --days 7 --order relevance` |
 | **Compare sources on a claim** | `filmot library compare "claim" --sort density` |
 | **Search library** | `filmot library search "term"` |
 | **Structured export** | `filmot library context TOPIC --format structured` |
@@ -522,8 +716,20 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Pipeline download** | `filmot search "query" --raw \| filmot download -t TOPIC --dedupe` |
 | **List library** | `filmot library list` |
 | **Library stats** | `filmot library stats` |
+| **Search non-English** | `filmot search "人工知能" --lang ja --full` |
+| **Search Hebrew** | `filmot search "בינה מלאכותית" --lang iw --full` |
+| **Search Chinese (no lang)** | `filmot search "人工智能" --full` |
+| **Search Hindi** | `filmot search "कृत्रिम बुद्धिमत्ता" --lang hi --full` |
+| **Search Russian** | `filmot search "нейросеть" --lang ru --full` |
 | **Limit output** | `filmot transcript VIDEO_ID --full 2>&1 \| Select-Object -First 200` |
+| **Download channel corpus** | `filmot channel-download "Channel Name" --workers 4` |
+| **Check channel status** | `filmot channel-status` |
+| **Search channel corpus** | `filmot channel-search SLUG "query"` |
+| **Proximity search (channel)** | `filmot channel-search SLUG '"A" NEAR/10 "B"'` |
+| **Tilde proximity (channel)** | `filmot channel-search SLUG '"word1 word2"~5'` |
 
 ---
 
-*This guide was written based on actual research sessions using Filmot CLI across topics including AI security, nuclear fusion, solid-state batteries, brain-computer interfaces, and humanoid robotics.*
+*This guide was written based on actual research sessions using Filmot CLI across topics including AI security, nuclear fusion, solid-state batteries, brain-computer interfaces, humanoid robotics, and multilingual AI discourse (Hebrew, Chinese, Hindi, Russian).*
+
+> **Next**: Read **[AGENTS_RESEARCH_GUIDE.md](AGENTS_RESEARCH_GUIDE.md)** for the methodology behind evaluating sources, detecting AI misinformation, cross-referencing claims across languages, and reporting findings with appropriate confidence levels.

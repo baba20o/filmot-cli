@@ -143,6 +143,11 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
             results["result"] = sorted(videos, key=_density_key, reverse=(order != "asc"))
             console.print(f"[dim]Sorted by density (matches/min)[/dim]")
 
+        # Hint if --title filter produced no results
+        videos_list = results.get("result", [])
+        if not videos_list and title:
+            console.print(f"[yellow]No results with --title \"{title}\". Try without --title to broaden the search.[/yellow]")
+
         if raw:
             click.echo(json_mod.dumps(results, indent=2, ensure_ascii=False))
             return
@@ -414,17 +419,44 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False):
         # Display hits (subtitle matches) with density scoring
         hits = video.get("hits", [])
         if hits:
+            density = 0
             density_str = ""
+            is_live_stream = False
             if duration and duration > 0:
                 density = len(hits) / (duration / 60)
                 density_str = f" | [bold]{density:.1f}/min[/bold]"
-            console.print(f"   [bold green]Matches ({len(hits)}{density_str}):[/bold green]")
+                # Flag long live streams with very low density
+                if duration > 7200 and density < 0.1:
+                    is_live_stream = True
+
+            live_tag = " [dim magenta]\\[live stream][/dim magenta]" if is_live_stream else ""
+            console.print(f"   [bold green]Matches ({len(hits)}{density_str}):[/bold green]{live_tag}")
+
+            # Deduplicate near-identical hit segments (looping live streams)
             display_hits = hits if full else hits[:3]
+            seen_texts = set()
+            deduped_hits = []
             for hit in display_hits:
+                # Build a text fingerprint from the hit content
+                text_key = (hit.get("ctx_before", "") + hit.get("token", "") + hit.get("ctx_after", "")).strip()[:80]
+                if not text_key:
+                    # hit_format=1: use first line text
+                    lines = hit.get("lines", [])
+                    text_key = lines[0].get("text", "")[:80] if lines else ""
+                if text_key in seen_texts:
+                    continue
+                seen_texts.add(text_key)
+                deduped_hits.append(hit)
+
+            for hit in deduped_hits:
                 _display_hit(hit, video_id)
-            
+
+            hidden = len(display_hits) - len(deduped_hits)
+            if hidden > 0:
+                console.print(f"      [dim]... {hidden} duplicate segments hidden[/dim]")
             if not full and len(hits) > 3:
-                console.print(f"      [dim]... and {len(hits) - 3} more matches[/dim]")
+                remaining = len(hits) - 3
+                console.print(f"      [dim]... and {remaining} more matches[/dim]")
 
 
 # ========== GET VIDEO ==========
@@ -1824,6 +1856,161 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
     console.print(f"\n[dim]Sources sorted by {sort_label} (most relevant first)[/dim]")
 
 
+# ========== PROBE HELPERS ==========
+
+_PROBE_STOPWORDS = frozenset({
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+    'should', 'may', 'might', 'shall', 'can', 'to', 'of', 'in', 'for',
+    'on', 'with', 'at', 'by', 'from', 'up', 'about', 'into', 'through',
+    'during', 'before', 'after', 'above', 'below', 'between', 'out', 'off',
+    'over', 'under', 'again', 'further', 'then', 'once', 'and', 'but', 'or',
+    'nor', 'not', 'so', 'very', 'just', 'than', 'too', 'also', 'that',
+    'this', 'these', 'those', 'it', 'its', 'he', 'she', 'they', 'them',
+    'their', 'his', 'her', 'we', 'our', 'you', 'your', 'me', 'my',
+    'which', 'who', 'whom', 'what', 'where', 'when', 'how', 'why', 'all',
+    'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some', 'such',
+    'no', 'only', 'own', 'same', 'if', 'as', 'because', 'while', 'until',
+    'there', 'here', 'now', 'well', 'like', 'know', 'think', 'say', 'said',
+    'going', 'really', 'right', 'get', 'got', 'go', 'come', 'came', 'make',
+    'made', 'take', 'took', 'see', 'seen', 'want', 'look', 'way', 'thing',
+    'things', 'much', 'many', 'even', 'still', 'back', 'kind', 'mean',
+    'actually', 'something', 'anything', 'nothing', 'yeah', 'okay', 'yes',
+    'um', 'uh', 'oh', 'people', 'time', 'year', 'years', 'one', 'two',
+    'first', 'new', 'last', 'long', 'great', 'little', 'world', 'good',
+    'big', 'need', 'help', 'try', 'start', 'part', 'day', 'days', 'point',
+    'fact', 'lot', 'talk', 'talking', 'tell', 'told', 'called', 'keep',
+    'let', 'put', 'end', 'set', 'run', 'show', 'turn', 'move', 'play',
+    'live', 'believe', 'hold', 'bring', 'happen', 'must', 'pay', 'meet',
+    'include', 'continue', 'stand', 'give', 'work', 'number', 'already',
+    'since', 'different', 'away', 'able', 'possible', 'another', 'quite',
+    'enough', 'done', 'left', 'second', 'next', 'three', 'four', 'five',
+    'high', 'important', 'hand', 'sure', 'question', 'course',
+    'video', 'watch', 'subscribe', 'channel', 'comment', 'share',
+    'gonna', 'dont', 'wont', 'cant', 'didnt', 'doesnt', 'isnt', 'wasnt',
+    'youre', 'theyre', 'weve', 'thats', 'whats', 'heres', 'theres',
+    # Common in spoken/news transcripts
+    'says', 'president', 'country', 'government', 'minister', 'official',
+    'officials', 'state', 'report', 'reports', 'says', 'according',
+    'million', 'billion', 'percent', 'tonight', 'today', 'yesterday',
+    'breaking', 'update', 'latest', 'news', 'story', 'coverage',
+})
+
+
+def _extract_probe_terms(texts, topic, top_n=12):
+    """Extract significant terms from transcript texts for NEAR/N probing.
+
+    Uses frequency-based extraction: finds frequent bigrams and single words
+    that aren't stopwords or the topic itself. No NLP libraries needed.
+    Thresholds adapt to corpus size so it works with 3 or 30 transcripts.
+    """
+    import re
+    from collections import Counter
+
+    combined = " ".join(texts).lower()
+    topic_words = set(re.findall(r'[a-z]{3,}', topic.lower()))
+
+    words = re.findall(r'[a-z]{3,}', combined)
+    total_words = len(words)
+
+    # Adaptive thresholds: scale with corpus size
+    # ~100 words -> min 2, ~1000 -> min 3, ~5000+ -> min 5
+    bigram_min = max(2, min(5, total_words // 500))
+    single_min = max(2, min(8, total_words // 300))
+
+    # Bigrams: two consecutive non-stopwords
+    bigrams = Counter()
+    for i in range(len(words) - 1):
+        w1, w2 = words[i], words[i + 1]
+        if w1 not in _PROBE_STOPWORDS and w2 not in _PROBE_STOPWORDS:
+            if w1 in topic_words and w2 in topic_words:
+                continue
+            bigrams[f"{w1} {w2}"] += 1
+
+    # Significant single words
+    singles = Counter()
+    for w in words:
+        if w not in _PROBE_STOPWORDS and w not in topic_words and len(w) > 3:
+            singles[w] += 1
+
+    # Prefer bigrams (more specific), supplement with singles
+    terms = []
+    seen_words = set()
+
+    for term, count in bigrams.most_common(40):
+        if count >= bigram_min:
+            terms.append(term)
+            seen_words.update(term.split())
+            if len(terms) >= top_n:
+                break
+
+    for term, count in singles.most_common(40):
+        if count >= single_min and term not in seen_words:
+            terms.append(term)
+            if len(terms) >= top_n:
+                break
+
+    return terms
+
+
+def _find_probe_pairs(texts, terms, window_size=50, max_pairs=5):
+    """Find co-occurring term pairs within text windows.
+
+    Slides a window across the combined transcript text and counts
+    how often each pair of terms appears in the same window.
+    Returns top co-occurring pairs as NEAR/N probe candidates.
+    """
+    import re
+    from collections import Counter
+
+    combined = " ".join(texts).lower()
+    words = re.findall(r'[a-z]{3,}', combined)
+
+    # Build lookup: word -> set of terms it belongs to
+    word_to_terms = {}
+    for term in terms:
+        for w in term.split():
+            word_to_terms.setdefault(w, set()).add(term)
+
+    # Slide through text in overlapping windows
+    pair_counts = Counter()
+    step = max(window_size // 2, 1)
+
+    for start in range(0, max(len(words) - window_size, 1), step):
+        window = words[start:start + window_size]
+        window_terms = set()
+
+        for i, w in enumerate(window):
+            if w in word_to_terms:
+                for term in word_to_terms[w]:
+                    parts = term.split()
+                    if len(parts) == 1:
+                        window_terms.add(term)
+                    elif w == parts[0] and i + 1 < len(window) and window[i + 1] == parts[1]:
+                        window_terms.add(term)
+
+        # Count all pairs in this window
+        window_list = sorted(window_terms)
+        for i in range(len(window_list)):
+            for j in range(i + 1, len(window_list)):
+                pair_counts[(window_list[i], window_list[j])] += 1
+
+    # Filter: skip pairs where terms share any word (e.g., "president vladimir" + "vladimir putin")
+    results = []
+    for (t1, t2), count in pair_counts.most_common(max_pairs * 3):
+        if count < 2:
+            break
+        words_t1 = set(t1.split())
+        words_t2 = set(t2.split())
+        if words_t1 & words_t2:
+            continue  # overlapping terms, skip
+        results.append((t1, t2, count))
+        if len(results) >= max_pairs:
+            break
+
+    return results
+
+
 # ========== RESEARCH COMMAND ==========
 
 @cli.command()
@@ -1833,22 +2020,33 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
 @click.option("--lang", "-l", default=None, help="Language code (default: en)")
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback when captions unavailable")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts")
-@click.option("--min-matches", default=None, type=int, help="Only download videos with at least N subtitle matches")
-@click.option("--sort", "sort_by", default="viewcount", type=click.Choice(["viewcount", "density"]), help="Sort by viewcount (default) or density (matches/min)")
-def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, dedupe: bool, min_matches: int, sort_by: str):
-    """Research a topic: search, download transcripts, build knowledge base.
+@click.option("--min-matches", default=2, type=int, help="Only download videos with at least N subtitle matches (default: 2, 0 to disable)")
+@click.option("--sort", "sort_by", default="density", type=click.Choice(["viewcount", "density"]), help="Sort by density (default, matches/min) or viewcount")
+@click.option("--scout/--no-scout", default=True, help="Run YouTube API scout for latest content (default: on, requires YOUTUBE_API_KEY)")
+@click.option("--scout-days", default=7, type=int, help="Scout window in days (default: 7)")
+@click.option("--probe", is_flag=True, help="Auto-probe: extract entities from transcripts and run NEAR/N searches to discover related content")
+def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, dedupe: bool, min_matches: int, sort_by: str, scout: bool, scout_days: int, probe: bool):
+    """Research a topic: scout, search, probe, and build knowledge base.
 
-    Single command that orchestrates the full research workflow:
-    1. Search with --title matching the topic
-    2. Download top N transcripts to library
-    3. Print summary with source list
+    Multi-phase research pipeline:
+    1. Scout — YouTube API probe for latest uploads (freshness check)
+    2. Search — Filmot deep transcript search with density filtering
+    3. Synthesize — merge both, download transcripts, build library
+    4. Probe (--probe) — extract key entities, auto-generate NEAR/N queries,
+       discover related content the original search missed
+
+    The scout phase catches breaking news that Filmot hasn't indexed yet.
+    The probe phase compounds your results by mining downloaded transcripts
+    for entity relationships, then running targeted NEAR/N searches.
 
     Examples:
 
     \b
         filmot research "deep sea mining"
         filmot research "quantum computing" --depth 20 --min-views 50000
-        filmot research "fusion energy" --dedupe --sort density
+        filmot research "fusion energy" --dedupe --sort viewcount
+        filmot research "OpenClaw" --scout-days 3
+        filmot research "Russia Ukraine ceasefire" --probe --depth 8
     """
     import hashlib
     from .library import get_library
@@ -1859,11 +2057,42 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
 
     try:
         client = FilmotClient()
-
-        # Step 1: Search with title filter
         console.print(f"[bold]Researching: {topic}[/bold]\n")
+
+        # ── Phase 1: Scout (YouTube API freshness probe) ──
+        scout_videos = []
+        if scout:
+            try:
+                from .youtube_search import search_recent, validate_youtube_api
+                validate_youtube_api()
+                with console.status(f"[bold cyan]Scouting YouTube for latest '{topic}' uploads (last {scout_days} days)...[/bold cyan]"):
+                    scout_results = search_recent(
+                        query=topic,
+                        days_back=scout_days,
+                        max_results=10,
+                        order="relevance",
+                    )
+                if scout_results:
+                    scout_videos = scout_results
+                    console.print(f"[cyan]Scout:[/cyan] Found {len(scout_videos)} recent YouTube uploads")
+                    for i, sv in enumerate(scout_videos[:5], 1):
+                        published = sv.get("published_at", "")[:10]
+                        views = sv.get("views", 0)
+                        console.print(f"  [cyan]{i}.[/cyan] {sv['title'][:70]} [dim]({published}, {views:,} views)[/dim]")
+                    if len(scout_videos) > 5:
+                        console.print(f"  [dim]... and {len(scout_videos) - 5} more[/dim]")
+                    console.print()
+                else:
+                    console.print(f"[dim]Scout: No recent YouTube uploads found for '{topic}'[/dim]\n")
+            except (ValueError, ImportError):
+                # No YOUTUBE_API_KEY or youtube_search not available — skip silently
+                console.print(f"[dim]Scout: Skipped (YOUTUBE_API_KEY not configured)[/dim]\n")
+            except Exception as e:
+                console.print(f"[dim]Scout: Skipped ({e})[/dim]\n")
+
+        # ── Phase 2: Search (Filmot deep transcript search) ──
         api_sort = "viewcount" if sort_by != "density" else None
-        with console.status(f"[bold green]Searching for videos about '{topic}'..."):
+        with console.status(f"[bold green]Searching Filmot transcripts for '{topic}'..."):
             results = client.search_subtitles(
                 query=topic,
                 title=topic,
@@ -1879,11 +2108,51 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
 
         videos = results.get("result", [])
         total = results.get("totalresultcount", len(videos))
-        console.print(f"Found {total:,} dedicated videos about '{topic}'")
 
         if not videos:
-            console.print("[yellow]No videos found. Try a different topic.[/yellow]")
-            return
+            # Fallback: search transcript only (no title filter)
+            console.print(f"[dim]No title+transcript matches. Broadening to transcript-only...[/dim]")
+            with console.status(f"[bold green]Searching transcripts for '{topic}'..."):
+                results = client.search_subtitles(
+                    query=topic,
+                    lang=lang or "en",
+                    min_views=min_views,
+                    sort_field=api_sort,
+                    sort_order="desc" if api_sort else None,
+                )
+            if "error" in results:
+                console.print(f"[red]Error: {results['error']}[/red]")
+                return
+            videos = results.get("result", [])
+            total = results.get("totalresultcount", len(videos))
+            if videos:
+                console.print(f"[green]Filmot:[/green] Found {total:,} videos mentioning '{topic}' in transcript")
+            elif scout_videos:
+                console.print(f"[yellow]Filmot: No indexed results yet — scout found {len(scout_videos)} recent uploads to work with[/yellow]")
+            else:
+                console.print("[yellow]No videos found in Filmot or YouTube. Try a different topic.[/yellow]")
+                return
+        else:
+            console.print(f"[green]Filmot:[/green] Found {total:,} dedicated videos about '{topic}'")
+
+        # ── Phase 3: Synthesize (merge scout + Filmot results) ──
+        # Add scout videos that aren't already in Filmot results
+        filmot_video_ids = {(v.get("id") or v.get("videoid")) for v in videos}
+        new_from_scout = [sv for sv in scout_videos if sv["video_id"] not in filmot_video_ids]
+        if new_from_scout:
+            console.print(f"[cyan]Synthesize:[/cyan] Adding {len(new_from_scout)} videos from scout (not yet in Filmot index)")
+            # Convert scout format to Filmot-compatible format for download
+            for sv in new_from_scout:
+                videos.append({
+                    "id": sv["video_id"],
+                    "videoid": sv["video_id"],
+                    "title": sv.get("title", ""),
+                    "channelname": sv.get("channel_title", ""),
+                    "viewcount": sv.get("views", 0),
+                    "duration": 0,  # unknown until transcript is fetched
+                    "hits": [],  # no transcript hits (not indexed yet)
+                    "_from_scout": True,
+                })
 
         # Client-side density sort
         if sort_by == "density":
@@ -1894,10 +2163,10 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
             videos.sort(key=_density_key, reverse=True)
             console.print(f"[dim]Sorted by density (matches/min)[/dim]")
 
-        # Apply --min-matches filter
-        if min_matches is not None:
+        # Apply --min-matches filter (0 to disable); preserve scout videos (no hits yet)
+        if min_matches and min_matches > 0:
             before = len(videos)
-            videos = [v for v in videos if len(v.get("hits", [])) >= min_matches]
+            videos = [v for v in videos if v.get("_from_scout") or len(v.get("hits", [])) >= min_matches]
             if before != len(videos):
                 console.print(f"[dim]Filtered: {before} -> {len(videos)} videos (min {min_matches} matches)[/dim]")
 
@@ -1923,12 +2192,13 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
             video_id = video.get("id") or video.get("videoid")
             title_str = video.get("title", "Unknown")
             channel = video.get("channelname", video.get("channeltitle", video.get("channel", "Unknown")))
+            source_tag = " [cyan](scout)[/cyan]" if video.get("_from_scout") else ""
 
             # Backfill missing metadata from Filmot video API
             title_str, channel = _backfill_metadata(video_id, title_str, channel)
 
             if library.exists(video_id, normalized_topic):
-                console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {title_str[:60]}")
+                console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {title_str[:60]}{source_tag}")
                 skip_count += 1
                 # Count existing chars
                 data = library.get(video_id, normalized_topic)
@@ -1943,7 +2213,7 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                     result = get_transcript(video_id)
 
                 if "error" in result:
-                    console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {title_str[:60]}")
+                    console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {title_str[:60]}{source_tag}")
                     fail_count += 1
                     continue
 
@@ -1973,19 +2243,143 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                     metadata=metadata,
                 )
                 total_chars += len(full_text)
-                console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {title_str[:60]}")
+                console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {title_str[:60]}{source_tag}")
                 success_count += 1
 
             except Exception as e:
-                console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}")
+                console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}{source_tag}")
                 fail_count += 1
 
-        # Step 3: Summary
+        # ── Phase 4: Probe (auto-generate NEAR/N from extracted entities) ──
+        probe_success = 0
+        probe_chars = 0
+        if probe:
+            # Collect transcript texts from library
+            transcript_texts = []
+            for t in library.list_transcripts(normalized_topic):
+                data = library.get(t["video_id"], normalized_topic)
+                if data and data.get("transcript"):
+                    transcript_texts.append(data["transcript"])
+
+            if len(transcript_texts) < 2:
+                console.print(f"\n[dim]Probe: Need at least 2 transcripts (got {len(transcript_texts)}). Try increasing --depth.[/dim]")
+            else:
+                console.print(f"\n[bold]Probing key relationships from {len(transcript_texts)} transcripts...[/bold]")
+
+                # Extract key terms
+                terms = _extract_probe_terms(transcript_texts, topic)
+                if not terms:
+                    console.print(f"  [dim]No significant entities extracted.[/dim]")
+                else:
+                    console.print(f"  Entities: [cyan]{', '.join(terms[:8])}{'...' if len(terms) > 8 else ''}[/cyan]")
+
+                    # Find co-occurring pairs
+                    pairs = _find_probe_pairs(transcript_texts, terms)
+
+                    if not pairs:
+                        console.print(f"  [dim]No strong co-occurring pairs found. Try --depth with more transcripts.[/dim]")
+                    else:
+                        console.print()
+                        existing_ids = {t["video_id"] for t in library.list_transcripts(normalized_topic)}
+                        probe_new_videos = []
+
+                        for idx, (t1, t2, co_count) in enumerate(pairs, 1):
+                            query = f'"{t1}" NEAR/15 "{t2}"'
+                            try:
+                                with console.status(f"  Probing: {query}"):
+                                    probe_results = client.search_subtitles(
+                                        query=query,
+                                        title=topic,
+                                        lang=lang or "en",
+                                    )
+                            except Exception:
+                                console.print(f"  Probe {idx}: {query} [dim]→ error[/dim]")
+                                continue
+
+                            if "error" in probe_results:
+                                console.print(f"  Probe {idx}: {query} [dim]→ error[/dim]")
+                                continue
+
+                            probe_hits = probe_results.get("result", [])
+                            total_probe = probe_results.get("totalresultcount", len(probe_hits))
+
+                            if not probe_hits:
+                                console.print(f"  Probe {idx}: {query} → [dim]0 results[/dim]")
+                                continue
+
+                            # Find peak density
+                            peak_density = 0
+                            for pv in probe_hits:
+                                dur = pv.get("duration", 0)
+                                nhits = len(pv.get("hits", []))
+                                if dur > 0:
+                                    peak_density = max(peak_density, nhits / (dur / 60))
+
+                            # Count new videos not already in library
+                            new_vids = [
+                                pv for pv in probe_hits
+                                if (pv.get("id") or pv.get("videoid")) not in existing_ids
+                            ]
+
+                            new_tag = f" | [cyan]{len(new_vids)} new[/cyan]" if new_vids else ""
+                            console.print(
+                                f"  Probe {idx}: {query} [dim](co:{co_count})[/dim] → "
+                                f"[green]{total_probe:,} results[/green] "
+                                f"(peak: [bold]{peak_density:.1f}/min[/bold]){new_tag}"
+                            )
+
+                            # Collect top 2 new videos per probe (sorted by density)
+                            for pv in sorted(new_vids, key=lambda v: len(v.get("hits", [])) / max(v.get("duration", 1) / 60, 0.01), reverse=True)[:2]:
+                                vid = pv.get("id") or pv.get("videoid")
+                                if vid not in existing_ids:
+                                    probe_new_videos.append(pv)
+                                    existing_ids.add(vid)
+
+                        # Download probe discoveries
+                        if probe_new_videos:
+                            dl_count = min(len(probe_new_videos), 3)
+                            console.print(f"\n  [cyan]Downloading {dl_count} probe discoveries...[/cyan]")
+                            for pv in probe_new_videos[:dl_count]:
+                                vid = pv.get("id") or pv.get("videoid")
+                                ptitle = pv.get("title", "Unknown")
+                                pchannel = pv.get("channelname", pv.get("channeltitle", "Unknown"))
+                                ptitle, pchannel = _backfill_metadata(vid, ptitle, pchannel)
+                                try:
+                                    if fallback:
+                                        result = get_transcript_with_fallback(vid, use_aws_fallback=True)
+                                    else:
+                                        result = get_transcript(vid)
+                                    if "error" not in result:
+                                        full_text = result.get("full_text", "")
+                                        metadata = {
+                                            "title": ptitle,
+                                            "channel": pchannel,
+                                            "language": result.get("language"),
+                                            "is_generated": result.get("is_generated"),
+                                            "duration_seconds": result.get("duration_seconds"),
+                                            "segment_count": result.get("segment_count"),
+                                            "views": pv.get("viewcount"),
+                                        }
+                                        library.save(video_id=vid, topic=normalized_topic, transcript_text=full_text, metadata=metadata)
+                                        probe_chars += len(full_text)
+                                        probe_success += 1
+                                        console.print(f"    [green]✓[/green] {ptitle[:60]} [dim magenta](probe)[/dim magenta]")
+                                    else:
+                                        console.print(f"    [red]Fail[/red] {ptitle[:60]}")
+                                except Exception as e:
+                                    console.print(f"    [red]Fail[/red] {vid} - {e}")
+
+        # Summary
         console.print(f"\n{'='*60}")
         console.print(f"[bold]Research complete: {normalized_topic}[/bold]")
-        console.print(f"  Saved: {success_count} | Skipped: {skip_count} | Failed: {fail_count}" +
-                      (f" | Deduped: {dedupe_count}" if dedupe_count else ""))
-        console.print(f"  Total content: {total_chars:,} characters ({total_chars / 1024:.0f} KB)")
+        stats = f"  Saved: {success_count} | Skipped: {skip_count} | Failed: {fail_count}"
+        if dedupe_count:
+            stats += f" | Deduped: {dedupe_count}"
+        if probe_success:
+            stats += f" | Probe: {probe_success}"
+        console.print(stats)
+        all_chars = total_chars + probe_chars
+        console.print(f"  Total content: {all_chars:,} characters ({all_chars / 1024:.0f} KB)")
 
         # List sources
         transcripts = library.list_transcripts(normalized_topic)
@@ -1993,6 +2387,17 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
             console.print(f"\n[bold]Sources ({len(transcripts)}):[/bold]")
             for t in transcripts:
                 console.print(f"  - {t.get('title', 'Unknown')} ({t.get('channel', 'Unknown')})")
+
+        # Hint: suggest yt-search if results were sparse and scout wasn't used
+        if not scout and success_count < 3:
+            console.print(f"\n[yellow]Tip: Few results found. Try adding --scout to also check YouTube for very recent uploads.[/yellow]")
+            console.print(f"  [dim]filmot research \"{topic}\" --scout[/dim]")
+        elif not scout_videos and success_count < 3:
+            console.print(f"\n[yellow]Tip: Few results. Try 'filmot yt-search \"{topic}\"' to find very recent videos not yet in Filmot's index.[/yellow]")
+
+        # Suggest --probe if not used and enough content was saved
+        if not probe and success_count >= 3:
+            console.print(f"\n[dim]Tip: Add --probe to auto-discover related content via NEAR/N entity extraction.[/dim]")
 
         console.print(f"\n[dim]Next steps:[/dim]")
         console.print(f"  filmot library search \"your query\" --topic {normalized_topic}")
@@ -2003,6 +2408,427 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
         console.print(f"[red]Configuration Error: {e}[/red]")
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
+
+
+# ========== CHANNEL DOWNLOAD ==========
+
+@cli.command("channel-download")
+@click.argument("channel_id")
+@click.option("--delay", "-d", default=1.0, type=float, help="Seconds between downloads (rate limiting, default: 1.0)")
+@click.option("--lang", "-l", default="en", help="Preferred language code (default: en)")
+@click.option("--limit", default=None, type=int, help="Limit number of transcripts to download (for testing)")
+@click.option("--workers", "-w", default=1, type=int, help="Parallel download workers (default: 1, try 4 for speed)")
+@click.option("--no-proxy", is_flag=True, help="Bypass proxy, connect directly with your IP")
+@click.option("--fresh", is_flag=True, help="Ignore existing manifest, start fresh")
+def channel_download(channel_id: str, delay: float, lang: str, limit: int, workers: int, no_proxy: bool, fresh: bool):
+    """Download ALL transcripts from a YouTube channel.
+
+    Enumerates every video on a channel via YouTube Data API, then downloads
+    each transcript. Keeps a manifest for resume — if interrupted, re-run the
+    same command to pick up where you left off (delta sync).
+
+    Transcripts are stored in .filmot_data/channels/<channel-name>/
+
+    \b
+    Examples:
+        filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg
+        filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg --delay 2
+        filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg --limit 5
+        filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg --workers 4
+    """
+    from rich.progress import Progress, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
+    from .channel_dl import ChannelDownloader, get_channel_info
+    import shutil
+
+    downloader = ChannelDownloader()
+
+    # If --fresh, remove existing channel dir
+    if fresh:
+        try:
+            info = get_channel_info(channel_id)
+            from .channel_dl import _slugify
+            slug = _slugify(info['name'])
+            channel_dir = downloader.channels_dir / slug
+            if channel_dir.exists():
+                stderr_console.print(f"[yellow]Removing existing data for {info['name']}...[/yellow]")
+                shutil.rmtree(channel_dir)
+        except Exception:
+            pass  # Will be handled below
+
+    # Phase 1: Channel info
+    with console.status("[bold blue]Fetching channel info..."):
+        try:
+            info = get_channel_info(channel_id)
+        except Exception as e:
+            console.print(f"[red]Error fetching channel: {e}[/red]")
+            return
+
+    console.print(Panel(
+        f"[bold]{info['name']}[/bold]\n"
+        f"Channel ID: {channel_id}\n"
+        f"Videos: {info['video_count']:,}\n"
+        f"Subscribers: {info['subscriber_count']:,}",
+        title="Channel",
+        border_style="blue",
+    ))
+
+    # Phase 2: Enumerate videos
+    from .channel_dl import list_all_video_ids, _slugify
+
+    stderr_console.print("[blue]Enumerating all videos...[/blue]")
+    
+    try:
+        all_videos = list_all_video_ids(
+            info['uploads_playlist_id'],
+            progress_callback=lambda cur, tot, pg: stderr_console.print(
+                f"  [dim]Listed {cur}/{tot} videos (page {pg})[/dim]"
+            ),
+        )
+    except Exception as e:
+        console.print(f"[red]Error listing videos: {e}[/red]")
+        return
+
+    stderr_console.print(f"[green]Found {len(all_videos)} videos[/green]")
+
+    # Phase 3: Determine delta
+    slug = _slugify(info['name'])
+    channel_dir = downloader._get_channel_dir(slug)
+    manifest = downloader._load_manifest(channel_dir)
+    existing = manifest.get('videos', {})
+    already_done = {k for k, v in existing.items() if v.get('status') == 'done'}
+
+    to_download = [v for v in all_videos if v['video_id'] not in already_done]
+
+    if limit:
+        to_download = to_download[:limit]
+
+    if not to_download:
+        console.print("[green]✓ Channel is fully synced! Nothing new to download.[/green]")
+        console.print(f"[dim]Total transcripts: {len(already_done)}[/dim]")
+        return
+
+    if already_done:
+        stderr_console.print(f"[yellow]Resuming — already have {len(already_done)} transcripts, {len(to_download)} remaining[/yellow]")
+    else:
+        stderr_console.print(f"[blue]Downloading {len(to_download)} transcripts...[/blue]")
+
+    if workers > 1:
+        stderr_console.print(f"[blue]Using {workers} parallel workers[/blue]")
+
+    # Phase 4: Download with progress bar
+    from .transcript import get_transcript
+    import time as _time
+    from datetime import datetime as _dt
+
+    # Force direct connection if --no-proxy
+    if no_proxy:
+        from .transcript import _api, _initialized
+        import filmot.transcript as _tmod
+        from youtube_transcript_api import YouTubeTranscriptApi as _YTT
+        _tmod._api = _YTT()
+        _tmod._proxy_configured = False
+        _tmod._initialized = True
+        stderr_console.print("[yellow]Proxy disabled — using direct IP[/yellow]")
+    import threading
+
+    languages = [lang, f'{lang}-US', f'{lang}-GB'] if lang == 'en' else [lang, 'en']
+
+    downloaded = 0
+    failed = 0
+    total_words = 0
+    _lock = threading.Lock()  # Protects manifest, counters, and progress bar
+    _interrupted = threading.Event()
+
+    # Ensure manifest structure
+    if 'videos' not in manifest:
+        manifest['videos'] = {}
+    for v in all_videos:
+        if v['video_id'] not in manifest['videos']:
+            manifest['videos'][v['video_id']] = {
+                'title': v['title'],
+                'published_at': v['published_at'],
+                'status': 'pending',
+            }
+
+    def _download_one(v_item):
+        """Download a single transcript. Thread-safe."""
+        nonlocal downloaded, failed, total_words
+
+        if _interrupted.is_set():
+            return
+
+        vid_id = v_item['video_id']
+
+        try:
+            result = get_transcript(vid_id, languages=languages)
+
+            with _lock:
+                if 'error' in result:
+                    manifest['videos'][vid_id].update({
+                        'status': 'failed',
+                        'error': result['error'],
+                        'last_attempt': _dt.now().isoformat(),
+                    })
+                    failed += 1
+                else:
+                    transcript_data = {
+                        'video_id': vid_id,
+                        'title': v_item['title'],
+                        'published_at': v_item['published_at'],
+                        'channel': info['name'],
+                        'channel_id': channel_id,
+                        'language': result.get('language', ''),
+                        'is_generated': result.get('is_generated', True),
+                        'duration_seconds': result.get('duration_seconds', 0),
+                        'segment_count': result.get('segment_count', 0),
+                        'word_count': len(result.get('full_text', '').split()),
+                        'full_text': result.get('full_text', ''),
+                        'segments': result.get('segments', []),
+                        'downloaded_at': _dt.now().isoformat(),
+                    }
+                    downloader._save_transcript(channel_dir, vid_id, transcript_data)
+
+                    wc = len(result.get('full_text', '').split())
+                    total_words += wc
+                    manifest['videos'][vid_id].update({
+                        'status': 'done',
+                        'language': result.get('language', ''),
+                        'is_generated': result.get('is_generated', True),
+                        'duration_seconds': result.get('duration_seconds', 0),
+                        'word_count': wc,
+                        'downloaded_at': _dt.now().isoformat(),
+                    })
+                    downloaded += 1
+
+                # Save manifest (crash-safe)
+                done_total = sum(1 for vv in manifest['videos'].values() if vv.get('status') == 'done')
+                manifest.update({
+                    'channel': info,
+                    'total_videos': len(all_videos),
+                    'downloaded_count': done_total,
+                    'failed_count': sum(1 for vv in manifest['videos'].values() if vv.get('status') == 'failed'),
+                    'last_updated': _dt.now().isoformat(),
+                })
+                downloader._save_manifest(channel_dir, manifest)
+
+        except Exception as e:
+            with _lock:
+                manifest['videos'][vid_id].update({
+                    'status': 'failed',
+                    'error': str(e),
+                    'last_attempt': _dt.now().isoformat(),
+                })
+                failed += 1
+                downloader._save_manifest(channel_dir, manifest)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=stderr_console,
+    ) as progress:
+        task = progress.add_task(f"Downloading ({workers}w)", total=len(to_download))
+
+        if workers <= 1:
+            # Sequential mode (original behavior)
+            for i, v in enumerate(to_download):
+                if _interrupted.is_set():
+                    break
+                title = v['title'][:50]
+                progress.update(task, description=f"[cyan]{title}...")
+                try:
+                    _download_one(v)
+                except KeyboardInterrupt:
+                    _interrupted.set()
+                    stderr_console.print("\n[yellow]Interrupted! Progress saved — re-run to resume.[/yellow]")
+                    break
+                progress.advance(task)
+                if i < len(to_download) - 1:
+                    _time.sleep(delay)
+        else:
+            # Parallel mode with ThreadPoolExecutor
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {}
+                    for v in to_download:
+                        fut = executor.submit(_download_one, v)
+                        futures[fut] = v
+
+                    for fut in as_completed(futures):
+                        if _interrupted.is_set():
+                            break
+                        v = futures[fut]
+                        try:
+                            fut.result()  # Raise any exception from the thread
+                        except Exception:
+                            pass  # Already handled inside _download_one
+                        progress.update(task, description=f"[cyan]{v['title'][:50]}...")
+                        progress.advance(task)
+            except KeyboardInterrupt:
+                _interrupted.set()
+                stderr_console.print("\n[yellow]Interrupted! Progress saved — re-run to resume.[/yellow]")
+
+    # Final update
+    manifest['last_sync'] = _dt.now().isoformat()
+    downloader._save_manifest(channel_dir, manifest)
+
+    # Summary
+    done_total = sum(1 for v in manifest['videos'].values() if v.get('status') == 'done')
+    console.print()
+    console.print(Panel(
+        f"[bold green]Download Complete[/bold green]\n\n"
+        f"Channel: [bold]{info['name']}[/bold]\n"
+        f"This session: [green]{downloaded}[/green] downloaded, [red]{failed}[/red] failed\n"
+        f"Total corpus: [bold]{done_total}/{len(all_videos)}[/bold] videos\n"
+        f"Words downloaded: [bold]{total_words:,}[/bold]\n"
+        f"Storage: {channel_dir}",
+        title="Summary",
+        border_style="green",
+    ))
+
+
+@cli.command("channel-status")
+@click.argument("channel_slug", required=False, default=None)
+def channel_status(channel_slug: str):
+    """Show download status and stats for channel corpora.
+
+    Without arguments, lists all downloaded channels.
+    With a channel slug, shows detailed stats.
+
+    \b
+    Examples:
+        filmot channel-status
+        filmot channel-status chat-with-traders
+    """
+    from .channel_dl import ChannelDownloader
+
+    downloader = ChannelDownloader()
+
+    if channel_slug is None:
+        # List all channels
+        channels = downloader.get_downloaded_channels()
+        if not channels:
+            console.print("[dim]No channels downloaded yet.[/dim]")
+            console.print("[dim]Use: filmot channel-download <channel_id>[/dim]")
+            return
+
+        table = Table(title="Downloaded Channels", border_style="blue")
+        table.add_column("Channel", style="bold")
+        table.add_column("Downloaded", justify="right")
+        table.add_column("Failed", justify="right")
+        table.add_column("Total", justify="right")
+        table.add_column("Last Updated", style="dim")
+        table.add_column("Slug", style="dim")
+
+        for ch in channels:
+            table.add_row(
+                ch['name'],
+                str(ch['downloaded']),
+                str(ch['failed']),
+                str(ch['total_videos']),
+                ch['last_updated'][:19] if ch['last_updated'] else '',
+                ch['slug'],
+            )
+        console.print(table)
+    else:
+        # Show detailed stats
+        stats = downloader.get_channel_stats(channel_slug)
+        if not stats:
+            console.print(f"[red]Channel '{channel_slug}' not found.[/red]")
+            console.print("[dim]Run 'filmot channel-status' to see available channels.[/dim]")
+            return
+
+        ch = stats.get('channel', {})
+        console.print(Panel(
+            f"[bold]{ch.get('name', channel_slug)}[/bold]\n"
+            f"Channel ID: {ch.get('channel_id', 'N/A')}\n\n"
+            f"Downloaded: [green]{stats['downloaded']}[/green] / {stats['total_videos']}\n"
+            f"Failed: [red]{stats['failed']}[/red]\n"
+            f"Pending: [yellow]{stats['pending']}[/yellow]\n\n"
+            f"Total words: [bold]{stats['total_words']:,}[/bold]\n"
+            f"Total duration: [bold]{stats['total_duration_hours']}[/bold] hours\n\n"
+            f"Last sync: {stats['last_sync'][:19] if stats['last_sync'] else 'never'}\n"
+            f"Storage: {stats['storage_path']}",
+            title="Channel Corpus",
+            border_style="cyan",
+        ))
+
+
+@cli.command("channel-search")
+@click.argument("channel_slug")
+@click.argument("query")
+@click.option("--limit", "-n", default=20, type=int, help="Max results (default: 20)")
+def channel_search(channel_slug: str, query: str, limit: int):
+    """Search across all transcripts in a downloaded channel corpus.
+
+    Supports proximity operators for finding words near each other:
+
+    \b
+    Plain search:
+        filmot channel-search chat-with-traders "Sharpe ratio"
+
+    NEAR/N – two phrases within N words of each other:
+        filmot channel-search chat-with-traders '"machine learning" NEAR/10 "neural network"'
+
+    ~N – words in a phrase within N words of each other:
+        filmot channel-search chat-with-traders '"deep learning tensorflow"~5'
+    """
+    from .channel_dl import ChannelDownloader, _parse_proximity_query
+    import re
+
+    parsed = _parse_proximity_query(query)
+    downloader = ChannelDownloader()
+
+    # Build a display label for the query type
+    if parsed[0] == 'near':
+        qlabel = f'"{parsed[1]}" NEAR/{parsed[3]} "{parsed[2]}"'
+    elif parsed[0] == 'tilde':
+        qlabel = f'"{" ".join(parsed[1])}"~{parsed[2]}'
+    else:
+        qlabel = query
+
+    with console.status(f"[blue]Searching '{qlabel}' across {channel_slug}..."):
+        results = downloader.search_corpus(channel_slug, query)
+
+    if not results:
+        console.print(f"[dim]No matches for '{qlabel}' in {channel_slug}.[/dim]")
+        return
+
+    total_matches = sum(r['match_count'] for r in results)
+    results = results[:limit]
+    console.print(f"\n[bold]Found {len(results)} videos matching '{qlabel}' ({total_matches} total hits)[/bold]\n")
+
+    for r in results:
+        console.print(f"[bold cyan]{r['title']}[/bold cyan]")
+        console.print(f"  [dim]{r['video_id']} | {r['published_at'][:10] if r['published_at'] else 'N/A'} | {r['match_count']} matches[/dim]")
+        for snippet in r['snippets'][:2]:
+            # Highlight keywords in the snippet
+            highlighted = snippet
+            if parsed[0] == 'near':
+                for term in [parsed[1], parsed[2]]:
+                    highlighted = re.sub(
+                        re.escape(term),
+                        f"[bold yellow]{term}[/bold yellow]",
+                        highlighted,
+                        flags=re.IGNORECASE,
+                    )
+            elif parsed[0] == 'tilde':
+                for w in parsed[1]:
+                    highlighted = re.sub(
+                        re.escape(w),
+                        f"[bold yellow]{w}[/bold yellow]",
+                        highlighted,
+                        flags=re.IGNORECASE,
+                    )
+            else:
+                highlighted = snippet.replace(query, f"[bold yellow]{query}[/bold yellow]")
+            console.print(f"  [dim]→[/dim] {highlighted}")
+        console.print()
 
 
 # ========== DOWNLOAD (STDIN) ==========

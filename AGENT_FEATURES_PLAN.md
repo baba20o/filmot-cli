@@ -209,3 +209,14 @@ All 77 existing tests pass after changes.
 | H | Auto-fallback to substring on zero word-boundary results | DONE | Catches plurals/inflections (e.g., "patent" finds "patents") |
 | I | Context overlap dedup in `_find_matches` | DONE | `min_gap` param skips matches within previous context window |
 | J | `--sort density` on `library compare` | DONE | Sort by mentions/min instead of raw count |
+
+## Channel Corpus Features (from corpus mining sessions)
+
+| # | Feature | Status | Notes |
+|---|---------|--------|-------|
+| K | `channel-download` command | DONE | Download all transcripts from a YouTube channel. Parallel workers, resume/delta, proxy + `--no-proxy` bypass. |
+| L | `channel-status` command | DONE | List all downloaded channels or detailed stats for one. |
+| M | `channel-search` command | DONE | Search across local channel corpus. Plain text, NEAR/N proximity, tilde `~N` proximity. |
+| N | Parallel download (`--workers`) | DONE | ThreadPoolExecutor with thread-safe manifest saves. 3x speedup at 4 workers. |
+| O | `--no-proxy` flag | DONE | Bypass Webshare proxy for direct connections. |
+| P | Proximity search in `channel-search` | DONE | `_parse_proximity_query()` parses NEAR/N and `"words"~N`. `_find_near_matches()` / `_find_tilde_matches()` do word-distance matching. |

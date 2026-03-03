@@ -70,5 +70,13 @@ proxies.txt
 
 # Research & Insights (private local research)
 Insights/
-
+custom_searches/
 context/
+
+# Scratch / dev files
+_q.py
+swagger.yaml
+nul
+
+# Claude Code settings (local)
+.claude/
