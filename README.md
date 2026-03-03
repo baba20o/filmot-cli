@@ -214,8 +214,8 @@ filmot search 'python ("tutorial" | "course")'
 # Find "machine learning" near "neural network" within 10 words
 filmot search '"machine learning" NEAR/10 "neural network"'
 
-# Exact phrase with proximity - words within 5 words of each other
-filmot search '"deep learning" "tensorflow"~5'
+# Proximity - words within 5 words of each other
+filmot search '"deep learning tensorflow"~5'
 
 # Find Python content that's NOT in a beginner context
 filmot search 'python NOTNEAR/10 beginner'
