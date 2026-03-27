@@ -203,6 +203,8 @@ filmot search '"artificial intelligence" | "A.I." | "AI"'
 filmot search '"iPhone" | "i phone" | "i-phone"'
 ```
 
+> **Proximity syntax caveat:** Do not put `|` inside a quoted phrase when using `NEAR/N` or `NOTNEAR/N`. This backend form is invalid: `"memory|context" NEAR/20 "production"`. Use grouped OR instead: `("memory" | "context") NEAR/20 "production"`. Filmot now rewrites the invalid form automatically, but the grouped form is the correct syntax to write.
+
 #### Combining Operators with Grouping
 
 Use parentheses `()` to build complex queries combining multiple operators:
@@ -222,6 +224,10 @@ filmot search 'python NOTNEAR/10 beginner'
 
 # Complex: Find Filmot mentions near YouTube-related terms (with spelling variations)
 filmot search '("filmot" | "philmot" | "filmont") NEAR/50 ("youtube" | "transcript" | "subtitle")'
+
+# Correct way to use OR inside proximity queries
+filmot search '("memory" | "context") NEAR/20 "production"'
+filmot search '"agent memory" NEAR/20 ("vector" | "graph" | "database")'
 
 # Find advanced Python discussions (exclude videos with "beginner" anywhere)
 filmot search 'python "advanced" -beginner'
@@ -493,6 +499,9 @@ filmot channel-search chat-with-traders "Sharpe ratio"
 # NEAR/N — find two phrases within N words of each other
 filmot channel-search chat-with-traders '"risk management" NEAR/10 "position sizing"'
 
+# NEAR/N with grouped OR on either side
+filmot channel-search chat-with-traders '("risk" | "drawdown") NEAR/10 ("position" | "sizing")'
+
 # ~N (tilde) — find words within N words of each other
 filmot channel-search chat-with-traders '"blew up account"~5'
 
@@ -503,8 +512,10 @@ filmot channel-search excess-returns "diversification" --limit 10
 | Operator | Syntax | Example |
 |----------|--------|---------|
 | **Plain** | `"text"` | `"Sharpe ratio"` |
-| **NEAR/N** | `"phrase1" NEAR/N "phrase2"` | `'"risk management" NEAR/10 "position sizing"'` |
+| **NEAR/N** | `"phrase1" NEAR/N "phrase2"` or `("a" \| "b") NEAR/N ("c" \| "d")` | `'"risk management" NEAR/10 "position sizing"'` |
 | **Tilde** | `"word1 word2"~N` | `'"blew up account"~5'` |
+
+> **Important:** For proximity queries, use grouped OR like `("risk" | "drawdown") NEAR/10 "position"`. Do not use quoted pipes like `"risk|drawdown" NEAR/10 "position"`.
 
 > **Note:** `channel-search` runs entirely offline against your downloaded corpus. No API calls, no rate limits, no quota. Download once, search forever.
 

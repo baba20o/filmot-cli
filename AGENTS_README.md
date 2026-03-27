@@ -39,6 +39,8 @@ filmot search '"artificial intelligence" NEAR/20 "job displacement"' --full
 
 The number after `NEAR/` is the word proximity window. `NEAR/15` means the two terms must appear within 15 words of each other. This turns a vague topic search into a surgical probe for **specific contextual relationships**.
 
+**Syntax rule:** when combining OR with proximity, use grouped OR on either side of `NEAR/N` or `NOTNEAR/N`, for example `("memory" | "context") NEAR/20 "production"`. Do not write `"memory|context" NEAR/20 "production"`; that backend form is invalid.
+
 **When to use it:**
 - Investigating claims: `'"company" NEAR/10 "lawsuit"'`
 - Finding connections: `'"person" NEAR/15 "scandal"'`
@@ -619,6 +621,7 @@ filmot channel-status
 # 3. Mine the corpus — plain text, NEAR/N, and tilde proximity all work
 filmot channel-search chat-with-traders "blew up"
 filmot channel-search chat-with-traders '"risk management" NEAR/10 "position sizing"'
+filmot channel-search chat-with-traders '("risk" | "drawdown") NEAR/10 ("position" | "sizing")'
 filmot channel-search chat-with-traders '"revenge trading"~5'
 
 # 4. Compare patterns across channels
@@ -637,8 +640,10 @@ filmot channel-search excess-returns '"risk management" NEAR/10 "position sizing
 | Operator | Syntax | Example |
 |----------|--------|---------|
 | Plain | `"text"` | `"Sharpe ratio"` |
-| NEAR/N | `"phrase1" NEAR/N "phrase2"` | `'"risk" NEAR/10 "sizing"'` |
+| NEAR/N | `"phrase1" NEAR/N "phrase2"` or `("a" \| "b") NEAR/N ("c" \| "d")` | `'"risk" NEAR/10 "sizing"'` |
 | Tilde | `"word1 word2"~N` | `'"blew up account"~5'` |
+
+Use grouped OR for proximity queries. Do not put `|` inside a quoted NEAR operand like `"risk|drawdown" NEAR/10 "position"`.
 
 ### Pattern 4: Technical Deep Dive
 ```bash

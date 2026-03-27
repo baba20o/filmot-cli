@@ -42,21 +42,24 @@ def _parse_proximity_query(query: str):
     """Parse a query string looking for proximity operators.
 
     Supported syntaxes (case-insensitive):
-        "phrase1" NEAR/N "phrase2"   – two phrases within N words
-        "word1 word2"~N             – words in the phrase within N words of each other
+        "phrase1" NEAR/N "phrase2"                  – two phrases within N words
+        ("alt1" | "alt2") NEAR/N "phrase2"         – OR group on left side
+        "phrase1" NEAR/N ("alt1" | "alt2")         – OR group on right side
+        ("alt1" | "alt2") NEAR/N ("alt3" | "alt4") – OR groups on both sides
+        "word1 word2"~N                            – words in the phrase within N words of each other
 
     Returns one of:
         ('plain', query_str)
-        ('near', phrase1, phrase2, distance)
+        ('near', left_terms, right_terms, distance)
         ('tilde', words_list, distance)
     """
-    # --- NEAR/N between two quoted phrases ---
-    m = re.match(
-        r'''^\s*"([^"]+)"\s+NEAR\s*/\s*(\d+)\s+"([^"]+)"\s*$''',
-        query, re.IGNORECASE,
-    )
+    # --- NEAR/N between quoted phrases or parenthesized OR groups ---
+    m = re.match(r'''^\s*(.+?)\s+NEAR\s*/\s*(\d+)\s+(.+?)\s*$''', query, re.IGNORECASE)
     if m:
-        return ('near', m.group(1).strip(), m.group(3).strip(), int(m.group(2)))
+        left_terms = _parse_near_operand(m.group(1))
+        right_terms = _parse_near_operand(m.group(3))
+        if left_terms and right_terms:
+            return ('near', left_terms, right_terms, int(m.group(2)))
 
     # --- "words"~N  (tilde proximity) ---
     m = re.match(r'''^\s*"([^"]+)"~(\d+)\s*$''', query)
@@ -66,6 +69,43 @@ def _parse_proximity_query(query: str):
             return ('tilde', words, int(m.group(2)))
 
     return ('plain', query)
+
+
+def _parse_near_operand(operand: str) -> Optional[list[str]]:
+    """Parse one side of a NEAR/N query.
+
+    Each operand can be either a single quoted phrase or a parenthesized OR
+    group of quoted phrases.
+    """
+    operand = operand.strip()
+
+    single = re.fullmatch(r'''\s*"([^"]+)"\s*''', operand)
+    if single:
+        return [single.group(1).strip()]
+
+    grouped = re.fullmatch(
+        r'''\(\s*"[^"]+"\s*(?:\|\s*"[^"]+"\s*)+\)''',
+        operand,
+    )
+    if grouped:
+        return [term.strip() for term in re.findall(r'''"([^"]+)"''', operand)]
+
+    return None
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping or touching character spans."""
+    if not spans:
+        return []
+
+    spans = sorted(spans)
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        if start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _find_near_matches(text: str, phrase1: str, phrase2: str, distance: int):
@@ -141,17 +181,21 @@ def _find_near_matches(text: str, phrase1: str, phrase2: str, distance: int):
                 span_end = max(cp1 + len(p1), cp2 + len(p2))
                 matches.append((span_start, span_end))
 
-    # Deduplicate overlapping spans
-    if not matches:
-        return []
-    matches.sort()
-    merged = [matches[0]]
-    for s, e in matches[1:]:
-        if s <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-    return merged
+    return _merge_spans(matches)
+
+
+def _find_grouped_near_matches(
+    text: str,
+    left_terms: list[str],
+    right_terms: list[str],
+    distance: int,
+) -> list[tuple[int, int]]:
+    """Find NEAR/N spans across every left/right term combination."""
+    spans = []
+    for left in left_terms:
+        for right in right_terms:
+            spans.extend(_find_near_matches(text, left, right, distance))
+    return _merge_spans(spans)
 
 
 def _find_tilde_matches(text: str, words: list[str], distance: int):
@@ -207,16 +251,7 @@ def _find_tilde_matches(text: str, words: list[str], distance: int):
             span_end = max(cp + len(w) for cp, w in zip(combo, words_lower))
             matches.append((span_start, span_end))
 
-    if not matches:
-        return []
-    matches.sort()
-    merged = [matches[0]]
-    for s, e in matches[1:]:
-        if s <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-    return merged
+    return _merge_spans(matches)
 
 
 def _slugify(name: str) -> str:
@@ -629,6 +664,7 @@ class ChannelDownloader:
         Supports:
           - Plain substring search:  "machine learning"
           - NEAR proximity:          "machine learning" NEAR/10 "neural network"
+          - NEAR with OR groups:     ("risk" | "drawdown") NEAR/10 "position"
           - Tilde proximity:         "deep learning tensorflow"~5
 
         Returns list of matches with video_id, title, context snippets.
@@ -652,8 +688,8 @@ class ChannelDownloader:
 
             # --- Proximity search paths ---
             if parsed[0] == 'near':
-                _, phrase1, phrase2, dist = parsed
-                spans = _find_near_matches(text, phrase1, phrase2, dist)
+                _, left_terms, right_terms, dist = parsed
+                spans = _find_grouped_near_matches(text, left_terms, right_terms, dist)
                 if not spans:
                     continue
                 snippets = self._snippets_from_spans(text, spans)

@@ -1,10 +1,46 @@
 """Filmot API client - Core API interactions."""
 
+import re
 import requests
 from typing import Optional, Dict, Any, List, Generator
 from .config import BASE_URL, get_headers, validate_config
 from .cache import get_cache
 from .rate_limiter import get_rate_limiter
+
+
+def _rewrite_pipe_phrase_operand(operand: str) -> tuple[str, bool]:
+    """Rewrite a quoted pipe phrase into grouped OR syntax.
+
+    Example:
+        '"memory|context"' -> '("memory" | "context")'
+    """
+    match = re.fullmatch(r'\s*"([^"]*\|[^"]*)"\s*', operand)
+    if not match:
+        return operand, False
+
+    parts = [part.strip() for part in match.group(1).split("|") if part.strip()]
+    if len(parts) < 2:
+        return operand, False
+
+    rewritten = "(" + " | ".join(f'"{part}"' for part in parts) + ")"
+    return rewritten, True
+
+
+def _rewrite_quoted_or_in_proximity_query(query: str) -> tuple[str, Optional[Dict[str, str]]]:
+    """Rewrite unsupported quoted-pipe NEAR/NOTNEAR operands into grouped OR syntax."""
+    match = re.match(r'^\s*(.+?)\s+((?:NOT)?NEAR\s*/\s*\d+)\s+(.+?)\s*$', query, re.IGNORECASE)
+    if not match:
+        return query, None
+
+    left_operand, operator, right_operand = match.groups()
+    left_rewritten, left_changed = _rewrite_pipe_phrase_operand(left_operand)
+    right_rewritten, right_changed = _rewrite_pipe_phrase_operand(right_operand)
+
+    if not (left_changed or right_changed):
+        return query, None
+
+    rewritten_query = f"{left_rewritten} {operator} {right_rewritten}"
+    return rewritten_query, {"from": query, "to": rewritten_query}
 
 
 class FilmotClient:
@@ -36,6 +72,7 @@ class FilmotClient:
 
         # Track cache hits for caller feedback
         self.last_cache_hit = False
+        self.last_query_rewrite = None
     
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None, 
                  data: Optional[Dict] = None, skip_cache: bool = False) -> Dict[str, Any]:
@@ -180,6 +217,9 @@ class FilmotClient:
         Returns:
             Search results with matching videos and subtitle hits
         """
+        query, rewrite = _rewrite_quoted_or_in_proximity_query(query)
+        self.last_query_rewrite = rewrite
+
         params = {
             "query": query,
             "lang": lang,

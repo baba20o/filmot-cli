@@ -124,6 +124,8 @@ When evaluating search results, cross-reference three metrics:
 filmot search '"topic" NEAR/15 "subtopic"' --sort density --min-views 5000 --min-matches 3
 ```
 
+When you need OR inside a proximity query, use grouped OR: `("topic" | "alternate topic") NEAR/15 "subtopic"`. Do not write `"topic|alternate topic" NEAR/15 "subtopic"`.
+
 ---
 
 ## 4. Multilingual Verification
@@ -185,6 +187,9 @@ filmot search '"person" NEAR/15 "specific claim"' --sort density --min-matches 2
 
 # Narrow by date if investigating a specific event
 filmot search '"event" NEAR/10 "detail"' --start-date 2025-01-01 --sort density
+
+# If you need OR, group it explicitly on either side of NEAR/N
+filmot search '("memory" | "context") NEAR/20 "production"' --sort density
 ```
 
 **If you have a channel corpus downloaded**, you can run the same proximity operators offline:
@@ -192,6 +197,7 @@ filmot search '"event" NEAR/10 "detail"' --start-date 2025-01-01 --sort density
 ```bash
 # Same NEAR/N syntax, but against your local corpus — no API calls
 filmot channel-search chat-with-traders '"risk management" NEAR/10 "position sizing"'
+filmot channel-search chat-with-traders '("risk" | "drawdown") NEAR/10 ("position" | "sizing")'
 filmot channel-search chat-with-traders '"blew up account"~5'
 ```
 

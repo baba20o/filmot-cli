@@ -119,6 +119,14 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
                 max_query_time=max_query_time,
                 hit_format=int(hit_format) if hit_format else None,
             )
+
+        if client.last_query_rewrite and not raw:
+            console.print(
+                f"[dim]Rewrote unsupported proximity syntax:[/dim] "
+                f"[dim]{client.last_query_rewrite['from']}[/dim] "
+                f"[dim]->[/dim] "
+                f"[dim]{client.last_query_rewrite['to']}[/dim]"
+            )
         
         if "error" in results:
             console.print(f"[red]Error: {results['error']}[/red]")
@@ -2781,12 +2789,17 @@ def channel_search(channel_slug: str, query: str, limit: int):
     from .channel_dl import ChannelDownloader, _parse_proximity_query
     import re
 
+    def _format_near_operand(terms: list[str]) -> str:
+        if len(terms) == 1:
+            return f'"{terms[0]}"'
+        return "(" + " | ".join(f'"{term}"' for term in terms) + ")"
+
     parsed = _parse_proximity_query(query)
     downloader = ChannelDownloader()
 
     # Build a display label for the query type
     if parsed[0] == 'near':
-        qlabel = f'"{parsed[1]}" NEAR/{parsed[3]} "{parsed[2]}"'
+        qlabel = f"{_format_near_operand(parsed[1])} NEAR/{parsed[3]} {_format_near_operand(parsed[2])}"
     elif parsed[0] == 'tilde':
         qlabel = f'"{" ".join(parsed[1])}"~{parsed[2]}'
     else:
@@ -2810,7 +2823,16 @@ def channel_search(channel_slug: str, query: str, limit: int):
             # Highlight keywords in the snippet
             highlighted = snippet
             if parsed[0] == 'near':
-                for term in [parsed[1], parsed[2]]:
+                terms = []
+                seen = set()
+                for group in [parsed[1], parsed[2]]:
+                    for term in group:
+                        key = term.lower()
+                        if key not in seen:
+                            terms.append(term)
+                            seen.add(key)
+
+                for term in sorted(terms, key=len, reverse=True):
                     highlighted = re.sub(
                         re.escape(term),
                         f"[bold yellow]{term}[/bold yellow]",
