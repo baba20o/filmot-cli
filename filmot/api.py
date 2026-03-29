@@ -1,11 +1,19 @@
 """Filmot API client - Core API interactions."""
 
 import re
+import time
+import logging
 import requests
 from typing import Optional, Dict, Any, List, Generator
 from .config import BASE_URL, get_headers, validate_config
 from .cache import get_cache
 from .rate_limiter import get_rate_limiter
+
+logger = logging.getLogger(__name__)
+
+# Retry config for 429 responses
+MAX_RETRIES = 4
+DEFAULT_RETRY_WAIT = 5  # seconds, if no Retry-After header
 
 
 def _rewrite_pipe_phrase_operand(operand: str) -> tuple[str, bool]:
@@ -74,17 +82,17 @@ class FilmotClient:
         self.last_cache_hit = False
         self.last_query_rewrite = None
     
-    def _request(self, method: str, endpoint: str, params: Optional[Dict] = None, 
+    def _request(self, method: str, endpoint: str, params: Optional[Dict] = None,
                  data: Optional[Dict] = None, skip_cache: bool = False) -> Dict[str, Any]:
-        """Make an API request with caching and rate limiting."""
+        """Make an API request with caching, rate limiting, and 429 retry."""
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        
+
         # Remove None values from params
         if params:
             params = {k: v for k, v in params.items() if v is not None}
         else:
             params = {}
-        
+
         # Check cache first (only for GET requests)
         self.last_cache_hit = False
         if method == "GET" and self.use_cache and self.cache and not skip_cache:
@@ -92,37 +100,67 @@ class FilmotClient:
             if cached is not None:
                 self.last_cache_hit = True
                 return cached
-        
-        # Apply rate limiting
-        self.rate_limiter.acquire()
-        
-        try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=data
-            )
-            response.raise_for_status()
-            result = response.json()
-            
-            # Report success to adaptive rate limiter
-            if hasattr(self.rate_limiter, 'report_success'):
-                self.rate_limiter.report_success()
-            
-            # Cache successful responses
-            if method == "GET" and self.use_cache and self.cache and "error" not in result:
-                self.cache.set(endpoint, params, result)
-            
-            return result
-        except requests.exceptions.HTTPError as e:
-            # Handle rate limiting
-            if response.status_code == 429:
-                if hasattr(self.rate_limiter, 'report_rate_limit'):
-                    self.rate_limiter.report_rate_limit()
-            return {"error": str(e), "status_code": response.status_code}
-        except requests.exceptions.RequestException as e:
-            return {"error": str(e)}
+
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            # Apply rate limiting
+            self.rate_limiter.acquire()
+
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=data
+                )
+                response.raise_for_status()
+                result = response.json()
+
+                # Report success to adaptive rate limiter
+                if hasattr(self.rate_limiter, 'report_success'):
+                    self.rate_limiter.report_success()
+
+                # Cache successful responses
+                if method == "GET" and self.use_cache and self.cache and "error" not in result:
+                    self.cache.set(endpoint, params, result)
+
+                if attempt > 0:
+                    logger.info("Request succeeded after %d retries: %s", attempt, endpoint)
+
+                return result
+            except requests.exceptions.HTTPError as e:
+                if response.status_code == 429:
+                    if hasattr(self.rate_limiter, 'report_rate_limit'):
+                        self.rate_limiter.report_rate_limit()
+
+                    if attempt < MAX_RETRIES:
+                        # Check Retry-After header (seconds or HTTP-date)
+                        retry_after = response.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                wait = int(retry_after)
+                            except ValueError:
+                                wait = DEFAULT_RETRY_WAIT
+                        else:
+                            # Exponential backoff: 5, 10, 20, 40
+                            wait = DEFAULT_RETRY_WAIT * (2 ** attempt)
+
+                        logger.warning(
+                            "Rate limited (429) on %s — waiting %ds before retry %d/%d",
+                            endpoint, wait, attempt + 1, MAX_RETRIES,
+                        )
+                        time.sleep(wait)
+                        continue
+
+                    logger.error("Rate limited (429) on %s — exhausted %d retries", endpoint, MAX_RETRIES)
+
+                last_error = e
+                return {"error": str(e), "status_code": response.status_code}
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                return {"error": str(e)}
+
+        return {"error": str(last_error) if last_error else "max retries exceeded"}
     
     def get(self, endpoint: str, params: Optional[Dict] = None, skip_cache: bool = False) -> Dict[str, Any]:
         """Make a GET request."""
