@@ -151,6 +151,9 @@ class WebshareProxyPool:
         self._sessions = [
             WebshareSession.from_dict(s) for s in data.get("sessions", [])
         ]
+        # Persisting the cursor matters for short-lived CLI processes: without
+        # it, every invocation starts at index 0 and hammers the same session.
+        self._cursor = int(data.get("cursor", 0))
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,6 +162,7 @@ class WebshareProxyPool:
             "gateway_host": self.gateway_host,
             "gateway_port": self.gateway_port,
             "countries": self.countries,
+            "cursor": self._cursor,
             "sessions": [s.to_dict() for s in self._sessions],
         }
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
