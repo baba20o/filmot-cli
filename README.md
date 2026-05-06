@@ -755,6 +755,62 @@ This CLI requires a RapidAPI key for the Filmot Tube Metadata Archive API:
 3. Copy your API key from the dashboard
 4. Add it to your `.env` file
 
+## Webshare Proxy Pool (transcript fetching)
+
+YouTube aggressively rate-limits and blocks data-center IPs (AWS, GCP, etc.).
+When YouTube's IP block hits this CLI's transcript fetcher, the request returns
+nothing usable. To avoid this, the CLI ships with a **dynamic Webshare proxy
+pool**: it pulls a list of residential proxy sessions from your Webshare
+account, rotates through them, tracks per-session health, and cools down or
+retires sessions that get rate-limited / blocked / fail to connect.
+
+### Setup
+
+1. Sign up at [webshare.io](https://www.webshare.io/) and get a residential plan.
+2. Copy your API token from the [user API keys page](https://dashboard.webshare.io/userapi/keys).
+3. Add it to `.env`:
+   ```bash
+   WEBSHARE_API_TOKEN=your_40_char_token_here
+   ```
+4. Verify:
+   ```bash
+   filmot proxy refresh   # populate the pool
+   filmot proxy status    # see healthy session count
+   filmot proxy test      # probe 3 sessions against a known video
+   ```
+
+### Configuration
+
+| Env var                      | Default       | Purpose                                                            |
+| ---------------------------- | ------------- | ------------------------------------------------------------------ |
+| `WEBSHARE_API_TOKEN`         | _(unset)_     | Required. Enables the dynamic pool.                                |
+| `FILMOT_PROXY_MODE`          | `proxy-only` if token set, else `auto` | `auto` \| `proxy-only` \| `direct-only` |
+| `FILMOT_PROXY_COUNTRIES`     | _(all)_       | Comma-separated ISO-2 codes (e.g. `US,GB,CA`).                     |
+| `FILMOT_PROXY_REFRESH_HOURS` | `24`          | How often the pool re-pulls the session list from Webshare.        |
+| `FILMOT_PROXY_MAX_SESSIONS`  | `50`          | Cap on sessions kept in the pool.                                  |
+| `FILMOT_PROXY_RETRY_LIMIT`   | `4`           | Max pool sessions to try per transcript before giving up.          |
+
+On AWS hosts, `proxy-only` mode is the right default — direct requests will
+typically be blocked. On a residential dev box, `auto` mode tries direct first.
+
+### CLI commands
+
+- `filmot proxy status` — table of pool size, healthy count, and per-session
+  health (success / 429 / blocked / cooldown / last error). Use `--full` to
+  list every session.
+- `filmot proxy refresh` — re-pulls the list from `/api/v2/proxy/list/`. Add
+  `--full` to also `POST /proxy/list/refresh/`, which asks Webshare to rotate
+  the underlying IPs (consumes a refresh credit on your plan).
+- `filmot proxy test [-n N] [--video-id VID]` — probes `N` sessions by
+  fetching a known short transcript through each, printing per-session
+  latency + result.
+
+### Legacy fallback
+
+The older `WEBSHARE_PROXY_USERNAME` / `WEBSHARE_PROXY_PASSWORD` static rotating
+endpoint still works for users without an API token, but it doesn't get health
+tracking or rotation — prefer the API-token path.
+
 ## AI Agent Integration
 
 This CLI is designed to work seamlessly with AI agents and LLMs. See [AGENTS_README.md](AGENTS_README.md) for the full agent-focused guide.

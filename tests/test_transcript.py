@@ -1,7 +1,9 @@
 """Tests for filmot.transcript module."""
 
 import pytest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
+import filmot.transcript as transcript_module
 
 from filmot.transcript import (
     extract_video_id,
@@ -147,6 +149,90 @@ class TestGetTranscript:
 
         result = get_transcript("https://youtu.be/dQw4w9WgXcQ")
         assert result["video_id"] == "dQw4w9WgXcQ"
+
+    @patch("filmot.transcript._fetch_transcript_from_api")
+    def test_pool_session_retried_on_transport_error(self, mock_fetch):
+        """A transport-class failure on one pool session triggers a retry on the next."""
+        from filmot.proxy_pool import WebshareProxyPool, WebshareSession
+        import filmot.proxy_pool as pp_mod
+
+        # Two fake sessions in the pool, no auto-refresh.
+        pool = WebshareProxyPool.__new__(WebshareProxyPool)
+        pool.token = "fake"
+        pool.gateway_host = "p.webshare.io"
+        pool.gateway_port = 80
+        pool.refresh_hours = 24
+        pool.max_sessions = 10
+        pool.countries = []
+        pool.request_timeout = 5
+        pool.state_path = Path("/tmp/pp_test_state.json")
+        import threading as _t
+        pool._lock = _t.Lock()
+        pool._sessions = [
+            WebshareSession(id="b-US-1", username="u1", password="p1", country_code="US"),
+            WebshareSession(id="b-US-2", username="u2", password="p2", country_code="US"),
+        ]
+        pool._last_refresh = 9e12  # far future, never refresh
+        pool._cursor = 0
+
+        mock_fetch.side_effect = [
+            Exception("Tunnel connection failed: 400 Bad Request"),
+            {
+                "video_id": "abc12345678",
+                "language": "en",
+                "is_generated": True,
+                "segments": [],
+                "full_text": "Recovered via second session",
+                "duration_seconds": 10,
+                "segment_count": 1,
+            },
+        ]
+
+        with patch("filmot.transcript.get_pool", return_value=pool), \
+             patch.dict("os.environ", {"FILMOT_PROXY_MODE": "proxy-only"}):
+            result = get_transcript("abc12345678")
+
+        assert result["full_text"] == "Recovered via second session"
+        assert result["route"] == "pool:b-US-2"
+        assert mock_fetch.call_count == 2
+        # First session should now be in cooldown after the connection error.
+        assert pool._sessions[0].fail_other + pool._sessions[0].fail_429 + pool._sessions[0].fail_blocked == 1
+        assert pool._sessions[0].cooldown_until > 0
+        assert pool._sessions[1].success == 1
+
+    @patch("filmot.transcript._fetch_transcript_from_api")
+    def test_terminal_error_short_circuits_routes(self, mock_fetch):
+        """TranscriptsDisabled on the first route stops route iteration."""
+        from youtube_transcript_api._errors import TranscriptsDisabled
+        from filmot.proxy_pool import WebshareProxyPool, WebshareSession
+        import threading as _t
+
+        pool = WebshareProxyPool.__new__(WebshareProxyPool)
+        pool.token = "fake"
+        pool.gateway_host = "p.webshare.io"
+        pool.gateway_port = 80
+        pool.refresh_hours = 24
+        pool.max_sessions = 10
+        pool.countries = []
+        pool.request_timeout = 5
+        pool.state_path = Path("/tmp/pp_test_state.json")
+        pool._lock = _t.Lock()
+        pool._sessions = [
+            WebshareSession(id="b-US-1", username="u1", password="p1", country_code="US"),
+            WebshareSession(id="b-US-2", username="u2", password="p2", country_code="US"),
+        ]
+        pool._last_refresh = 9e12
+        pool._cursor = 0
+
+        mock_fetch.side_effect = TranscriptsDisabled("abc12345678")
+
+        with patch("filmot.transcript.get_pool", return_value=pool), \
+             patch.dict("os.environ", {"FILMOT_PROXY_MODE": "proxy-only"}):
+            result = get_transcript("abc12345678")
+
+        assert "disabled" in result["error"].lower()
+        # Only one fetch attempt: terminal error short-circuits the route ladder.
+        assert mock_fetch.call_count == 1
 
 
 # ── get_transcript_with_fallback ─────────────────────────────────

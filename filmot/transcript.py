@@ -17,63 +17,116 @@ import re
 import os
 from dotenv import load_dotenv
 
+from .proxy_pool import (
+    classify_transport_error,
+    get_pool,
+)
+
 load_dotenv()
 
-# Global API instance - can be reconfigured with proxy
+# Default number of pool sessions to try on transport-class failures.
+_POOL_RETRY_LIMIT = int(os.getenv("FILMOT_PROXY_RETRY_LIMIT", "4"))
+
+# Global API instance - holds the "primary" non-pool client (direct, legacy
+# Webshare via env vars, or an operator-supplied proxy from configure_proxy()).
+# The dynamic Webshare pool is layered on top by get_transcript().
 _api = None
 _proxy_configured = False
 _initialized = False
+_proxy_source = "direct"
+
+
+def _build_direct_api() -> YouTubeTranscriptApi:
+    """Build a direct YouTubeTranscriptApi client."""
+    return YouTubeTranscriptApi()
+
+
+def _build_webshare_api(proxy_username: str, proxy_password: str) -> YouTubeTranscriptApi:
+    """Build a Webshare-backed YouTubeTranscriptApi client."""
+    from youtube_transcript_api.proxies import WebshareProxyConfig
+
+    return YouTubeTranscriptApi(
+        proxy_config=WebshareProxyConfig(
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+    )
+
+
+def _build_generic_proxy_api(http_proxy: Optional[str], https_proxy: Optional[str]) -> YouTubeTranscriptApi:
+    """Build a generic HTTP/HTTPS proxy-backed YouTubeTranscriptApi client."""
+    from youtube_transcript_api.proxies import GenericProxyConfig
+
+    return YouTubeTranscriptApi(
+        proxy_config=GenericProxyConfig(
+            http_url=http_proxy,
+            https_url=https_proxy or http_proxy,
+        )
+    )
+
+
+def _primary_from_environment() -> tuple[YouTubeTranscriptApi, str, bool]:
+    """Build the "primary" non-pool client from environment config.
+
+    Order of precedence (skipping the dynamic pool, which is layered separately):
+
+    1. ``WEBSHARE_PROXY_USERNAME`` + ``WEBSHARE_PROXY_PASSWORD`` (legacy single
+       rotating endpoint via ``WebshareProxyConfig``).
+    2. ``HTTP_PROXY`` / ``HTTPS_PROXY``.
+    3. Direct connection.
+
+    Returns ``(api, label, is_proxy)``.
+    """
+    webshare_user = os.getenv("WEBSHARE_PROXY_USERNAME")
+    webshare_pass = os.getenv("WEBSHARE_PROXY_PASSWORD")
+    if webshare_user and webshare_pass:
+        try:
+            return (
+                _build_webshare_api(webshare_user, webshare_pass),
+                "legacy-webshare",
+                True,
+            )
+        except ImportError:
+            pass
+
+    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    if http_proxy or https_proxy:
+        try:
+            return (
+                _build_generic_proxy_api(http_proxy, https_proxy),
+                "env-proxy",
+                True,
+            )
+        except ImportError:
+            pass
+
+    return _build_direct_api(), "direct", False
 
 
 def _init_api() -> None:
-    """Initialize the API, checking for proxy config in environment."""
-    global _api, _proxy_configured, _initialized
-    
+    """Initialise the "primary" client (the non-pool route)."""
+    global _api, _proxy_configured, _initialized, _proxy_source
+
     if _initialized:
         return
-    
-    # Check for proxy configuration in environment
-    # Option 1: Webshare proxy (recommended for residential rotating proxies)
-    webshare_user = os.getenv("WEBSHARE_PROXY_USERNAME")
-    webshare_pass = os.getenv("WEBSHARE_PROXY_PASSWORD")
-    
-    if webshare_user and webshare_pass:
-        try:
-            from youtube_transcript_api.proxies import WebshareProxyConfig
-            _api = YouTubeTranscriptApi(
-                proxy_config=WebshareProxyConfig(
-                    proxy_username=webshare_user,
-                    proxy_password=webshare_pass,
-                )
-            )
-            _proxy_configured = True
-            _initialized = True
-            return
-        except ImportError:
-            pass
-    
-    # Option 2: Generic HTTP/HTTPS proxy
-    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-    
-    if http_proxy or https_proxy:
-        try:
-            from youtube_transcript_api.proxies import GenericProxyConfig
-            _api = YouTubeTranscriptApi(
-                proxy_config=GenericProxyConfig(
-                    http_url=http_proxy,
-                    https_url=https_proxy or http_proxy,
-                )
-            )
-            _proxy_configured = True
-            _initialized = True
-            return
-        except ImportError:
-            pass
-    
-    # No proxy configured, use default API
-    _api = YouTubeTranscriptApi()
+
+    _api, _proxy_source, _proxy_configured = _primary_from_environment()
     _initialized = True
+
+
+def _resolve_proxy_mode() -> str:
+    """Decide the active routing mode.
+
+    ``FILMOT_PROXY_MODE`` may be set to ``auto``, ``proxy-only``, or
+    ``direct-only``. When unset, we default to ``proxy-only`` whenever a
+    Webshare API token is configured (typical AWS-host case where direct
+    fetches are routinely blocked) and ``auto`` otherwise.
+    """
+    mode = (os.getenv("FILMOT_PROXY_MODE") or "").strip().lower()
+    if mode in {"auto", "proxy-only", "direct-only"}:
+        return mode
+    return "proxy-only" if os.getenv("WEBSHARE_API_TOKEN") else "auto"
 
 
 def configure_proxy(
@@ -82,44 +135,28 @@ def configure_proxy(
     http_proxy: Optional[str] = None,
     https_proxy: Optional[str] = None,
 ) -> None:
-    """
-    Configure the transcript API to use a proxy.
-    
-    This helps bypass IP blocks by routing requests through different IPs.
-    
-    For Webshare (recommended - rotating residential proxies):
+    """Configure the transcript API to use a proxy as the *primary* client.
+
+    The dynamic Webshare pool (``WEBSHARE_API_TOKEN``) is unaffected by this
+    call; it remains as the first leg of the route ladder when present.
+
+    For Webshare (legacy single rotating endpoint):
         configure_proxy(webshare_username="user", webshare_password="pass")
-    
+
     For generic HTTP/HTTPS proxy:
         configure_proxy(http_proxy="http://user:pass@host:port")
-    
-    Args:
-        webshare_username: Webshare.io proxy username
-        webshare_password: Webshare.io proxy password
-        http_proxy: Generic HTTP proxy URL
-        https_proxy: Generic HTTPS proxy URL (defaults to http_proxy if not set)
     """
-    global _api, _proxy_configured, _initialized
-    
+    global _api, _proxy_configured, _initialized, _proxy_source
+
     if webshare_username and webshare_password:
-        from youtube_transcript_api.proxies import WebshareProxyConfig
-        _api = YouTubeTranscriptApi(
-            proxy_config=WebshareProxyConfig(
-                proxy_username=webshare_username,
-                proxy_password=webshare_password,
-            )
-        )
+        _api = _build_webshare_api(webshare_username, webshare_password)
+        _proxy_source = "legacy-webshare"
     elif http_proxy:
-        from youtube_transcript_api.proxies import GenericProxyConfig
-        _api = YouTubeTranscriptApi(
-            proxy_config=GenericProxyConfig(
-                http_url=http_proxy,
-                https_url=https_proxy or http_proxy,
-            )
-        )
+        _api = _build_generic_proxy_api(http_proxy, https_proxy)
+        _proxy_source = "explicit-proxy"
     else:
         raise ValueError("Must provide either Webshare credentials or proxy URL")
-    
+
     _proxy_configured = True
     _initialized = True
 
@@ -131,15 +168,16 @@ def get_api() -> YouTubeTranscriptApi:
 
 
 def disable_proxy() -> None:
+    """Disable all proxy routes and force direct connection only.
+
+    Sets ``FILMOT_PROXY_MODE=direct-only`` for the rest of this process so the
+    dynamic pool is also skipped, then resets the primary client.
     """
-    Disable proxy and use direct connection.
-    
-    Useful when you want to bypass proxy settings from environment
-    variables and connect directly.
-    """
-    global _api, _proxy_configured, _initialized
-    _api = YouTubeTranscriptApi()
+    global _api, _proxy_configured, _initialized, _proxy_source
+    os.environ["FILMOT_PROXY_MODE"] = "direct-only"
+    _api = _build_direct_api()
     _proxy_configured = False
+    _proxy_source = "direct"
     _initialized = True
 
 
@@ -151,10 +189,9 @@ def is_proxy_configured() -> bool:
 
 def reset_api() -> None:
     """Reset to default API without proxy."""
-    global _api, _proxy_configured, _initialized
-    _api = YouTubeTranscriptApi()
-    _proxy_configured = False
-    _initialized = True
+    global _initialized
+    _initialized = False
+    _init_api()
 
 
 def extract_video_id(video_input: str) -> str:
@@ -215,8 +252,105 @@ def get_transcript(
     if languages is None:
         languages = ['en', 'en-US', 'en-GB']
     
+    attempts: list[str] = []
+    last_error: Optional[Exception] = None
+
+    for label, api, on_outcome in _iter_routes():
+        attempts.append(label)
+        try:
+            result = _fetch_transcript_from_api(
+                api,
+                video_id,
+                languages=languages,
+                preserve_formatting=preserve_formatting,
+            )
+        except (TranscriptsDisabled, VideoUnavailable, NoTranscriptFound) as terminal:
+            # Caption-side terminal failures — not a transport problem.
+            # Don't penalise the route; surface the error immediately.
+            if on_outcome is not None:
+                on_outcome("success", None)
+            return _terminal_error_result(terminal, video_id, label)
+        except Exception as exc:  # noqa: BLE001 - we re-raise via result dict
+            kind = classify_transport_error(exc)
+            if on_outcome is not None:
+                on_outcome("failure", (kind or "other", str(exc)))
+            last_error = exc
+            if not kind:
+                # Unknown / non-transport error — stop retrying.
+                break
+            continue
+
+        # Success.
+        if on_outcome is not None:
+            on_outcome("success", None)
+        if isinstance(result, dict) and "error" not in result:
+            result["route"] = label
+        return result
+
+    error_msg = str(last_error) if last_error else "all routes exhausted"
+    return {
+        "error": error_msg,
+        "video_id": video_id,
+        "routes_tried": attempts,
+    }
+
+
+def _terminal_error_result(exc: Exception, video_id: str, route: str) -> dict:
+    if isinstance(exc, TranscriptsDisabled):
+        msg = "Transcripts are disabled for this video"
+    elif isinstance(exc, VideoUnavailable):
+        msg = "Video is unavailable"
+    else:
+        msg = str(exc) or "No transcript available"
+    return {"error": msg, "video_id": video_id, "route": route}
+
+
+def _iter_routes():
+    """Yield ``(label, api_client, on_outcome)`` tuples per the active mode.
+
+    ``on_outcome`` is a callable invoked once per attempt with either
+    ``("success", None)`` or ``("failure", (kind, summary))`` so the pool can
+    update health stats. ``None`` for non-pool routes.
+    """
+    mode = _resolve_proxy_mode()
+    pool = None if mode == "direct-only" else get_pool()
+
+    # 1. Pool sessions (try up to N).
+    if pool is not None and mode in {"auto", "proxy-only"}:
+        for _ in range(_POOL_RETRY_LIMIT):
+            session = pool.pick()
+            if session is None:
+                break
+            url = pool.proxy_url(session)
+            api = _build_generic_proxy_api(url, url)
+
+            def _cb(outcome, info, _s=session, _p=pool):
+                if outcome == "success":
+                    _p.report_success(_s)
+                else:
+                    kind, summary = info
+                    _p.report_failure(_s, kind or "other", summary=summary)
+
+            yield (f"pool:{session.id}", api, _cb)
+
+    # 2. Primary client (direct, env-proxy, legacy-webshare, or operator-supplied).
+    if mode != "proxy-only" or pool is None:
+        yield (_proxy_source, get_api(), None)
+
+
+def _fetch_transcript_from_api(
+    api: YouTubeTranscriptApi,
+    video_id: str,
+    languages: list[str],
+    preserve_formatting: bool,
+) -> dict:
+    """Fetch transcript using a specific API client.
+
+    Caption-side terminal failures (``TranscriptsDisabled``, ``VideoUnavailable``,
+    ``NoTranscriptFound`` after translation attempts) propagate as exceptions so
+    the route iterator can distinguish them from transport failures.
+    """
     try:
-        api = get_api()
         # Try the simple fetch first
         try:
             transcript = api.fetch(video_id, languages=languages, preserve_formatting=preserve_formatting)
@@ -231,10 +365,9 @@ def get_transcript(
             if translated:
                 transcript = translated
             else:
-                return {
-                    'error': 'No transcript available (tried translation)',
-                    'video_id': video_id,
-                }
+                # Bubble up as a terminal NoTranscriptFound so the route iterator
+                # treats it as caption-side, not transport-side.
+                raise NoTranscriptFound(video_id, languages, transcript_list)
         
         # Convert to dict format for consistency
         segments = [
@@ -269,21 +402,9 @@ def get_transcript(
             'segment_count': len(segments),
         }
         
-    except TranscriptsDisabled:
-        return {
-            'error': 'Transcripts are disabled for this video',
-            'video_id': video_id,
-        }
-    except VideoUnavailable:
-        return {
-            'error': 'Video is unavailable',
-            'video_id': video_id,
-        }
-    except Exception as e:
-        return {
-            'error': str(e),
-            'video_id': video_id,
-        }
+    except (TranscriptsDisabled, VideoUnavailable, NoTranscriptFound):
+        # Re-raise terminal errors so the route iterator can short-circuit.
+        raise
 
 
 def get_transcript_with_timestamps(

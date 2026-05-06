@@ -7,6 +7,7 @@ import json
 
 from filmot.aws_transcribe import (
     check_dependencies,
+    download_audio,
     upload_to_s3,
     start_transcription_job,
     wait_for_transcription,
@@ -41,6 +42,39 @@ class TestCheckDependencies:
         ok, msg = check_dependencies()
         assert ok is False
         assert "yt-dlp" in msg
+
+
+class TestDownloadAudio:
+
+    @patch.dict(os.environ, {"HTTPS_PROXY": "http://proxy.example:8080"}, clear=False)
+    @patch("subprocess.run")
+    def test_prefers_direct_connection_before_env_proxy(self, mock_run, tmp_path):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        (tmp_path / "abc12345678.mp3").write_bytes(b"audio")
+
+        path = download_audio("abc12345678", output_dir=str(tmp_path))
+
+        assert path.endswith("abc12345678.mp3")
+        used_env = mock_run.call_args.kwargs["env"]
+        assert "HTTPS_PROXY" not in used_env
+
+    @patch.dict(os.environ, {"HTTPS_PROXY": "http://proxy.example:8080"}, clear=False)
+    @patch("subprocess.run")
+    def test_retries_with_env_proxy_after_direct_failure(self, mock_run, tmp_path):
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr="direct failed"),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+        (tmp_path / "abc12345678.mp3").write_bytes(b"audio")
+
+        path = download_audio("abc12345678", output_dir=str(tmp_path))
+
+        assert path.endswith("abc12345678.mp3")
+        assert mock_run.call_count == 2
+        first_env = mock_run.call_args_list[0].kwargs["env"]
+        second_env = mock_run.call_args_list[1].kwargs["env"]
+        assert "HTTPS_PROXY" not in first_env
+        assert second_env["HTTPS_PROXY"] == "http://proxy.example:8080"
 
 
 # ── upload_to_s3 ─────────────────────────────────────────────────

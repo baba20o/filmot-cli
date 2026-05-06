@@ -1120,7 +1120,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             console.print(f"[red]Proxy error: {e}[/red]")
             return
     elif is_proxy_configured():
-        stderr_console.print(f"[dim]Using proxy from environment[/dim]")
+        stderr_console.print(f"[dim]Environment proxy available as fallback[/dim]")
 
     # Progress callback for AWS fallback
     def aws_progress(stage: str, msg: str):
@@ -2530,12 +2530,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
 
     # Force direct connection if --no-proxy
     if no_proxy:
-        from .transcript import _api, _initialized
-        import filmot.transcript as _tmod
-        from youtube_transcript_api import YouTubeTranscriptApi as _YTT
-        _tmod._api = _YTT()
-        _tmod._proxy_configured = False
-        _tmod._initialized = True
+        from .transcript import disable_proxy
+        disable_proxy()
         stderr_console.print("[yellow]Proxy disabled — using direct IP[/yellow]")
     import threading
 
@@ -2888,6 +2884,167 @@ def download(topic: str, count: int, fallback: bool, dedupe: bool):
         results = {"result": results}
 
     _bulk_download_transcripts(results, f"{topic}:{count}", console, fallback=fallback, dedupe=dedupe)
+
+
+# ========== PROXY POOL ==========
+
+@cli.group()
+def proxy():
+    """Manage the dynamic Webshare proxy pool used for transcript fetches.
+
+    Requires WEBSHARE_API_TOKEN in your environment. The pool replaces the
+    legacy single rotating endpoint with a list of session-pinned residential
+    IPs that can be individually cooled-down or retired when they go bad.
+    """
+
+
+def _require_pool():
+    from .proxy_pool import get_pool
+    pool = get_pool()
+    if pool is None:
+        console.print("[red]No Webshare pool available.[/red]")
+        console.print("[dim]Set WEBSHARE_API_TOKEN in your .env (https://dashboard.webshare.io/userapi/keys)[/dim]")
+        return None
+    return pool
+
+
+@proxy.command("status")
+@click.option("--full", is_flag=True, help="Show every session, not just a summary")
+def proxy_status(full: bool):
+    """Show pool size, healthy count, and per-session health."""
+    pool = _require_pool()
+    if pool is None:
+        return
+    snap = pool.status_snapshot()
+
+    from datetime import datetime
+    last_refresh = (
+        datetime.fromtimestamp(snap["last_refresh"]).strftime("%Y-%m-%d %H:%M:%S")
+        if snap["last_refresh"]
+        else "never"
+    )
+
+    console.print(Panel(
+        f"[bold]Gateway:[/bold]  {snap['gateway']}\n"
+        f"[bold]Countries:[/bold] {', '.join(snap['countries']) if snap['countries'] else 'all'}\n"
+        f"[bold]Sessions:[/bold] {snap['healthy']} healthy / {snap['total']} total\n"
+        f"[bold]Last refresh:[/bold] {last_refresh}{' [yellow](stale)[/yellow]' if snap['stale'] else ''}",
+        title="Webshare Proxy Pool",
+        border_style="cyan",
+    ))
+
+    if not snap["sessions"]:
+        console.print("[yellow]Pool is empty. Run `filmot proxy refresh` to populate it.[/yellow]")
+        return
+
+    rows = snap["sessions"] if full else [
+        s for s in snap["sessions"] if not s["available"] or s["success"] + s["fail_429"] + s["fail_blocked"] + s["fail_other"] > 0
+    ]
+    if not rows and not full:
+        console.print(f"[green]All {snap['total']} sessions healthy and unused. Use --full to list every session.[/green]")
+        return
+
+    from rich.table import Table
+    t = Table(show_lines=False)
+    t.add_column("Session")
+    t.add_column("Country")
+    t.add_column("State")
+    t.add_column("OK", justify="right")
+    t.add_column("429", justify="right")
+    t.add_column("Blocked", justify="right")
+    t.add_column("Other", justify="right")
+    t.add_column("Cooldown", justify="right")
+    t.add_column("Last error")
+
+    for s in rows:
+        if s["retired"]:
+            state = "[red]retired[/red]"
+        elif not s["available"]:
+            state = "[yellow]cooldown[/yellow]"
+        else:
+            state = "[green]ready[/green]"
+        cooldown = f"{s['cooldown_remaining_s']}s" if s["cooldown_remaining_s"] else "-"
+        err = (s["last_error"] or "")[:50]
+        t.add_row(
+            s["id"], s["country"] or "-", state,
+            str(s["success"]), str(s["fail_429"]), str(s["fail_blocked"]), str(s["fail_other"]),
+            cooldown, err,
+        )
+    console.print(t)
+
+
+@proxy.command("refresh")
+@click.option("--full", is_flag=True, help="Also POST /proxy/list/refresh/ (rotates the underlying IPs at Webshare)")
+def proxy_refresh(full: bool):
+    """Re-pull the session list from Webshare. With --full, also rotate IPs."""
+    pool = _require_pool()
+    if pool is None:
+        return
+    if full:
+        try:
+            with console.status("[bold blue]Asking Webshare to rotate the underlying proxy list..."):
+                pool.request_full_refresh()
+            console.print("[green]POST /proxy/list/refresh/ accepted (204).[/green]")
+        except Exception as e:
+            console.print(f"[red]Refresh request failed: {e}[/red]")
+            console.print("[dim]This typically means you have no on-demand refreshes available on your plan.[/dim]")
+    try:
+        with console.status("[bold blue]Pulling current proxy list..."):
+            n = pool.refresh(force=True)
+        console.print(f"[green]Pool now has {n} sessions ({pool.healthy_count()} healthy).[/green]")
+    except Exception as e:
+        console.print(f"[red]List refresh failed: {e}[/red]")
+
+
+@proxy.command("test")
+@click.option("--video-id", default="dQw4w9WgXcQ", help="Video to probe (default: a known short video)")
+@click.option("--count", "-n", default=3, type=int, help="Number of sessions to test (default: 3)")
+def proxy_test(video_id: str, count: int):
+    """Probe N pool sessions by fetching a known YouTube transcript through each."""
+    from .proxy_pool import classify_transport_error
+    from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api.proxies import GenericProxyConfig
+    import time
+
+    pool = _require_pool()
+    if pool is None:
+        return
+    if pool.healthy_count() == 0:
+        console.print("[yellow]No healthy sessions. Trying refresh...[/yellow]")
+        try:
+            pool.refresh(force=True)
+        except Exception as e:
+            console.print(f"[red]Refresh failed: {e}[/red]")
+            return
+
+    from rich.table import Table
+    t = Table(title=f"Probing {count} pool sessions against {video_id}")
+    t.add_column("Session")
+    t.add_column("Country")
+    t.add_column("Result")
+    t.add_column("Latency", justify="right")
+    t.add_column("Detail")
+
+    for _ in range(count):
+        sess = pool.pick()
+        if sess is None:
+            console.print("[yellow]Pool exhausted before probe completed.[/yellow]")
+            break
+        url = pool.proxy_url(sess)
+        api = YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=url, https_url=url))
+        started = time.monotonic()
+        try:
+            segs = list(api.fetch(video_id, languages=["en"]))
+            latency = f"{(time.monotonic() - started) * 1000:.0f}ms"
+            pool.report_success(sess)
+            t.add_row(sess.id, sess.country_code or "-", "[green]ok[/green]", latency, f"{len(segs)} segments")
+        except Exception as e:
+            latency = f"{(time.monotonic() - started) * 1000:.0f}ms"
+            kind = classify_transport_error(e) or "other"
+            pool.report_failure(sess, kind, summary=str(e))
+            t.add_row(sess.id, sess.country_code or "-", f"[red]{kind}[/red]", latency, str(e)[:60])
+
+    console.print(t)
 
 
 def main():

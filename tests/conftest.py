@@ -1,11 +1,29 @@
 """Shared test fixtures for Filmot CLI tests."""
 
+import os
 import pytest
 import tempfile
 import shutil
 from pathlib import Path
 
+# Ensure tests run isolated from the developer's real Webshare credentials.
+# Individual tests opt back in by setting these or patching ``filmot.proxy_pool.get_pool``.
+os.environ.pop("WEBSHARE_API_TOKEN", None)
+os.environ["FILMOT_PROXY_MODE"] = "direct-only"
+
 from filmot.library import TranscriptLibrary
+import filmot.proxy_pool as proxy_pool
+import filmot.transcript as transcript_module
+
+
+@pytest.fixture(autouse=True)
+def _isolated_proxy_state():
+    """Reset proxy/pool singletons between tests so state never leaks."""
+    proxy_pool.reset_pool()
+    transcript_module._initialized = False
+    yield
+    proxy_pool.reset_pool()
+    transcript_module._initialized = False
 
 
 @pytest.fixture
