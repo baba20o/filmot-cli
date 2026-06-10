@@ -629,6 +629,8 @@ filmot channel-search excess-returns "blew up"
 filmot channel-search excess-returns '"risk management" NEAR/10 "position sizing"'
 ```
 
+**Proximity terms match whole words.** `"account"` will not match "accounts" or "accountability" — add explicit alternatives for inflections: `("account" | "accounts")`. Terms must be double-quoted; unquoted operands like `risk NEAR/10 position` are rejected with an error explaining the supported forms.
+
 **When to use this over `filmot search`:**
 - You want to mine a **specific channel** exhaustively (not just videos that match a query)
 - You need **offline search** — no API calls, no rate limits, no quota

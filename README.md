@@ -517,6 +517,8 @@ filmot channel-search excess-returns "diversification" --limit 10
 
 > **Important:** For proximity queries, use grouped OR like `("risk" | "drawdown") NEAR/10 "position"`. Do not use quoted pipes like `"risk|drawdown" NEAR/10 "position"`.
 
+> **Whole-word matching:** Proximity operators match whole words — `"account"` will not match "accounts" or "accountability". For plurals and inflections, add explicit alternatives: `("account" | "accounts")`. Terms must be double-quoted; unquoted operands (e.g. `risk NEAR/10 position`) are rejected with an error.
+
 > **Note:** `channel-search` runs entirely offline against your downloaded corpus. No API calls, no rate limits, no quota. Download once, search forever.
 
 ### View Configuration

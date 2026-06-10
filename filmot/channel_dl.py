@@ -71,6 +71,11 @@ def _parse_proximity_query(query: str):
     return ('plain', query)
 
 
+def _looks_like_proximity(query: str) -> bool:
+    """True if *query* contains proximity operator syntax (NEAR/N or "..."~N)."""
+    return bool(re.search(r'NEAR\s*/\s*\d+|"~\d+', query, re.IGNORECASE))
+
+
 def _parse_near_operand(operand: str) -> Optional[list[str]]:
     """Parse one side of a NEAR/N query.
 
@@ -108,8 +113,37 @@ def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def _phrase_occurrences(text_lower: str, phrase: str) -> list[tuple[int, int]]:
+    """Find (start_char, end_char) of whole-word occurrences of *phrase*.
+
+    Words in the phrase may be separated by any whitespace run in the text
+    (spaces, newlines). Boundaries prevent substring hits like "count"
+    matching inside "accountability".
+    """
+    pattern = r'(?<!\w)' + r'\s+'.join(re.escape(w) for w in phrase.split()) + r'(?!\w)'
+    return [(m.start(), m.end()) for m in re.finditer(pattern, text_lower)]
+
+
+def _snap_word_index(token_starts: list[int], char_pos: int) -> int:
+    """Binary search for the token containing (or nearest to) *char_pos*."""
+    import bisect
+    i = bisect.bisect_left(token_starts, char_pos)
+    if i == 0:
+        return 0
+    if i >= len(token_starts):
+        return len(token_starts) - 1
+    before = token_starts[i - 1]
+    after = token_starts[i]
+    if char_pos - before <= after - char_pos:
+        return i - 1
+    return i
+
+
 def _find_near_matches(text: str, phrase1: str, phrase2: str, distance: int):
     """Find positions where *phrase1* and *phrase2* appear within *distance* words.
+
+    Distance is measured between the nearest edges of the two phrases, so a
+    multi-word phrase isn't penalized by its own length.
 
     Returns list of (start_char, end_char) spans covering both matches.
     """
@@ -117,69 +151,33 @@ def _find_near_matches(text: str, phrase1: str, phrase2: str, distance: int):
     p1 = phrase1.lower()
     p2 = phrase2.lower()
 
-    # Collect all occurrence positions for each phrase
-    def _all_positions(hay: str, needle: str):
-        out = []
-        pos = 0
-        while True:
-            idx = hay.find(needle, pos)
-            if idx == -1:
-                break
-            out.append(idx)
-            pos = idx + 1
-        return out
+    occ1 = _phrase_occurrences(text_lower, p1)
+    occ2 = _phrase_occurrences(text_lower, p2)
 
-    p1_positions = _all_positions(text_lower, p1)
-    p2_positions = _all_positions(text_lower, p2)
-
-    if not p1_positions or not p2_positions:
+    if not occ1 or not occ2:
         return []
 
-    # For word-distance we need a word index.  Build char→word_index map.
     tokens = _tokenize_words(text)
-    # Map: char_offset → word_index (for the first char of each token)
-    char_to_widx = {}
-    for widx, (_, coff) in enumerate(tokens):
-        char_to_widx[coff] = widx
-
-    def _word_index_of(char_pos: int) -> int | None:
-        """Find the word index for a character position (snap to nearest token start)."""
-        best = None
-        best_dist = float('inf')
-        for coff, widx in char_to_widx.items():
-            d = abs(coff - char_pos)
-            if d < best_dist:
-                best_dist = d
-                best = widx
-        return best
-
-    # Pre-compute word indices for all positions (O(n) approach)
-    # Build sorted list of token starts for binary-search snapping
     token_starts = [coff for (_, coff) in tokens]
 
-    def _snap_word_index(char_pos: int) -> int:
-        """Binary search for nearest token start."""
-        import bisect
-        i = bisect.bisect_left(token_starts, char_pos)
-        if i == 0:
-            return 0
-        if i >= len(token_starts):
-            return len(token_starts) - 1
-        before = token_starts[i - 1]
-        after = token_starts[i]
-        if char_pos - before <= after - char_pos:
-            return i - 1
-        return i
+    n1 = len(p1.split())
+    n2 = len(p2.split())
 
     matches = []
-    for cp1 in p1_positions:
-        wi1 = _snap_word_index(cp1)
-        for cp2 in p2_positions:
-            wi2 = _snap_word_index(cp2)
-            if abs(wi1 - wi2) <= distance:
-                span_start = min(cp1, cp2)
-                span_end = max(cp1 + len(p1), cp2 + len(p2))
-                matches.append((span_start, span_end))
+    for s1, e1 in occ1:
+        w1_start = _snap_word_index(token_starts, s1)
+        w1_end = w1_start + n1 - 1
+        for s2, e2 in occ2:
+            w2_start = _snap_word_index(token_starts, s2)
+            w2_end = w2_start + n2 - 1
+            if w2_start > w1_end:
+                gap = w2_start - w1_end
+            elif w1_start > w2_end:
+                gap = w1_start - w2_end
+            else:
+                gap = 0  # overlapping spans
+            if gap <= distance:
+                matches.append((min(s1, s2), max(e1, e2)))
 
     return _merge_spans(matches)
 
@@ -206,49 +204,27 @@ def _find_tilde_matches(text: str, words: list[str], distance: int):
     text_lower = text.lower()
     words_lower = [w.lower() for w in words]
 
-    # Collect all positions per word
-    def _all_positions(hay: str, needle: str):
-        out = []
-        pos = 0
-        while True:
-            idx = hay.find(needle, pos)
-            if idx == -1:
-                break
-            out.append(idx)
-            pos = idx + 1
-        return out
-
-    word_positions = [_all_positions(text_lower, w) for w in words_lower]
-    if any(len(p) == 0 for p in word_positions):
+    word_occurrences = [_phrase_occurrences(text_lower, w) for w in words_lower]
+    if any(len(p) == 0 for p in word_occurrences):
         return []
 
     tokens = _tokenize_words(text)
     token_starts = [coff for (_, coff) in tokens]
-
-    def _snap_word_index(char_pos: int) -> int:
-        import bisect
-        i = bisect.bisect_left(token_starts, char_pos)
-        if i == 0:
-            return 0
-        if i >= len(token_starts):
-            return len(token_starts) - 1
-        before = token_starts[i - 1]
-        after = token_starts[i]
-        if char_pos - before <= after - char_pos:
-            return i - 1
-        return i
 
     # For 2 words, simple pair check. For N words, check all combos of positions.
     # Since most queries will be 2-3 words, brute-force is fine.
     from itertools import product
 
     matches = []
-    for combo in product(*word_positions):
-        word_indices = [_snap_word_index(cp) for cp in combo]
+    for combo in product(*word_occurrences):
+        word_indices = [_snap_word_index(token_starts, s) for s, _ in combo]
+        # A repeated query word must match distinct occurrences in the text
+        if len(set(word_indices)) < len(word_indices):
+            continue
         span = max(word_indices) - min(word_indices)
         if span <= distance:
-            span_start = min(combo)
-            span_end = max(cp + len(w) for cp, w in zip(combo, words_lower))
+            span_start = min(s for s, _ in combo)
+            span_end = max(e for _, e in combo)
             matches.append((span_start, span_end))
 
     return _merge_spans(matches)
@@ -379,11 +355,13 @@ class ChannelDownloader:
         tmp_path.replace(manifest_path)
     
     def _save_transcript(self, channel_dir: Path, video_id: str, data: dict):
-        """Save individual transcript file."""
+        """Save individual transcript file atomically."""
         safe_id = re.sub(r'[/\\:*?"<>|]', '_', video_id)
         path = channel_dir / "transcripts" / f"{safe_id}.json"
-        with open(path, 'w', encoding='utf-8') as f:
+        tmp_path = path.with_suffix(".json.tmp")
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        tmp_path.replace(path)
         return path
     
     def get_downloaded_channels(self) -> list[dict]:
@@ -676,11 +654,21 @@ class ChannelDownloader:
             return []
 
         parsed = _parse_proximity_query(query)
+        if parsed[0] == 'plain' and _looks_like_proximity(query):
+            raise ValueError(
+                f"Query contains proximity operators but could not be parsed: {query}\n"
+                'Supported forms: \'"phrase1" NEAR/N "phrase2"\', '
+                '\'("alt1" | "alt2") NEAR/N "phrase"\', \'"word1 word2"~N\'. '
+                "Terms must be double-quoted."
+            )
         results = []
 
         for f in sorted(transcripts_dir.glob("*.json")):
-            with open(f, 'r', encoding='utf-8') as fh:
-                data = json.load(fh)
+            try:
+                with open(f, 'r', encoding='utf-8') as fh:
+                    data = json.load(fh)
+            except (json.JSONDecodeError, OSError):
+                continue  # skip corrupted/unreadable transcript files
 
             text = data.get('full_text', '')
             if not text:
