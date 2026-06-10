@@ -329,6 +329,7 @@ These are patterns we discovered the hard way.
 - **AI-slop is thick** in this topic. "Breakthrough" claims with impossible specificity are the biggest hazard.
 - **The real advance** (Caltech PDM) is modest but genuine. It doesn't claim room-temperature superconductivity — it claims a new state that might help us understand how to get there.
 - **Twistronics** (magic-angle graphene) is the strongest legitimate pathway — well-documented, Nobel-adjacent, and progressing steadily.
+- **Update (2026-06-10):** PDM remains *unreplicated but undisputed* — still one Nature paper (FeTe₀.₅₅Se₀.₄₅, 40% gap modulation), no published independent confirmation 16 months on. Twistronics coverage went quiet (zero transcript hits Feb–Jun 2026). No new LK-99-style hype wave emerged; the slop ecosystem migrated to quantum-computing chips instead (same announcement-vs-evidence pattern, see Majorana 2). Lesson reinforced: **quiet science is underrepresented on YouTube exactly as press-release claims are overrepresented** — a stale field note can mean "nothing happened," not "you missed it." Check primary literature before assuming either.
 
 ### Key Takeaway
 The tool's real power isn't finding information — any search engine does that. **The power is combining scout freshness + Filmot depth + NEAR/N precision + multilingual reach + probe discovery to triangulate truth.** No single query gives you the answer. The methodology does.
