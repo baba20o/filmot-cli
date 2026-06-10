@@ -69,13 +69,14 @@ def cli():
 @click.option("--bulk-download", default=None, help="Download top N transcripts to TOPIC (e.g., --bulk-download prompt-injection:10)")
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback during bulk download when captions unavailable")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts during bulk download")
+@click.option("--no-proxy", is_flag=True, help="Bypass proxy during bulk download, connect directly")
 def search(query: str, lang: str, page: int, category: str, exclude: str,
            channel_id: str, channel: str, channel_count: int, title: str,
            min_views: int, max_views: int, min_likes: int, max_likes: int,
            min_duration: int, max_duration: int, start_date: str, end_date: str,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
            max_query_time: int, hit_format: str, full: bool, raw: bool, min_matches: int,
-           bulk_download: str, fallback: bool, dedupe: bool):
+           bulk_download: str, fallback: bool, dedupe: bool, no_proxy: bool):
     """Search for videos by subtitle/transcript content.
     
     Examples:
@@ -165,6 +166,10 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
 
         # Bulk download mode
         if bulk_download:
+            if no_proxy:
+                from .transcript import disable_proxy
+                disable_proxy()
+                console.print("[dim]Proxy disabled, using direct connection[/dim]")
             _bulk_download_transcripts(results, bulk_download, console, fallback=fallback, dedupe=dedupe)
             return
 
@@ -290,6 +295,7 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
     else:
         topic = bulk_download
         max_count = 10
+    max_count = max(0, max_count)
 
     videos = results.get("result", results.get("videos", results.get("items", [])))
 
@@ -305,6 +311,7 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
     skip_count = 0
     fail_count = 0
     dedupe_count = 0
+    proxy_errors = False
 
     # Build dedup hash set from existing library entries
     seen_hashes = set()
@@ -339,6 +346,8 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
 
             if "error" in result:
                 console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {result['error']}")
+                if "proxy" in str(result["error"]).lower():
+                    proxy_errors = True
                 fail_count += 1
                 continue
 
@@ -374,12 +383,16 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
 
         except Exception as e:
             console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}")
+            if "proxy" in str(e).lower():
+                proxy_errors = True
             fail_count += 1
 
     summary = f"\n[bold]Complete:[/bold] {success_count} saved, {skip_count} skipped, {fail_count} failed"
     if dedupe_count:
         summary += f", {dedupe_count} deduplicated"
     console.print(summary)
+    if proxy_errors:
+        console.print("[yellow]Proxy connection failures detected — your proxy may be down. Try --no-proxy to connect directly.[/yellow]")
     console.print(f"[dim]View with: filmot library list {topic}[/dim]")
 
 
@@ -1980,11 +1993,12 @@ def _find_probe_pairs(texts, terms, window_size=50, max_pairs=5):
         for w in term.split():
             word_to_terms.setdefault(w, set()).add(term)
 
-    # Slide through text in overlapping windows
+    # Slide through text in overlapping windows (inclusive of the tail)
     pair_counts = Counter()
     step = max(window_size // 2, 1)
+    last_start = max(len(words) - window_size, 0)
 
-    for start in range(0, max(len(words) - window_size, 1), step):
+    for start in range(0, last_start + 1, step):
         window = words[start:start + window_size]
         window_terms = set()
 
@@ -2004,19 +2018,20 @@ def _find_probe_pairs(texts, terms, window_size=50, max_pairs=5):
                 pair_counts[(window_list[i], window_list[j])] += 1
 
     # Filter: skip pairs where terms share any word (e.g., "president vladimir" + "vladimir putin")
-    results = []
-    for (t1, t2), count in pair_counts.most_common(max_pairs * 3):
+    # Rank by specificity first (multi-word terms beat frequent generic singles), then count
+    candidates = []
+    for (t1, t2), count in pair_counts.items():
         if count < 2:
-            break
+            continue
         words_t1 = set(t1.split())
         words_t2 = set(t2.split())
         if words_t1 & words_t2:
             continue  # overlapping terms, skip
-        results.append((t1, t2, count))
-        if len(results) >= max_pairs:
-            break
+        specificity = (len(words_t1) > 1) + (len(words_t2) > 1)
+        candidates.append((specificity, count, t1, t2))
 
-    return results
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    return [(t1, t2, count) for _, count, t1, t2 in candidates[:max_pairs]]
 
 
 # ========== RESEARCH COMMAND ==========
@@ -2033,7 +2048,8 @@ def _find_probe_pairs(texts, terms, window_size=50, max_pairs=5):
 @click.option("--scout/--no-scout", default=True, help="Run YouTube API scout for latest content (default: on, requires YOUTUBE_API_KEY)")
 @click.option("--scout-days", default=7, type=int, help="Scout window in days (default: 7)")
 @click.option("--probe", is_flag=True, help="Auto-probe: extract entities from transcripts and run NEAR/N searches to discover related content")
-def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, dedupe: bool, min_matches: int, sort_by: str, scout: bool, scout_days: int, probe: bool):
+@click.option("--no-proxy", is_flag=True, help="Bypass proxy for transcript downloads, connect directly")
+def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, dedupe: bool, min_matches: int, sort_by: str, scout: bool, scout_days: int, probe: bool, no_proxy: bool):
     """Research a topic: scout, search, probe, and build knowledge base.
 
     Multi-phase research pipeline:
@@ -2058,7 +2074,13 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
     """
     import hashlib
     from .library import get_library
-    from .transcript import get_transcript, get_transcript_with_fallback
+    from .transcript import get_transcript, get_transcript_with_fallback, disable_proxy, is_proxy_configured
+
+    if no_proxy:
+        disable_proxy()
+        console.print("[dim]Proxy disabled, using direct connection[/dim]")
+    elif is_proxy_configured():
+        console.print("[dim]Using proxy from environment[/dim]")
 
     library = get_library()
     normalized_topic = library._normalize_topic(topic)
@@ -2116,6 +2138,7 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
 
         videos = results.get("result", [])
         total = results.get("totalresultcount", len(videos))
+        title_filter_works = bool(videos)
 
         if not videos:
             # Fallback: search transcript only (no title filter)
@@ -2178,13 +2201,24 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
             if before != len(videos):
                 console.print(f"[dim]Filtered: {before} -> {len(videos)} videos (min {min_matches} matches)[/dim]")
 
-        # Step 2: Download transcripts
-        videos_to_download = videos[:depth]
+        # Step 2: Download transcripts — reserve slots for scout videos, which
+        # sort to the bottom (density 0, not yet indexed by Filmot) and would
+        # otherwise always be sliced off by the depth cut
+        scout_vids = [v for v in videos if v.get("_from_scout")]
+        if scout_vids:
+            scout_slots = min(len(scout_vids), max(1, depth // 3))
+            non_scout = [v for v in videos if not v.get("_from_scout")]
+            videos_to_download = non_scout[:max(depth - scout_slots, 0)] + scout_vids[:scout_slots]
+            if len(videos_to_download) < depth:
+                videos_to_download += scout_vids[scout_slots:depth - len(videos_to_download) + scout_slots]
+        else:
+            videos_to_download = videos[:depth]
         success_count = 0
         skip_count = 0
         fail_count = 0
         dedupe_count = 0
         total_chars = 0
+        proxy_errors = False
 
         seen_hashes = set()
         if dedupe:
@@ -2221,7 +2255,10 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                     result = get_transcript(video_id)
 
                 if "error" in result:
-                    console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {title_str[:60]}{source_tag}")
+                    err = str(result["error"])
+                    console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {title_str[:60]}{source_tag} [dim]- {err[:100]}[/dim]")
+                    if "proxy" in err.lower():
+                        proxy_errors = True
                     fail_count += 1
                     continue
 
@@ -2256,7 +2293,12 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
 
             except Exception as e:
                 console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}{source_tag}")
+                if "proxy" in str(e).lower():
+                    proxy_errors = True
                 fail_count += 1
+
+        if proxy_errors:
+            console.print("\n[yellow]Proxy connection failures detected — your proxy may be down. Try --no-proxy to connect directly.[/yellow]")
 
         # ── Phase 4: Probe (auto-generate NEAR/N from extracted entities) ──
         probe_success = 0
@@ -2295,9 +2337,12 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                             query = f'"{t1}" NEAR/15 "{t2}"'
                             try:
                                 with console.status(f"  Probing: {query}"):
+                                    # Only constrain by title if the main search proved
+                                    # the title filter matches videos for this topic —
+                                    # otherwise every probe is guaranteed 0 results.
                                     probe_results = client.search_subtitles(
                                         query=query,
-                                        title=topic,
+                                        title=topic if title_filter_works else None,
                                         lang=lang or "en",
                                     )
                             except Exception:
@@ -2337,7 +2382,7 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                             )
 
                             # Collect top 2 new videos per probe (sorted by density)
-                            for pv in sorted(new_vids, key=lambda v: len(v.get("hits", [])) / max(v.get("duration", 1) / 60, 0.01), reverse=True)[:2]:
+                            for pv in sorted(new_vids, key=lambda v: len(v.get("hits", [])) / (v.get("duration", 0) / 60) if v.get("duration", 0) > 0 else 0, reverse=True)[:2]:
                                 vid = pv.get("id") or pv.get("videoid")
                                 if vid not in existing_ids:
                                     probe_new_videos.append(pv)
@@ -2373,7 +2418,7 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                                         probe_success += 1
                                         console.print(f"    [green]✓[/green] {ptitle[:60]} [dim magenta](probe)[/dim magenta]")
                                     else:
-                                        console.print(f"    [red]Fail[/red] {ptitle[:60]}")
+                                        console.print(f"    [red]Fail[/red] {ptitle[:60]} [dim]- {str(result['error'])[:100]}[/dim]")
                                 except Exception as e:
                                     console.print(f"    [red]Fail[/red] {vid} - {e}")
 
@@ -2801,8 +2846,12 @@ def channel_search(channel_slug: str, query: str, limit: int):
     else:
         qlabel = query
 
-    with console.status(f"[blue]Searching '{qlabel}' across {channel_slug}..."):
-        results = downloader.search_corpus(channel_slug, query)
+    try:
+        with console.status(f"[blue]Searching '{qlabel}' across {channel_slug}..."):
+            results = downloader.search_corpus(channel_slug, query)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return
 
     if not results:
         console.print(f"[dim]No matches for '{qlabel}' in {channel_slug}.[/dim]")
@@ -2856,7 +2905,8 @@ def channel_search(channel_slug: str, query: str, limit: int):
 @click.option("--count", "-n", default=50, type=int, help="Maximum transcripts to download (default: 50)")
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts")
-def download(topic: str, count: int, fallback: bool, dedupe: bool):
+@click.option("--no-proxy", is_flag=True, help="Bypass proxy, connect directly with your IP")
+def download(topic: str, count: int, fallback: bool, dedupe: bool, no_proxy: bool):
     """Download transcripts from piped search results.
 
     Reads JSON search results from stdin and downloads transcripts
@@ -2882,6 +2932,11 @@ def download(topic: str, count: int, fallback: bool, dedupe: bool):
     # Wrap in expected format if needed
     if isinstance(results, list):
         results = {"result": results}
+
+    if no_proxy:
+        from .transcript import disable_proxy
+        disable_proxy()
+        console.print("[dim]Proxy disabled, using direct connection[/dim]")
 
     _bulk_download_transcripts(results, f"{topic}:{count}", console, fallback=fallback, dedupe=dedupe)
 
