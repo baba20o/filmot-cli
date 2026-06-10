@@ -342,9 +342,38 @@ class ChannelDownloader:
         """Load existing manifest or return empty structure."""
         manifest_path = channel_dir / "manifest.json"
         if manifest_path.exists():
-            with open(manifest_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                return {}
         return {}
+
+    def _resolve_channel_dir(self, channel_info: dict) -> tuple[str, Path]:
+        """Resolve the storage slug and directory for a channel, keyed by channel ID.
+
+        An existing corpus whose manifest carries this channel_id is reused even
+        if the channel has since been renamed (resume survives renames). If a
+        *different* channel's corpus already occupies the name slug, the slug is
+        disambiguated with a channel-id suffix so corpora never merge.
+        """
+        channel_id = channel_info['channel_id']
+
+        if self.channels_dir.exists():
+            for d in sorted(self.channels_dir.iterdir()):
+                if d.is_dir():
+                    manifest = self._load_manifest(d)
+                    if manifest.get('channel', {}).get('channel_id') == channel_id:
+                        return d.name, self._get_channel_dir(d.name)
+
+        slug = _slugify(channel_info['name'])
+        candidate = self.channels_dir / slug
+        if candidate.exists():
+            existing_id = self._load_manifest(candidate).get('channel', {}).get('channel_id')
+            if existing_id and existing_id != channel_id:
+                slug = f"{slug}-{channel_id[-6:].lower()}"
+
+        return slug, self._get_channel_dir(slug)
     
     def _save_manifest(self, channel_dir: Path, manifest: dict):
         """Save manifest atomically."""
@@ -417,8 +446,7 @@ class ChannelDownloader:
         # STEP 1: Get channel info
         log('info', f'Fetching channel info for {channel_id}...')
         channel_info = get_channel_info(channel_id)
-        slug = _slugify(channel_info['name'])
-        channel_dir = self._get_channel_dir(slug)
+        slug, channel_dir = self._resolve_channel_dir(channel_info)
         
         log('info', f"Channel: {channel_info['name']} ({channel_info['video_count']} videos)")
         log('info', f"Storage: {channel_dir}")

@@ -161,6 +161,48 @@ def test_search_corpus_skips_corrupted_transcript_files(tmp_path):
     assert len(results) == 1
 
 
+def _save_manifest_for(downloader, slug, channel_id, name):
+    channel_dir = downloader._get_channel_dir(slug)
+    downloader._save_manifest(
+        channel_dir,
+        {"channel": {"channel_id": channel_id, "name": name}, "videos": {}},
+    )
+    return channel_dir
+
+
+def test_resolve_channel_dir_fresh_channel_uses_name_slug(tmp_path):
+    downloader = ChannelDownloader(data_dir=str(tmp_path / ".filmot_data"))
+    slug, channel_dir = downloader._resolve_channel_dir(
+        {"channel_id": "UCaaa111", "name": "Chat With Traders"}
+    )
+    assert slug == "chat-with-traders"
+    assert channel_dir.name == "chat-with-traders"
+
+
+def test_resolve_channel_dir_survives_channel_rename(tmp_path):
+    downloader = ChannelDownloader(data_dir=str(tmp_path / ".filmot_data"))
+    old_dir = _save_manifest_for(downloader, "chat-with-traders", "UCaaa111", "Chat With Traders")
+
+    # Channel renamed itself — resume must find the existing corpus by ID
+    slug, channel_dir = downloader._resolve_channel_dir(
+        {"channel_id": "UCaaa111", "name": "Trader Talks"}
+    )
+    assert slug == "chat-with-traders"
+    assert channel_dir == old_dir
+
+
+def test_resolve_channel_dir_disambiguates_slug_collision(tmp_path):
+    downloader = ChannelDownloader(data_dir=str(tmp_path / ".filmot_data"))
+    _save_manifest_for(downloader, "my-channel", "UCaaa111", "My Channel")
+
+    # A different channel with a colliding name must not merge corpora
+    slug, channel_dir = downloader._resolve_channel_dir(
+        {"channel_id": "UCbbb222", "name": "MY_CHANNEL"}
+    )
+    assert slug == "my-channel-bbb222"
+    assert channel_dir.name != "my-channel"
+
+
 def test_save_transcript_is_atomic(tmp_path):
     downloader = ChannelDownloader(data_dir=str(tmp_path / ".filmot_data"))
     channel_dir = downloader._get_channel_dir("test-channel")

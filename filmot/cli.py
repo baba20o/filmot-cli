@@ -2499,10 +2499,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     if fresh:
         try:
             info = get_channel_info(channel_id)
-            from .channel_dl import _slugify
-            slug = _slugify(info['name'])
-            channel_dir = downloader.channels_dir / slug
-            if channel_dir.exists():
+            _, channel_dir = downloader._resolve_channel_dir(info)
+            if (channel_dir / "manifest.json").exists():
                 stderr_console.print(f"[yellow]Removing existing data for {info['name']}...[/yellow]")
                 shutil.rmtree(channel_dir)
         except Exception:
@@ -2526,7 +2524,7 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     ))
 
     # Phase 2: Enumerate videos
-    from .channel_dl import list_all_video_ids, _slugify
+    from .channel_dl import list_all_video_ids
 
     stderr_console.print("[blue]Enumerating all videos...[/blue]")
     
@@ -2543,9 +2541,9 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
 
     stderr_console.print(f"[green]Found {len(all_videos)} videos[/green]")
 
-    # Phase 3: Determine delta
-    slug = _slugify(info['name'])
-    channel_dir = downloader._get_channel_dir(slug)
+    # Phase 3: Determine delta — resolve corpus by channel ID so renames
+    # resume in place and same-name channels never merge
+    slug, channel_dir = downloader._resolve_channel_dir(info)
     manifest = downloader._load_manifest(channel_dir)
     existing = manifest.get('videos', {})
     already_done = {k for k, v in existing.items() if v.get('status') == 'done'}
