@@ -173,6 +173,16 @@ Always use `--full` to see all matches without truncation. Add `--lang en` for E
 | `--bulk-download TOPIC:N` | Download top N transcripts to library | `--bulk-download fusion:10` |
 | `--start-date` / `--end-date` | Date range filter (yyyy-mm-dd) | `--start-date 2026-01-01` |
 | `--sort` | Sort: `viewcount`, `likecount`, `uploaddate`, `duration`, `chanrank`, `id`, `density` | `--sort viewcount` |
+| `--context N` | Characters of context per side in snippets (raise for fuller quotes) | `--context 120` |
+
+### Reading the results (signals built into the display)
+
+Every result now surfaces credibility and navigation signals inline, so you can triage at read speed:
+
+- **Timestamped deep links** — the `Video:` URL and every match link jump straight to the moment (`&t=312s`), not 0:00. Click the hit, land on the sentence.
+- **Engagement ratio** — `Engagement: 0.7%` (likes/views) next to the view count. A 10%+ ratio is strong organic interest; <1% on a "breakthrough" video is a yellow flag (per research guide §1).
+- **Echo warning** — if results share near-identical phrasing, they're tagged `[echo#N]` and a warning prints up top. That's the convergence-vs-echo test (guide §3) automated: echo = copied script / AI-slop; genuine convergence uses different words and is *not* flagged.
+- **Freshness note** — when your date window reaches the last few days, the tool reminds you Filmot lags ~24-48h and prints the exact `yt-search` command to catch launch-day coverage (guide Trap 5/7).
 
 ### Density Scoring
 
@@ -210,6 +220,18 @@ filmot transcript VIDEO_ID --full
 ```
 
 The `--full` flag outputs continuous text optimized for AI processing.
+
+### Search Inside a Transcript (`--grep`)
+
+You don't have to download the whole transcript and eyeball it — `--grep` runs the **same proximity operators** (NEAR/N, OR-groups, `~N` tilde, plain substring) against a single fetched transcript and prints only the matching moments, each with a timestamped deep link:
+
+```bash
+filmot transcript VIDEO_ID --grep '"risk management" NEAR/10 "position sizing"'
+filmot transcript VIDEO_ID --grep '("memory" | "context") NEAR/15 "production"'
+filmot transcript VIDEO_ID --grep '"first plasma"~5'
+```
+
+This closes the search → download → grep loop inside the tool: find a promising video with `search`, then probe its exact content without leaving the CLI.
 
 ### Save to Library
 
@@ -324,6 +346,21 @@ This auto-saves to `{topic}-context.md` with full metadata headers:
 ---
 ## Video 2: ...
 ```
+
+---
+
+## Session Ledger (resuming an investigation)
+
+Every `search`, `research`, and `channel-search` is logged to `.filmot_data/sessions/`. This matters for agents: a fresh instance with no memory of yesterday can read the ledger and pick up an investigation instead of re-deriving it from scratch.
+
+```bash
+filmot sessions                    # list all sessions (newest activity first)
+filmot sessions fable-5-mythos     # replay a topic-scoped research session
+filmot sessions 2026-06-10         # replay a day's ad-hoc search queries
+filmot sessions 2026-06-10 --raw   # raw JSONL, for piping into your own tools
+```
+
+`research <topic>` logs to `<topic>.jsonl` (the whole investigation in one file); ad-hoc `search`/`channel-search` log to the current date. Each event records the query, result counts, downloads, and date filters — enough to reconstruct what was asked and what came back.
 
 ---
 

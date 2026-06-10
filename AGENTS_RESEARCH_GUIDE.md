@@ -264,6 +264,14 @@ English-language YouTube is massive but not comprehensive. Many stories look dif
 
 **Fix**: Search in the language of origin. Korean topic → Korean search. Russian event → Russian search. Even a null result is informative.
 
+### Trap 7: Stopping at YouTube (the primary-source handoff)
+YouTube transcripts tell you what *the world is saying* about a thing — fast, broad, multilingual. They do not tell you what the *thing itself* says. Field-tested lesson: on a launch-day investigation, transcripts got ~90% of the truth in an hour, but the last 10% — and two outright corrections — required the primary document (a company announcement and a system card). Two specific failure modes:
+
+- **The negative-space heuristic inverts on release day.** "If a big claim had real backing, someone credible would be covering it" is a good fake-detector — *except* in the first 24-48 hours after an official announcement, when even true claims haven't echoed yet. A press-release claim with thin organic coverage is not suspicious; it's just new. Don't file it as fabricated.
+- **YouTube inflates agency.** Creators systematically upgrade "the tool assisted experts" into "the tool autonomously beat the experts." Capability claims survive cross-referencing; *agency* claims often don't. Check the primary source for who-did-what.
+
+**Fix**: For any claim that traces to a specific document (paper, announcement, model card, filing, court record), **close on the primary source** before you assign final confidence. Use the tool to find *who is talking and what they emphasize*; use the original document to nail *what is actually true*. A finding isn't "Confirmed" until you've either seen the primary source or triangulated 3+ independent credible reporters who clearly read it themselves.
+
 ---
 
 ## 7. Reporting What You Find

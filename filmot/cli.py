@@ -1,6 +1,8 @@
 """Filmot CLI - Command Line Interface."""
 
 import click
+import re
+from typing import Optional
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -66,6 +68,7 @@ def cli():
 @click.option("--full", is_flag=True, help="Show all matches (no truncation) - useful for AI agents")
 @click.option("--raw", is_flag=True, help="Output raw JSON response")
 @click.option("--min-matches", default=None, type=int, help="Only show videos with at least N subtitle matches")
+@click.option("--context", "context_chars", default=50, type=int, help="Characters of context per side in snippets (raise for fuller quotes)")
 @click.option("--bulk-download", default=None, help="Download top N transcripts to TOPIC (e.g., --bulk-download prompt-injection:10)")
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback during bulk download when captions unavailable")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts during bulk download")
@@ -76,7 +79,7 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
            min_duration: int, max_duration: int, start_date: str, end_date: str,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
            max_query_time: int, hit_format: str, full: bool, raw: bool, min_matches: int,
-           bulk_download: str, fallback: bool, dedupe: bool, no_proxy: bool):
+           context_chars: int, bulk_download: str, fallback: bool, dedupe: bool, no_proxy: bool):
     """Search for videos by subtitle/transcript content.
     
     Examples:
@@ -174,8 +177,20 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
             return
 
         # Display formatted results
-        _display_subtitle_results(results, query, full=full)
-        
+        _display_subtitle_results(results, query, full=full, context_chars=context_chars)
+
+        hint = _freshness_hint(start_date, end_date, query)
+        if hint:
+            console.print(f"\n{hint}")
+
+        from .ledger import log_event
+        _vids = results.get("result", [])
+        log_event(
+            "search", query=query, lang=lang, sort=sort,
+            start_date=start_date, end_date=end_date,
+            results=len(_vids), total=results.get("totalresultcount"),
+        )
+
     except ValueError as e:
         console.print(f"[red]Configuration Error: {e}[/red]")
     except Exception as e:
@@ -202,16 +217,33 @@ def _format_duration(duration: int) -> str:
         return f"{mins}m {secs}s"
 
 
-def _display_hit(hit: dict, video_id: str):
-    """Display a single hit match, handling both hit formats."""
+def _hit_start(hit: dict) -> float:
+    """Best-available start time (seconds) for a hit, across both hit formats."""
+    lines = hit.get("lines", [])
+    if lines:
+        return lines[0].get("start", hit.get("start", 0))
+    return hit.get("start", 0)
+
+
+def _deep_link(video_id: str, start_seconds: float) -> str:
+    """YouTube watch URL that jumps straight to *start_seconds*."""
+    return f"https://youtube.com/watch?v={video_id}&t={int(start_seconds)}s"
+
+
+def _display_hit(hit: dict, video_id: str, context_chars: int = 50):
+    """Display a single hit match, handling both hit formats.
+
+    context_chars controls how much surrounding context to show per side for
+    hit_format=0 snippets (raise it with --context for fuller quotes).
+    """
     start = hit.get("start", 0)
     token = hit.get("token", "")
     timestamp = _format_timestamp(start)
-    link = f"https://youtube.com/watch?v={video_id}&t={int(start)}"
-    
+    link = _deep_link(video_id, start)
+
     # Check if this is hit_format=1 (has 'lines' array) or hit_format=0 (has ctx_before/after)
     lines = hit.get("lines", [])
-    
+
     if lines:
         # Hit format 1: Full subtitle lines
         for line in lines:
@@ -219,21 +251,86 @@ def _display_hit(hit: dict, video_id: str):
             line_start = line.get("start", start)
             line_dur = line.get("dur", 0)
             line_ts = _format_timestamp(line_start)
+            line_link = _deep_link(video_id, line_start)
             # Highlight the token in the line text
             highlighted = line_text.replace(token, f"[bold yellow]{token}[/bold yellow]")
             highlighted = highlighted.replace(token.capitalize(), f"[bold yellow]{token.capitalize()}[/bold yellow]")
             highlighted = highlighted.replace(token.upper(), f"[bold yellow]{token.upper()}[/bold yellow]")
-            console.print(f"      [[link={link}]{line_ts}[/link]] {highlighted}")
+            console.print(f"      [[link={line_link}]{line_ts}[/link]] {highlighted}")
     else:
         # Hit format 0: Context snippets
         ctx_before = hit.get("ctx_before", "")
         ctx_after = hit.get("ctx_after", "")
-        
+
         # Truncate context if too long
-        ctx_before = ctx_before[-50:] if len(ctx_before) > 50 else ctx_before
-        ctx_after = ctx_after[:50] if len(ctx_after) > 50 else ctx_after
-        
+        ctx_before = ctx_before[-context_chars:] if len(ctx_before) > context_chars else ctx_before
+        ctx_after = ctx_after[:context_chars] if len(ctx_after) > context_chars else ctx_after
+
         console.print(f"      [[link={link}]{timestamp}[/link]] ...{ctx_before} [bold yellow]{token}[/bold yellow] {ctx_after}...")
+
+
+def _hit_fingerprint_text(video: dict) -> str:
+    """Normalized concatenation of a video's hit text, for echo detection."""
+    parts = []
+    for hit in video.get("hits", []):
+        lines = hit.get("lines", [])
+        if lines:
+            parts.extend(line.get("text", "") for line in lines)
+        else:
+            parts.append(hit.get("ctx_before", ""))
+            parts.append(hit.get("token", ""))
+            parts.append(hit.get("ctx_after", ""))
+    text = " ".join(parts).lower()
+    return re.sub(r"[^a-z0-9 ]", " ", text)
+
+
+def _detect_echo_clusters(videos: list, n: int = 5, threshold: float = 0.5) -> dict:
+    """Flag videos whose hit phrasing is near-identical (script-copying / AI-slop echo).
+
+    Builds word n-gram shingle sets per video and clusters by Jaccard similarity.
+    Returns {video_index: cluster_label} only for videos in a cluster of >= 2.
+    Convergence (different words, same idea) scores low and is left unflagged;
+    echo (copied phrasing) scores high. See research guide §3 (convergence vs echo).
+    """
+    shingles = []
+    for v in videos:
+        words = _hit_fingerprint_text(v).split()
+        grams = {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)} if len(words) >= n else set()
+        shingles.append(grams)
+
+    parent = list(range(len(videos)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(videos)):
+        if not shingles[i]:
+            continue
+        for j in range(i + 1, len(videos)):
+            if not shingles[j]:
+                continue
+            inter = len(shingles[i] & shingles[j])
+            if not inter:
+                continue
+            union = len(shingles[i] | shingles[j])
+            if union and inter / union >= threshold:
+                parent[find(i)] = find(j)
+
+    groups = {}
+    for i in range(len(videos)):
+        groups.setdefault(find(i), []).append(i)
+
+    clusters = {}
+    label = 0
+    for members in groups.values():
+        if len(members) >= 2:
+            label += 1
+            for idx in members:
+                clusters[idx] = label
+    return clusters
 
 
 def _format_count(count: int) -> str:
@@ -246,6 +343,135 @@ def _format_count(count: int) -> str:
         return f"{count / 1_000:.1f}K"
     else:
         return str(count)
+
+
+def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> None:
+    """Run a proximity/plain query against a fetched transcript and print matches.
+
+    Reuses the local proximity engine from channel_dl (NEAR/N, OR-groups, ~N tilde,
+    plain substring) so the same operators work on a single transcript — closing the
+    search → download → grep loop inside the tool. Match snippets carry timestamped
+    deep links derived from the transcript's own segments.
+    """
+    from .channel_dl import (
+        _parse_proximity_query,
+        _looks_like_proximity,
+        _find_grouped_near_matches,
+        _find_tilde_matches,
+        _phrase_occurrences,
+    )
+
+    video_id = result.get("video_id", "")
+    text = result.get("full_text", "")
+    segments = result.get("segments", [])
+    if not text:
+        console.print("[yellow]No transcript text to search.[/yellow]")
+        return
+
+    # Build a char-offset → segment-start-time index matching how full_text was joined
+    offsets = []  # (start_char, seg_start_seconds)
+    pos = 0
+    for seg in segments:
+        seg_text = seg.get("text", "").replace("\n", " ")
+        offsets.append((pos, seg.get("start", 0)))
+        pos += len(seg_text) + 1  # +1 for the joining space
+
+    def _time_at(char_pos: int) -> float:
+        lo, hi, best = 0, len(offsets) - 1, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if offsets[mid][0] <= char_pos:
+                best = offsets[mid][1]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    parsed = _parse_proximity_query(query)
+    if parsed[0] == "plain" and _looks_like_proximity(query):
+        console.print(
+            "[red]Error:[/red] query has proximity operators but couldn't be parsed. "
+            'Use \'"a" NEAR/N "b"\', \'("a"|"b") NEAR/N "c"\', or \'"a b"~N\'.'
+        )
+        return
+
+    text_lower = text.lower()
+    if parsed[0] == "near":
+        _, left, right, dist = parsed
+        spans = _find_grouped_near_matches(text, left, right, dist)
+    elif parsed[0] == "tilde":
+        _, words, dist = parsed
+        spans = _find_tilde_matches(text, words, dist)
+    else:
+        q = parsed[1].lower()
+        spans = [(m, m + len(q)) for m in _all_substring_positions(text_lower, q)]
+
+    if not spans:
+        console.print(f"[dim]No matches for '{query}' in transcript.[/dim]")
+        return
+
+    console.print(f"[bold]{len(spans)} match(es) for '{query}':[/bold]\n")
+    for start_c, end_c in spans:
+        ts = _time_at(start_c)
+        link = _deep_link(video_id, ts) if video_id else ""
+        s = max(0, start_c - context_chars)
+        e = min(len(text), end_c + context_chars)
+        snippet = text[s:e].strip().replace("\n", " ")
+        if s > 0:
+            snippet = "..." + snippet
+        if e < len(text):
+            snippet = snippet + "..."
+        loc = f"[link={link}]{_format_timestamp(ts)}[/link]" if link else _format_timestamp(ts)
+        console.print(f"  [[cyan]{loc}[/cyan]] {snippet}\n")
+
+
+def _all_substring_positions(haystack: str, needle: str) -> list:
+    out, pos = [], 0
+    while True:
+        idx = haystack.find(needle, pos)
+        if idx == -1:
+            break
+        out.append(idx)
+        pos = idx + 1
+    return out
+
+
+def _freshness_hint(start_date: str, end_date: str, query: str) -> Optional[str]:
+    """Return a one-line freshness hint if the query is hunting recent content.
+
+    Filmot indexes transcripts ~24-48h behind upload, so a date window that
+    reaches the last few days will miss the freshest coverage. yt-search hits
+    the YouTube API live and fills that gap. Fires only on explicit recent-date
+    signals to avoid noise on ordinary queries.
+    """
+    from datetime import date, datetime as _dt
+
+    def _parse(d):
+        if not d:
+            return None
+        try:
+            return _dt.strptime(d, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    today = date.today()
+    sd = _parse(start_date)
+    ed = _parse(end_date)
+
+    wants_recent = (sd is not None and (today - sd).days <= 14) or \
+                   (ed is not None and (today - ed).days <= 3)
+    if not wants_recent:
+        return None
+
+    days = 7
+    if sd is not None:
+        days = max(3, min(30, (today - sd).days + 2))
+    safe_query = query.replace('"', "'")[:60]
+    return (
+        f"[yellow]Freshness note:[/yellow] Filmot indexes ~24-48h behind upload. "
+        f"For launch-day / breaking coverage, also run: "
+        f"[cyan]filmot yt-search \"{safe_query}\" --days {days}[/cyan]"
+    )
 
 
 def _backfill_metadata(video_id: str, title: str, channel: str) -> tuple:
@@ -396,23 +622,36 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
     console.print(f"[dim]View with: filmot library list {topic}[/dim]")
 
 
-def _display_subtitle_results(results: dict, query: str, full: bool = False):
+def _display_subtitle_results(results: dict, query: str, full: bool = False, context_chars: int = 50):
     """Display subtitle search results with rich formatting.
-    
+
     Args:
         results: API response dictionary
         query: Original search query
         full: If True, show all matches without truncation (useful for AI agents)
+        context_chars: Characters of surrounding context per side for snippets
     """
     videos = results.get("result", results.get("videos", results.get("items", [])))
-    
+
     if not videos:
         console.print("[yellow]No results found.[/yellow]")
         return
-    
+
     total = results.get("totalresultcount", len(videos))
     console.print(Panel(f"[bold]Found {total:,} results for: {query}[/bold]"))
-    
+
+    # Echo detection: flag results that share near-identical phrasing (research
+    # guide §3 — convergence vs echo). Computed across the whole result set.
+    echo_clusters = _detect_echo_clusters(videos)
+    if echo_clusters:
+        n_flagged = len(echo_clusters)
+        n_groups = len(set(echo_clusters.values()))
+        console.print(
+            f"[yellow]⚠ Echo warning:[/yellow] {n_flagged} results across {n_groups} "
+            f"cluster(s) share near-identical phrasing (possible script-copying / AI-slop). "
+            f"Tagged [yellow]\\[echo#N][/yellow] below."
+        )
+
     for i, video in enumerate(videos, 1):
         title = video.get("title", "Unknown Title")
         video_id = video.get("id", "")
@@ -426,19 +665,33 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False):
         category = video.get("category", "")
         upload_date = video.get("uploaddate", "")
         lang = video.get("lang", "")
-        
+
         duration_str = _format_duration(duration)
         channel_subs_str = _format_count(channel_subs) if channel_subs else "N/A"
-        
-        console.print(f"\n[bold cyan]{i}. {title}[/bold cyan]")
-        console.print(f"   [dim]Channel:[/dim] {channel} ({channel_subs_str} subs) | [dim]Country:[/dim] {channel_country}")
-        console.print(f"   [dim]Views:[/dim] {views:,} | [dim]Likes:[/dim] {likes:,} | [dim]Duration:[/dim] {duration_str}")
-        console.print(f"   [dim]Category:[/dim] {category} | [dim]Language:[/dim] {lang} | [dim]Uploaded:[/dim] {upload_date}")
-        console.print(f"   [dim]Video:[/dim] https://youtube.com/watch?v={video_id}")
-        console.print(f"   [dim]Channel:[/dim] https://youtube.com/channel/{channel_id}")
-        
-        # Display hits (subtitle matches) with density scoring
+
+        # Engagement ratio (likes/views) — credibility signal per research guide §1
+        eng_str = ""
+        if views and views > 0:
+            eng_pct = (likes / views) * 100
+            eng_str = f" | [dim]Engagement:[/dim] {eng_pct:.1f}%"
+
+        echo_tag = f" [yellow]\\[echo#{echo_clusters[i - 1]}][/yellow]" if (i - 1) in echo_clusters else ""
+
+        # Result-level deep link jumps to the first match, not 0:00
         hits = video.get("hits", [])
+        if hits:
+            video_url = _deep_link(video_id, _hit_start(hits[0]))
+        else:
+            video_url = f"https://youtube.com/watch?v={video_id}"
+
+        console.print(f"\n[bold cyan]{i}. {title}[/bold cyan]{echo_tag}")
+        console.print(f"   [dim]Channel:[/dim] {channel} ({channel_subs_str} subs) | [dim]Country:[/dim] {channel_country}")
+        console.print(f"   [dim]Views:[/dim] {views:,} | [dim]Likes:[/dim] {likes:,}{eng_str} | [dim]Duration:[/dim] {duration_str}")
+        console.print(f"   [dim]Category:[/dim] {category} | [dim]Language:[/dim] {lang} | [dim]Uploaded:[/dim] {upload_date}")
+        console.print(f"   [dim]Video:[/dim] {video_url}")
+        console.print(f"   [dim]Channel:[/dim] https://youtube.com/channel/{channel_id}")
+
+        # Display hits (subtitle matches) with density scoring
         if hits:
             density = 0
             density_str = ""
@@ -470,7 +723,7 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False):
                 deduped_hits.append(hit)
 
             for hit in deduped_hits:
-                _display_hit(hit, video_id)
+                _display_hit(hit, video_id, context_chars=context_chars)
 
             hidden = len(display_hits) - len(deduped_hits)
             if hidden > 0:
@@ -1068,9 +1321,10 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
 @click.option("--no-proxy", is_flag=True, help="Disable proxy (ignore env vars, connect directly)")
 @click.option("--save-to", default=None, help="Save transcript to library under TOPIC (e.g., --save-to prompt-injection)")
 @click.option("--fallback/--no-fallback", default=False, help="Use AWS Transcribe if YouTube captions unavailable")
+@click.option("--grep", default=None, help="Search within the transcript using proximity operators (NEAR/N, ~N) — prints timestamped matches")
 @click.pass_context
-def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float, 
-               raw: bool, output: str, full: bool, proxy: str, no_proxy: bool, save_to: str, fallback: bool):
+def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
+               raw: bool, output: str, full: bool, proxy: str, no_proxy: bool, save_to: str, fallback: bool, grep: str):
     """Download full YouTube transcript for deep analysis.
     
     This command fetches the complete transcript of a YouTube video,
@@ -1157,21 +1411,44 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             result = get_transcript(video_id, languages)
     
     if "error" in result:
+        err_str = str(result.get('error', ''))
+        err_low = err_str.lower()
         console.print(f"[red]Error: {result['error']}[/red]")
         console.print(f"[dim]Video ID: {result.get('video_id', video_id)}[/dim]")
-        if "IpBlocked" in str(result.get('error', '')) or "blocked" in str(result.get('error', '')).lower():
-            console.print("\n[yellow]Tip: Your IP is blocked by YouTube. Try using a proxy:[/yellow]")
+        if result.get("routes_tried"):
+            console.print(f"[dim]Routes tried: {', '.join(result['routes_tried'])}[/dim]")
+
+        # Classify the failure so we give the RIGHT advice, not a blanket --fallback tip
+        is_proxy = any(s in err_low for s in ("proxy", "tunnel", "max retries", "connection"))
+        is_ipblock = "ipblocked" in err_low or "blocked" in err_low
+        is_captions = any(s in err_low for s in ("transcripts are disabled", "no transcript", "captions", "unavailable"))
+
+        if is_proxy:
+            console.print("\n[yellow]Tip: This is a transport/proxy failure, not a missing-caption issue.[/yellow]")
+            console.print("  Your proxy may be down or out of credits. Connect directly with: [cyan]--no-proxy[/cyan]")
+            console.print("  Or refresh the proxy pool / check WEBSHARE_API_TOKEN in .env")
+        elif is_ipblock:
+            console.print("\n[yellow]Tip: Your IP is blocked by YouTube. Route through a proxy:[/yellow]")
             console.print("  filmot transcript VIDEO_ID --proxy http://user:pass@host:port")
             console.print("  Or set WEBSHARE_PROXY_USERNAME/PASSWORD in .env for rotating proxies")
-        if not fallback:
-            console.print("\n[yellow]Tip: Use --fallback to try AWS Transcribe when captions unavailable[/yellow]")
+        elif is_captions and not fallback:
+            console.print("\n[yellow]Tip: No captions found. Use --fallback to try AWS Transcribe.[/yellow]")
+        elif not fallback:
+            console.print("\n[dim]Tip: --fallback tries AWS Transcribe; --no-proxy bypasses the proxy.[/dim]")
         return
     
     # Show source if using fallback
     source = result.get('source', 'youtube')
     if source == 'aws_transcribe':
         console.print(f"[cyan]Transcribed via AWS Transcribe (language: {result.get('language', 'unknown')})[/cyan]")
-    
+
+    # Grep mode: search within the transcript and print timestamped matches, then stop
+    if grep:
+        _grep_transcript(result, grep)
+        from .ledger import log_event
+        log_event("transcript", video_id=result.get("video_id", video_id), grep=grep)
+        return
+
     # Save to library if --save-to specified
     if save_to:
         from .library import get_library
@@ -2465,6 +2742,14 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
         all_chars = total_chars + probe_chars
         console.print(f"  Total content: {all_chars:,} characters ({all_chars / 1024:.0f} KB)")
 
+        from .ledger import log_event
+        log_event(
+            "research", topic=normalized_topic, query=topic,
+            scout=len(scout_videos), filmot_total=total,
+            saved=success_count, skipped=skip_count, failed=fail_count,
+            deduped=dedupe_count, probe=probe_success, depth=depth,
+        )
+
         # List sources
         transcripts = library.list_transcripts(normalized_topic)
         if transcripts:
@@ -2890,6 +3175,9 @@ def channel_search(channel_slug: str, query: str, limit: int):
     results = results[:limit]
     console.print(f"\n[bold]Found {len(results)} videos matching '{qlabel}' ({total_matches} total hits)[/bold]\n")
 
+    from .ledger import log_event
+    log_event("channel-search", slug=channel_slug, query=query, videos=len(results), hits=total_matches)
+
     for r in results:
         console.print(f"[bold cyan]{r['title']}[/bold cyan]")
         console.print(f"  [dim]{r['video_id']} | {r['published_at'][:10] if r['published_at'] else 'N/A'} | {r['match_count']} matches[/dim]")
@@ -2925,6 +3213,71 @@ def channel_search(channel_slug: str, query: str, limit: int):
                 highlighted = snippet.replace(query, f"[bold yellow]{query}[/bold yellow]")
             console.print(f"  [dim]→[/dim] {highlighted}")
         console.print()
+
+
+# ========== SESSIONS (LEDGER) ==========
+
+@cli.command("sessions")
+@click.argument("name", required=False, default=None)
+@click.option("--raw", is_flag=True, help="Output raw JSONL events")
+def sessions(name: str, raw: bool):
+    """Show the research session ledger so you can resume prior investigations.
+
+    Every search, research run, and channel-search is logged to
+    .filmot_data/sessions/. Without NAME, lists all sessions. With a NAME
+    (topic slug or YYYY-MM-DD date), replays that session's events.
+
+    \b
+    Examples:
+        filmot sessions                       # list all sessions
+        filmot sessions fable-5-mythos        # replay a topic session
+        filmot sessions 2026-06-10            # replay a day's ad-hoc queries
+        filmot sessions 2026-06-10 --raw      # raw JSONL for piping
+    """
+    from .ledger import list_sessions, read_events
+
+    if not name:
+        rows = list_sessions()
+        if not rows:
+            console.print("[dim]No sessions logged yet. Run a search or research command first.[/dim]")
+            return
+        table = Table(title="Research Sessions")
+        table.add_column("Session", style="cyan")
+        table.add_column("Events", justify="right")
+        table.add_column("Last activity", style="dim")
+        for r in rows:
+            table.add_row(r["name"], str(r["events"]), r["last_ts"].replace("T", " "))
+        console.print(table)
+        console.print("\n[dim]Replay one with: filmot sessions <name>[/dim]")
+        return
+
+    events = read_events(name)
+    if not events:
+        console.print(f"[yellow]No session found for '{name}'.[/yellow]")
+        return
+
+    if raw:
+        for e in events:
+            click.echo(json_mod.dumps(e, ensure_ascii=False))
+        return
+
+    console.print(f"[bold]Session: {name}[/bold] ({len(events)} events)\n")
+    for e in events:
+        ts = e.get("ts", "").replace("T", " ")
+        kind = e.get("kind", "?")
+        if kind == "search":
+            detail = f"\"{e.get('query','')}\" → {e.get('results',0)}/{e.get('total','?')} results"
+            if e.get("start_date") or e.get("end_date"):
+                detail += f" [{e.get('start_date','')}..{e.get('end_date','')}]"
+        elif kind == "research":
+            detail = f"\"{e.get('query','')}\" → saved {e.get('saved',0)}, probe {e.get('probe',0)} (scout {e.get('scout',0)})"
+        elif kind == "channel-search":
+            detail = f"{e.get('slug','')}: \"{e.get('query','')}\" → {e.get('videos',0)} vids / {e.get('hits',0)} hits"
+        elif kind == "transcript":
+            detail = f"{e.get('video_id','')}" + (f" grep \"{e.get('grep')}\"" if e.get("grep") else "")
+        else:
+            detail = json_mod.dumps({k: v for k, v in e.items() if k not in ("ts", "kind")}, ensure_ascii=False)
+        console.print(f"  [dim]{ts}[/dim] [cyan]{kind}[/cyan]  {detail}")
 
 
 # ========== DOWNLOAD (STDIN) ==========
