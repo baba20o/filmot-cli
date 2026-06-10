@@ -151,8 +151,8 @@ def configure_proxy(
     if webshare_username and webshare_password:
         _api = _build_webshare_api(webshare_username, webshare_password)
         _proxy_source = "legacy-webshare"
-    elif http_proxy:
-        _api = _build_generic_proxy_api(http_proxy, https_proxy)
+    elif http_proxy or https_proxy:
+        _api = _build_generic_proxy_api(http_proxy or https_proxy, https_proxy)
         _proxy_source = "explicit-proxy"
     else:
         raise ValueError("Must provide either Webshare credentials or proxy URL")
@@ -355,12 +355,13 @@ def _fetch_transcript_from_api(
         try:
             transcript = api.fetch(video_id, languages=languages, preserve_formatting=preserve_formatting)
         except NoTranscriptFound:
-            # Try to list and translate
+            # Try to list and translate into the first requested language
+            target_lang = languages[0].split('-')[0] if languages else 'en'
             transcript_list = api.list(video_id)
             translated = None
             for t in transcript_list:
                 if t.is_translatable:
-                    translated = t.translate('en').fetch(preserve_formatting=preserve_formatting)
+                    translated = t.translate(target_lang).fetch(preserve_formatting=preserve_formatting)
                     break
             if translated:
                 transcript = translated

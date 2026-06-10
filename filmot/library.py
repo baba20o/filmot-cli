@@ -211,7 +211,9 @@ class TranscriptLibrary:
         if substring:
             pattern = re.compile(re.escape(query_lower))
         else:
-            pattern = re.compile(r'\b' + re.escape(query_lower) + r'\b')
+            # Lookarounds instead of \b so queries ending in non-word chars
+            # (e.g. "c++", ".net") still match as whole words
+            pattern = re.compile(r'(?<!\w)' + re.escape(query_lower) + r'(?!\w)')
 
         results = []
 

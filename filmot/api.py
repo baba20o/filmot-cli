@@ -328,9 +328,14 @@ class FilmotClient:
             if max_results and total_results >= max_results:
                 break
             
-            # Check if we've fetched all available results
-            total_available = result.get("totalresultcount", 0)
-            if total_results >= total_available:
+            # Check if we've fetched all available results. If the API omits
+            # totalresultcount, fall back to stopping on a short page rather
+            # than always stopping after page 1.
+            total_available = result.get("totalresultcount")
+            if total_available is not None:
+                if total_results >= total_available:
+                    break
+            elif len(videos) < 50:
                 break
     
     def search_subtitles_all(
