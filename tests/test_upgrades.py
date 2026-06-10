@@ -104,3 +104,26 @@ def test_ledger_skips_none_fields(tmp_path):
     ev = ledger.read_events(date.today().strftime("%Y-%m-%d"), data_dir=d)[0]
     assert "lang" not in ev
     assert ev["results"] == 3
+
+
+def test_yt_search_logs_to_ledger(tmp_path, monkeypatch):
+    """yt-search must write a ledger event like search/transcript do."""
+    from click.testing import CliRunner
+    from filmot.cli import cli as cli_group
+    import filmot.youtube_search as ys
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ys, "validate_youtube_api", lambda: None)
+    monkeypatch.setattr(ys, "search_recent", lambda **kw: [
+        {"video_id": "abc12345678", "title": "T", "channel_title": "C",
+         "published_at": "2026-06-10T00:00:00Z", "views": 1, "duration": "PT1M"},
+    ])
+
+    result = CliRunner().invoke(cli_group, ["yt-search", "quantum", "--days", "3"])
+    assert result.exit_code == 0
+
+    events = ledger.read_events(date.today().strftime("%Y-%m-%d"), data_dir=str(tmp_path / ".filmot_data"))
+    yt_events = [e for e in events if e["kind"] == "yt-search"]
+    assert len(yt_events) == 1
+    assert yt_events[0]["query"] == "quantum"
+    assert yt_events[0]["results"] == 1

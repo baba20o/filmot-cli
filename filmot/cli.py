@@ -1755,10 +1755,16 @@ def yt_search(query: str, days: int, max_results: int, order: str,
                 topic_id=topic_id,
             )
         
+        from .ledger import log_event
+        log_event(
+            "yt-search", query=query, days=days, order=order,
+            lang=lang, region=region, results=len(results) if results else 0,
+        )
+
         if not results:
             console.print(f"[yellow]No videos found for '{query}' in the last {days} days.[/yellow]")
             return
-        
+
         # Build summary line
         filters = []
         if region:
