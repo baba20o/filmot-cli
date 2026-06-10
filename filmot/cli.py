@@ -1386,8 +1386,17 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         except Exception as e:
             console.print(f"[red]Proxy error: {e}[/red]")
             return
-    elif is_proxy_configured():
-        stderr_console.print(f"[dim]Environment proxy available as fallback[/dim]")
+    else:
+        try:
+            from .proxy_pool import get_pool
+            _pool = get_pool()
+            if _pool is not None:
+                kind = "file-backed" if getattr(_pool, "_file_backed", False) else "API"
+                stderr_console.print(f"[dim]Webshare pool active ({_pool.healthy_count()} healthy sessions, {kind}) + direct fallback[/dim]")
+            elif is_proxy_configured():
+                stderr_console.print(f"[dim]Proxy configured from environment[/dim]")
+        except Exception:
+            pass
 
     # Progress callback for AWS fallback
     def aws_progress(stage: str, msg: str):
@@ -3340,7 +3349,8 @@ def _require_pool():
     pool = get_pool()
     if pool is None:
         console.print("[red]No Webshare pool available.[/red]")
-        console.print("[dim]Set WEBSHARE_API_TOKEN in your .env (https://dashboard.webshare.io/userapi/keys)[/dim]")
+        console.print("[dim]Either set WEBSHARE_API_TOKEN in .env (https://dashboard.webshare.io/userapi/keys),[/dim]")
+        console.print("[dim]or place a session list at .filmot_data/webshare_info.txt (host:port:user:pass per line).[/dim]")
         return None
     return pool
 

@@ -40,6 +40,10 @@ DEFAULT_GATEWAY_PORT = 80
 DEFAULT_REFRESH_HOURS = 6
 DEFAULT_MAX_SESSIONS = 50
 DEFAULT_STATE_PATH = Path(".filmot_data") / "webshare_pool.json"
+# A pre-exported list of backbone sessions ("host:port:username:password" per
+# line). Lets the pool rotate across many residential exit IPs without a
+# WEBSHARE_API_TOKEN — each numbered session pins to a distinct exit IP.
+DEFAULT_SESSION_FILE = Path(".filmot_data") / "webshare_info.txt"
 
 # Cooldown windows per failure class (seconds)
 COOLDOWN_RATE_LIMITED = 90
@@ -135,8 +139,47 @@ class WebshareProxyPool:
         self._sessions: list[WebshareSession] = []
         self._last_refresh: float = 0.0
         self._cursor: int = 0  # round-robin pointer
+        self._file_backed: bool = False
 
         self._load_state()
+
+    def _init_file_backed(self, sessions: list, state_path: Optional[Path] = None) -> None:
+        """Initialize a token-less pool from a pre-exported session list.
+
+        Never calls the Webshare API; rotates across the provided sessions and
+        persists health to its own state file (merging prior health by id).
+        """
+        self.token = None
+        self.countries = []
+        self.gateway_host = DEFAULT_GATEWAY_HOST
+        self.gateway_port = DEFAULT_GATEWAY_PORT
+        self.refresh_hours = DEFAULT_REFRESH_HOURS
+        self.max_sessions = len(sessions)
+        self.state_path = Path(state_path) if state_path else (Path(".filmot_data") / "webshare_pool_file.json")
+        self.request_timeout = 15.0
+        self._lock = threading.Lock()
+        self._sessions = sessions
+        self._last_refresh = time.time()
+        self._cursor = 0
+        self._file_backed = True
+        # Merge prior health stats (cooldowns, retirement) for known sessions.
+        try:
+            if self.state_path.exists():
+                data = json.loads(self.state_path.read_text())
+                prior = {s["id"]: s for s in data.get("sessions", [])}
+                for sess in self._sessions:
+                    if sess.id in prior:
+                        merged = WebshareSession.from_dict(prior[sess.id])
+                        sess.success = merged.success
+                        sess.fail_429 = merged.fail_429
+                        sess.fail_blocked = merged.fail_blocked
+                        sess.fail_other = merged.fail_other
+                        sess.consecutive_failures = merged.consecutive_failures
+                        sess.cooldown_until = merged.cooldown_until
+                        sess.retired = merged.retired
+                self._cursor = int(data.get("cursor", 0)) % max(len(self._sessions), 1)
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
 
     # ── persistence ────────────────────────────────────────────────────
 
@@ -222,6 +265,9 @@ class WebshareProxyPool:
 
     def refresh(self, *, force: bool = False) -> int:
         """Pull sessions from Webshare. Returns the number now in the pool."""
+        if getattr(self, "_file_backed", False):
+            # File-backed pools have a fixed session list; nothing to pull.
+            return len(self._sessions)
         with self._lock:
             now = time.time()
             stale = (now - self._last_refresh) > self.refresh_hours * 3600
@@ -387,28 +433,72 @@ def _parse_countries(raw: Optional[str]) -> list[str]:
     return [c.strip().upper() for c in raw.split(",") if c.strip()]
 
 
+def _load_sessions_from_file(path: Path, limit: int) -> list[WebshareSession]:
+    """Parse a 'host:port:username:password' session list into WebshareSessions.
+
+    Sampled evenly across the file (not just the first N) so we spread across
+    distinct exit IPs rather than clustering on the lowest-numbered sessions.
+    """
+    try:
+        lines = [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
+    except OSError:
+        return []
+    parsed = []
+    for ln in lines:
+        parts = ln.split(":")
+        if len(parts) >= 4:
+            # host:port:username:password (password may itself contain ':')
+            host, port, username = parts[0], parts[1], parts[2]
+            password = ":".join(parts[3:])
+            parsed.append((username, password))
+    if not parsed:
+        return []
+    if len(parsed) > limit:
+        step = len(parsed) / limit
+        parsed = [parsed[int(i * step)] for i in range(limit)]
+    return [WebshareSession(id=u, username=u, password=p) for u, p in parsed]
+
+
 def get_pool(*, force_new: bool = False) -> Optional[WebshareProxyPool]:
-    """Return the process-wide pool, or None if no API token is configured."""
+    """Return the process-wide pool, or None if no proxy source is configured.
+
+    Two sources, in order of preference:
+      1. WEBSHARE_API_TOKEN  → live API, health-tracked, can self-refresh.
+      2. A pre-exported session file (WEBSHARE_SESSION_FILE or webshare_info.txt)
+         → rotate across many backbone sessions with no API token. This revives
+         multi-IP rotation when only proxy credentials (not an API key) exist.
+    """
     global _pool
     with _pool_lock:
         if _pool is not None and not force_new:
             return _pool
+        max_sessions = int(os.getenv("FILMOT_PROXY_MAX_SESSIONS", DEFAULT_MAX_SESSIONS))
         token = os.getenv("WEBSHARE_API_TOKEN")
-        if not token:
-            return None
-        try:
-            _pool = WebshareProxyPool(
-                token,
-                countries=_parse_countries(os.getenv("FILMOT_PROXY_COUNTRIES")),
-                refresh_hours=float(
-                    os.getenv("FILMOT_PROXY_REFRESH_HOURS", DEFAULT_REFRESH_HOURS)
-                ),
-                max_sessions=int(
-                    os.getenv("FILMOT_PROXY_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)
-                ),
-            )
-        except WebshareProxyError:
-            _pool = None
+        if token:
+            try:
+                _pool = WebshareProxyPool(
+                    token,
+                    countries=_parse_countries(os.getenv("FILMOT_PROXY_COUNTRIES")),
+                    refresh_hours=float(
+                        os.getenv("FILMOT_PROXY_REFRESH_HOURS", DEFAULT_REFRESH_HOURS)
+                    ),
+                    max_sessions=max_sessions,
+                )
+            except WebshareProxyError:
+                _pool = None
+            if _pool is not None:
+                return _pool
+
+        # Fall back to a file-backed pool (no API token needed).
+        session_file = Path(os.getenv("WEBSHARE_SESSION_FILE", str(DEFAULT_SESSION_FILE)))
+        if session_file.exists():
+            sessions = _load_sessions_from_file(session_file, max_sessions)
+            if sessions:
+                _pool = WebshareProxyPool.__new__(WebshareProxyPool)
+                _pool._init_file_backed(sessions)
+                return _pool
+
+        _pool = None
         return _pool
 
 

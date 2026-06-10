@@ -248,10 +248,12 @@ class TestStatusSnapshot:
 # ── module-level get_pool ─────────────────────────────────────────
 
 class TestGetPool:
-    def test_no_token_returns_none(self, monkeypatch):
+    def test_no_token_and_no_file_returns_none(self, monkeypatch, tmp_path):
         monkeypatch.delenv("WEBSHARE_API_TOKEN", raising=False)
+        monkeypatch.setenv("WEBSHARE_SESSION_FILE", str(tmp_path / "does-not-exist.txt"))
         reset_pool()
         assert get_pool() is None
+        reset_pool()
 
     def test_with_token_returns_pool(self, monkeypatch):
         monkeypatch.setenv("WEBSHARE_API_TOKEN", "fake")
@@ -259,6 +261,30 @@ class TestGetPool:
         pool = get_pool()
         assert pool is not None
         assert pool.token == "fake"
+        reset_pool()
+
+    def test_file_backed_pool_when_no_token(self, monkeypatch, tmp_path):
+        # No API token, but a session list file exists → file-backed pool
+        monkeypatch.delenv("WEBSHARE_API_TOKEN", raising=False)
+        session_file = tmp_path / "webshare_info.txt"
+        session_file.write_text(
+            "\n".join(f"p.webshare.io:80:user-{i}:secretpw" for i in range(1, 21))
+        )
+        monkeypatch.setenv("WEBSHARE_SESSION_FILE", str(session_file))
+        monkeypatch.setenv("FILMOT_PROXY_MAX_SESSIONS", "5")
+        monkeypatch.chdir(tmp_path)  # keep the pool's state file inside tmp
+        reset_pool()
+        pool = get_pool()
+        assert pool is not None
+        assert pool._file_backed is True
+        assert len(pool._sessions) == 5  # sampled down from 20
+        assert pool.token is None
+        # rotation: two consecutive picks differ
+        a = pool.pick()
+        b = pool.pick()
+        assert a is not None and b is not None and a.id != b.id
+        # refresh is a no-op (must never hit the API)
+        assert pool.refresh() == 5
         reset_pool()
 
 

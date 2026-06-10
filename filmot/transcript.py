@@ -27,6 +27,15 @@ load_dotenv()
 # Default number of pool sessions to try on transport-class failures.
 _POOL_RETRY_LIMIT = int(os.getenv("FILMOT_PROXY_RETRY_LIMIT", "4"))
 
+# Webshare gateway for the legacy username/password path.
+_WEBSHARE_GATEWAY = os.getenv("WEBSHARE_GATEWAY", "p.webshare.io:80")
+# WebshareProxyConfig appends a "-rotate" suffix to the username for the
+# rotating-residential endpoint. Static-session Webshare plans reject that
+# endpoint with "Tunnel connection failed: 400". Default to the bare-username
+# gateway (which those plans accept); set FILMOT_WEBSHARE_ROTATE=1 to opt back
+# into the library's rotating behavior.
+_WEBSHARE_ROTATE = os.getenv("FILMOT_WEBSHARE_ROTATE", "0").strip().lower() in ("1", "true", "yes")
+
 # Global API instance - holds the "primary" non-pool client (direct, legacy
 # Webshare via env vars, or an operator-supplied proxy from configure_proxy()).
 # The dynamic Webshare pool is layered on top by get_transcript().
@@ -42,15 +51,23 @@ def _build_direct_api() -> YouTubeTranscriptApi:
 
 
 def _build_webshare_api(proxy_username: str, proxy_password: str) -> YouTubeTranscriptApi:
-    """Build a Webshare-backed YouTubeTranscriptApi client."""
-    from youtube_transcript_api.proxies import WebshareProxyConfig
+    """Build a Webshare-backed YouTubeTranscriptApi client.
 
-    return YouTubeTranscriptApi(
-        proxy_config=WebshareProxyConfig(
-            proxy_username=proxy_username,
-            proxy_password=proxy_password,
+    Static-session Webshare plans reject the library's default ``-rotate``
+    endpoint (400). By default we route the bare username through the gateway
+    via GenericProxyConfig, which those plans accept. Set FILMOT_WEBSHARE_ROTATE=1
+    to use the library's WebshareProxyConfig rotating endpoint instead.
+    """
+    if _WEBSHARE_ROTATE:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=proxy_username,
+                proxy_password=proxy_password,
+            )
         )
-    )
+    url = f"http://{proxy_username}:{proxy_password}@{_WEBSHARE_GATEWAY}"
+    return _build_generic_proxy_api(url, url)
 
 
 def _build_generic_proxy_api(http_proxy: Optional[str], https_proxy: Optional[str]) -> YouTubeTranscriptApi:
