@@ -2034,6 +2034,27 @@ def _find_probe_pairs(texts, terms, window_size=50, max_pairs=5):
     return [(t1, t2, count) for _, count, t1, t2 in candidates[:max_pairs]]
 
 
+def _probe_topic_words(topic: str) -> list[str]:
+    """Significant topic words used to relevance-check probe results."""
+    import re
+    return [w for w in re.findall(r'[a-z0-9]{4,}', topic.lower()) if w not in _PROBE_STOPWORDS]
+
+
+def _probe_hit_is_relevant(video: dict, topic_words: list[str]) -> bool:
+    """True if a probe result mentions the research topic in its title or hit context."""
+    if not topic_words:
+        return True
+    parts = [video.get("title", "")]
+    for hit in video.get("hits", [])[:10]:
+        parts.append(hit.get("ctx_before", ""))
+        parts.append(hit.get("token", ""))
+        parts.append(hit.get("ctx_after", ""))
+        for line in hit.get("lines", [])[:3]:
+            parts.append(line if isinstance(line, str) else str(line.get("text", "")))
+    text = " ".join(parts).lower()
+    return any(w in text for w in topic_words)
+
+
 # ========== RESEARCH COMMAND ==========
 
 @cli.command()
@@ -2332,6 +2353,7 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                         console.print()
                         existing_ids = {t["video_id"] for t in library.list_transcripts(normalized_topic)}
                         probe_new_videos = []
+                        probe_topic_words = _probe_topic_words(topic)
 
                         for idx, (t1, t2, co_count) in enumerate(pairs, 1):
                             query = f'"{t1}" NEAR/15 "{t2}"'
@@ -2373,6 +2395,15 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                                 pv for pv in probe_hits
                                 if (pv.get("id") or pv.get("videoid")) not in existing_ids
                             ]
+
+                            # Without a working title filter, probe results are
+                            # unconstrained — only download videos that mention
+                            # the research topic in their title or hit context
+                            if not title_filter_works:
+                                new_vids = [
+                                    pv for pv in new_vids
+                                    if _probe_hit_is_relevant(pv, probe_topic_words)
+                                ]
 
                             new_tag = f" | [cyan]{len(new_vids)} new[/cyan]" if new_vids else ""
                             console.print(
