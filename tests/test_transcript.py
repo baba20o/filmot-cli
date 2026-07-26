@@ -207,6 +207,45 @@ class TestGetTranscript:
         assert pool._sessions[1].success == 1
 
     @patch("filmot.transcript._fetch_transcript_from_api")
+    @patch("filmot.transcript._iter_routes")
+    def test_direct_success_retains_prior_pool_route_diagnostics(
+        self, mock_routes, mock_fetch
+    ):
+        pool_outcome = MagicMock()
+        pool_api = MagicMock(name="pool_api")
+        direct_api = MagicMock(name="direct_api")
+        pool_route = "pool:webshare-api:session-deadbeef"
+        mock_routes.return_value = iter([
+            (pool_route, pool_api, pool_outcome),
+            ("direct", direct_api, None),
+        ])
+        mock_fetch.side_effect = [
+            Exception("Tunnel connection failed: 400 Bad Request"),
+            {
+                "video_id": "abc12345678",
+                "language": "en",
+                "is_generated": True,
+                "segments": [],
+                "full_text": "Recovered directly",
+                "duration_seconds": 1,
+                "segment_count": 0,
+            },
+        ]
+
+        result = get_transcript("abc12345678")
+
+        assert result["route"] == "direct"
+        assert result["routes_tried"] == [pool_route, "direct"]
+        assert len(result["route_errors"]) == 1
+        assert result["route_errors"][0]["route"] == pool_route
+        assert result["route_errors"][0]["kind"] == "connection"
+        assert result["route_errors"][0]["error_type"] == "Exception"
+        pool_outcome.assert_called_once_with(
+            "failure",
+            ("connection", "Tunnel connection failed: 400 Bad Request"),
+        )
+
+    @patch("filmot.transcript._fetch_transcript_from_api")
     def test_terminal_error_short_circuits_routes(self, mock_fetch):
         """TranscriptsDisabled on the first route stops route iteration."""
         from youtube_transcript_api._errors import TranscriptsDisabled
@@ -239,6 +278,69 @@ class TestGetTranscript:
         assert "disabled" in result["error"].lower()
         # Only one fetch attempt: terminal error short-circuits the route ladder.
         assert mock_fetch.call_count == 1
+
+    @patch("filmot.transcript._fetch_transcript_from_api")
+    @patch("filmot.transcript._iter_routes")
+    def test_terminal_result_has_normalized_route_metadata(
+        self, mock_routes, mock_fetch
+    ):
+        from youtube_transcript_api._errors import TranscriptsDisabled
+
+        mock_routes.return_value = iter([
+            ("direct", MagicMock(name="direct_api"), None),
+        ])
+        mock_fetch.side_effect = TranscriptsDisabled("abc12345678")
+
+        result = get_transcript("abc12345678")
+
+        assert result["error_type"] == "TranscriptsDisabled"
+        assert result["route"] == "direct"
+        assert result["routes_tried"] == ["direct"]
+        assert result["route_errors"] == []
+
+    @patch("filmot.transcript._fetch_transcript_from_api")
+    def test_fresh_primary_uses_isolated_client_and_default_keeps_mock_path(
+        self, mock_fetch, monkeypatch
+    ):
+        shared_api = MagicMock(name="shared_primary")
+        fresh_api = MagicMock(name="fresh_primary")
+        payload = {
+            "video_id": "abc12345678",
+            "language": "en",
+            "is_generated": True,
+            "segments": [],
+            "full_text": "isolated",
+            "duration_seconds": 1,
+            "segment_count": 0,
+        }
+        mock_fetch.side_effect = [dict(payload), dict(payload)]
+        monkeypatch.setattr(transcript_module, "_initialized", True)
+        monkeypatch.setattr(transcript_module, "_api", shared_api)
+        monkeypatch.setattr(transcript_module, "_proxy_source", "direct")
+        monkeypatch.setenv("FILMOT_PROXY_MODE", "direct-only")
+
+        with (
+            patch(
+                "filmot.transcript._fresh_primary_api",
+                return_value=fresh_api,
+            ) as mock_fresh,
+            patch(
+                "filmot.transcript.get_api",
+                return_value=shared_api,
+            ) as mock_get_api,
+        ):
+            isolated = get_transcript(
+                "abc12345678",
+                fresh_primary=True,
+            )
+            regular = get_transcript("abc12345678")
+
+        assert isolated["route"] == "direct"
+        assert regular["route"] == "direct"
+        assert mock_fetch.call_args_list[0].args[0] is fresh_api
+        assert mock_fetch.call_args_list[1].args[0] is shared_api
+        mock_fresh.assert_called_once_with()
+        mock_get_api.assert_called_once_with()
 
     @patch("filmot.transcript._fetch_transcript_from_api")
     def test_route_timeout_advances_to_next_pool_session(self, mock_fetch, tmp_path):
@@ -295,6 +397,7 @@ class TestGetTranscript:
         assert pool._sessions[0].last_failure_kind == "connection"
         assert pool._sessions[1].success == 1
         assert [event["event"] for event in events] == [
+            "pool_prepare",
             "route_start",
             "route_timeout",
             "route_start",
@@ -429,6 +532,67 @@ class TestRoutingPlan:
         assert plan["primary"] == "direct"
         assert [route["label"] for route in plan["routes"]] == ["direct"]
         assert plan["has_direct_route"] is True
+        assert transcript_module.get_api()._fetcher._http_client.trust_env is False
+
+    def test_explicit_proxy_can_override_token_backed_proxy_only_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("WEBSHARE_API_TOKEN", "configured-token")
+        monkeypatch.delenv("FILMOT_PROXY_MODE", raising=False)
+        monkeypatch.setattr(transcript_module, "_api", None)
+        monkeypatch.setattr(transcript_module, "_initialized", False)
+        monkeypatch.setattr(transcript_module, "_proxy_configured", False)
+        monkeypatch.setattr(transcript_module, "_proxy_source", "direct")
+        monkeypatch.setattr(
+            transcript_module,
+            "_build_generic_proxy_api",
+            lambda *args: MagicMock(),
+        )
+
+        transcript_module.configure_proxy(
+            http_proxy="http://explicit.invalid:8080",
+            exclusive=True,
+        )
+        plan = routing_plan()
+
+        assert plan["mode"] == "primary-only"
+        assert [route["label"] for route in plan["routes"]] == [
+            "explicit-proxy"
+        ]
+        assert plan["pool_configured"] is False
+
+    def test_proxy_pool_refresh_failure_is_returned_clearly(
+        self, monkeypatch
+    ):
+        from filmot.proxy_pool import WebshareProxyError
+
+        pool = MagicMock()
+        pool.source = "webshare-api"
+        pool.available_count.return_value = 0
+        pool.pick.side_effect = WebshareProxyError(
+            "Webshare rejected the API token (401)"
+        )
+        monkeypatch.setenv("FILMOT_PROXY_MODE", "proxy-only")
+        monkeypatch.setattr(transcript_module, "_initialized", True)
+        monkeypatch.setattr(transcript_module, "_api", MagicMock())
+        monkeypatch.setattr(transcript_module, "_proxy_source", "direct")
+        monkeypatch.setattr(transcript_module, "_proxy_configured", False)
+        monkeypatch.setattr(transcript_module, "get_pool", lambda: pool)
+        events = []
+
+        result = get_transcript(
+            "abc12345678",
+            progress_callback=events.append,
+        )
+
+        assert result["error_type"] == "WebshareProxyError"
+        assert "401" in result["error"]
+        assert result["route_errors"][0]["kind"] == "pool_refresh"
+        assert [event["event"] for event in events] == [
+            "pool_prepare",
+            "pool_prepare_failed",
+            "routes_exhausted",
+        ]
 
 
 class TestProbePoolSession:
@@ -495,7 +659,24 @@ class TestGetTranscriptWithFallback:
     @patch("filmot.aws_transcribe.transcribe_video")
     def test_youtube_fails_aws_succeeds(self, mock_transcribe, mock_deps, mock_gt):
         """When YouTube fails, AWS Transcribe fallback kicks in."""
-        mock_gt.return_value = {"error": "Transcripts are disabled", "video_id": "abc12345678"}
+        youtube_route_errors = [{
+            "route": "pool:webshare-api:session-deadbeef",
+            "kind": "connection",
+            "error_type": "ProxyError",
+            "error": "proxy failed",
+            "elapsed_s": 0.5,
+        }]
+        mock_gt.return_value = {
+            "error": "Transcripts are disabled",
+            "error_type": "TranscriptsDisabled",
+            "video_id": "abc12345678",
+            "route": "direct",
+            "routes_tried": [
+                "pool:webshare-api:session-deadbeef",
+                "direct",
+            ],
+            "route_errors": youtube_route_errors,
+        }
         mock_deps.return_value = (True, "")
         mock_transcribe.return_value = ("AWS transcript text here", "en-US")
 
@@ -503,6 +684,65 @@ class TestGetTranscriptWithFallback:
         assert result["source"] == "aws_transcribe"
         assert result["full_text"] == "AWS transcript text here"
         assert result["language"] == "en-US"
+        assert result["route"] == "aws-transcribe"
+        assert result["youtube_error"] == "Transcripts are disabled"
+        assert result["youtube_error_type"] == "TranscriptsDisabled"
+        assert result["youtube_routes_tried"] == [
+            "pool:webshare-api:session-deadbeef",
+            "direct",
+        ]
+        assert result["routes_tried"] == [
+            "pool:webshare-api:session-deadbeef",
+            "direct",
+            "aws-transcribe",
+        ]
+        assert result["route_errors"] == youtube_route_errors
+
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.aws_transcribe.check_dependencies")
+    @patch("filmot.aws_transcribe.transcribe_video")
+    def test_aws_failure_retains_youtube_route_metadata(
+        self, mock_transcribe, mock_deps, mock_gt
+    ):
+        youtube_route_errors = [{
+            "route": "pool:webshare-api:session-deadbeef",
+            "kind": "connection",
+            "error_type": "ProxyError",
+            "error": "proxy failed",
+            "elapsed_s": 0.5,
+        }]
+        mock_gt.return_value = {
+            "error": "all YouTube routes failed",
+            "error_type": "ConnectionError",
+            "video_id": "abc12345678",
+            "routes_tried": [
+                "pool:webshare-api:session-deadbeef",
+                "direct",
+            ],
+            "route_errors": youtube_route_errors,
+        }
+        mock_deps.return_value = (True, "")
+        mock_transcribe.side_effect = RuntimeError("AWS job failed")
+
+        result = get_transcript_with_fallback(
+            "abc12345678",
+            use_aws_fallback=True,
+        )
+
+        assert result["error_type"] == "RuntimeError"
+        assert result["route"] == "aws-transcribe"
+        assert result["youtube_error"] == "all YouTube routes failed"
+        assert result["youtube_error_type"] == "ConnectionError"
+        assert result["youtube_routes_tried"] == [
+            "pool:webshare-api:session-deadbeef",
+            "direct",
+        ]
+        assert result["routes_tried"] == [
+            "pool:webshare-api:session-deadbeef",
+            "direct",
+            "aws-transcribe",
+        ]
+        assert result["route_errors"] == youtube_route_errors
 
     @patch("filmot.transcript.get_transcript")
     @patch("filmot.aws_transcribe.check_dependencies")

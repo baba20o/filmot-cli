@@ -41,7 +41,9 @@ def _read_path(path: Path) -> list:
                 line = line.strip()
                 if line:
                     try:
-                        events.append(json.loads(line))
+                        event = json.loads(line)
+                        if isinstance(event, dict):
+                            events.append(event)
                     except json.JSONDecodeError:
                         continue
     except OSError:
@@ -103,6 +105,9 @@ def migrate_legacy_session(name: str, data_dir: str = ".filmot_data") -> int:
             try:
                 event = json.loads(stripped)
             except json.JSONDecodeError:
+                remaining_lines.append(line)
+                continue
+            if not isinstance(event, dict):
                 remaining_lines.append(line)
                 continue
             if _event_matches_topic(event, topic_slug):

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from hashlib import sha256
@@ -59,6 +60,20 @@ RETIRE_AFTER_CONSECUTIVE_FAILURES = 5
 
 class WebshareProxyError(Exception):
     """Raised for failures talking to the Webshare REST API."""
+
+
+def redact_sensitive_text(value: object, secrets: Iterable[str] = ()) -> str:
+    """Remove proxy URL userinfo and caller-known secrets from diagnostics."""
+    text = str(value)
+    text = re.sub(
+        r"(?i)(https?://)[^/\s@]+@",
+        r"\1***:***@",
+        text,
+    )
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "***")
+    return text
 
 
 @dataclass
@@ -154,6 +169,7 @@ class WebshareProxyPool:
         self._sessions: list[WebshareSession] = []
         self._last_refresh: float = 0.0
         self._cursor: int = 0  # round-robin pointer
+        self._in_flight_ids: set[str] = set()
         self._file_backed: bool = False
         self._session_file_path: Optional[Path] = None
 
@@ -186,6 +202,7 @@ class WebshareProxyPool:
         self._sessions = sessions
         self._last_refresh = time.time()
         self._cursor = 0
+        self._in_flight_ids = set()
         self._file_backed = True
         self._session_file_path = Path(session_file_path)
         # Merge prior health stats (cooldowns, retirement) for known sessions.
@@ -206,7 +223,10 @@ class WebshareProxyPool:
                         sess.last_success_at = merged.last_success_at
                         sess.last_failure_at = merged.last_failure_at
                         sess.last_failure_kind = merged.last_failure_kind
-                        sess.last_error = merged.last_error
+                        sess.last_error = redact_sensitive_text(
+                            merged.last_error or "",
+                            (sess.username, sess.password),
+                        ) or None
                         sess.retired = merged.retired
                 self._cursor = int(data.get("cursor", 0)) % max(len(self._sessions), 1)
         except (OSError, json.JSONDecodeError, KeyError):
@@ -225,6 +245,11 @@ class WebshareProxyPool:
         self._sessions = [
             WebshareSession.from_dict(s) for s in data.get("sessions", [])
         ]
+        for session in self._sessions:
+            session.last_error = redact_sensitive_text(
+                session.last_error or "",
+                (session.username, session.password),
+            ) or None
         # Persisting the cursor matters for short-lived CLI processes: without
         # it, every invocation starts at index 0 and hammers the same session.
         self._cursor = int(data.get("cursor", 0))
@@ -416,36 +441,74 @@ class WebshareProxyPool:
     def session_file_path(self) -> Optional[Path]:
         return getattr(self, "_session_file_path", None)
 
-    def pick(self) -> Optional[WebshareSession]:
+    def pick(
+        self,
+        *,
+        refresh: bool = True,
+        exclude_ids: Optional[set[str]] = None,
+        lease: bool = False,
+    ) -> Optional[WebshareSession]:
         """Return the next available session, or None if pool is empty/exhausted.
 
-        Refreshes from the API on first use or when stale.
+        Refreshes from the API on first use or when stale. ``exclude_ids`` lets
+        bounded diagnostic callers request distinct sessions without changing
+        normal round-robin behavior. Sessions leased by another caller are
+        always excluded. With ``lease=True``, the selected session remains
+        unavailable until it is released or an outcome is reported.
         """
-        if not self._sessions or (
+        if refresh and (not self._sessions or (
             time.time() - self._last_refresh > self.refresh_hours * 3600
-        ):
+        )):
             try:
                 self.refresh()
             except WebshareProxyError:
-                # Use whatever is cached; caller will see error eventually.
-                pass
+                # A stale populated cache remains useful, but an empty pool
+                # must preserve the management error so callers can explain
+                # why no route exists.
+                if not self._sessions:
+                    raise
 
         with self._lock:
             if not self._sessions:
                 return None
             now = time.time()
+            in_flight = getattr(self, "_in_flight_ids", None)
+            if in_flight is None:
+                # Older integrations and tests sometimes construct a pool via
+                # ``__new__``. Lazily initialize transient lease state so those
+                # callers retain backwards compatibility.
+                in_flight = set()
+                self._in_flight_ids = in_flight
+            excluded = set(exclude_ids or ())
+            excluded.update(in_flight)
             n = len(self._sessions)
             for offset in range(n):
                 idx = (self._cursor + offset) % n
                 s = self._sessions[idx]
-                if s.is_available(now):
+                if s.id not in excluded and s.is_available(now):
                     self._cursor = (idx + 1) % n
                     s.last_used_at = now
+                    if lease:
+                        in_flight.add(s.id)
                     return s
             return None  # all in cooldown / retired
 
+    def release(self, session: WebshareSession) -> None:
+        """Release an in-flight session without recording a health outcome."""
+        with self._lock:
+            in_flight = getattr(self, "_in_flight_ids", None)
+            if in_flight is None:
+                self._in_flight_ids = set()
+                return
+            in_flight.discard(session.id)
+
     def report_success(self, session: WebshareSession) -> None:
         with self._lock:
+            in_flight = getattr(self, "_in_flight_ids", None)
+            if in_flight is None:
+                in_flight = set()
+                self._in_flight_ids = in_flight
+            in_flight.discard(session.id)
             now = time.time()
             session.success += 1
             session.consecutive_failures = 0
@@ -468,6 +531,11 @@ class WebshareProxyPool:
             "other": COOLDOWN_OTHER,
         }
         with self._lock:
+            in_flight = getattr(self, "_in_flight_ids", None)
+            if in_flight is None:
+                in_flight = set()
+                self._in_flight_ids = in_flight
+            in_flight.discard(session.id)
             now = time.time()
             if kind == "rate_limited":
                 session.fail_429 += 1
@@ -480,7 +548,10 @@ class WebshareProxyPool:
             session.last_failure_at = now
             session.last_failure_kind = kind
             if summary:
-                session.last_error = summary[:200]
+                session.last_error = redact_sensitive_text(
+                    summary,
+                    (session.username, session.password),
+                )[:200]
             if session.consecutive_failures >= RETIRE_AFTER_CONSECUTIVE_FAILURES:
                 session.retired = True
             self._save_state()
@@ -491,21 +562,35 @@ class WebshareProxyPool:
         Availability is not a health assertion: an untested or historically
         failing session becomes available again after its cooldown.
         """
-        now = time.time()
-        return sum(1 for s in self._sessions if s.is_available(now))
+        with self._lock:
+            now = time.time()
+            in_flight = getattr(self, "_in_flight_ids", set())
+            return sum(
+                1
+                for s in self._sessions
+                if s.id not in in_flight and s.is_available(now)
+            )
 
     def recently_healthy_count(self) -> int:
         """Return available sessions with a successful recent live fetch."""
-        now = time.time()
-        window = (
-            getattr(self, "recent_success_hours", DEFAULT_RECENT_SUCCESS_HOURS)
-            * 3600
-        )
-        return sum(
-            1
-            for s in self._sessions
-            if s.is_available(now) and s.was_recently_successful(now, window)
-        )
+        with self._lock:
+            now = time.time()
+            in_flight = getattr(self, "_in_flight_ids", set())
+            window = (
+                getattr(self, "recent_success_hours", DEFAULT_RECENT_SUCCESS_HOURS)
+                * 3600
+            )
+            return sum(
+                1
+                for s in self._sessions
+                if (
+                    s.id not in in_flight
+                    and s.is_available(now)
+                    and s.consecutive_failures == 0
+                    and s.last_success_at >= s.last_failure_at
+                    and s.was_recently_successful(now, window)
+                )
+            )
 
     def healthy_count(self) -> int:
         """Compatibility alias for genuinely, recently healthy sessions."""
@@ -513,18 +598,27 @@ class WebshareProxyPool:
 
     def status_snapshot(self) -> dict:
         now = time.time()
+        with self._lock:
+            in_flight = set(getattr(self, "_in_flight_ids", set()))
         recent_window = (
             getattr(self, "recent_success_hours", DEFAULT_RECENT_SUCCESS_HOURS)
             * 3600
         )
         sessions = []
         for s in self._sessions:
-            recently_successful = s.was_recently_successful(now, recent_window)
-            available = s.is_available(now)
+            leased = s.id in in_flight
+            recently_successful = (
+                s.consecutive_failures == 0
+                and s.last_success_at >= s.last_failure_at
+                and s.was_recently_successful(now, recent_window)
+            )
+            available = not leased and s.is_available(now)
             if not s.valid:
                 state = "invalid"
             elif s.retired:
                 state = "retired"
+            elif leased:
+                state = "in-flight"
             elif not available:
                 state = "cooldown"
             elif s.consecutive_failures:
@@ -542,6 +636,7 @@ class WebshareProxyPool:
                     "country": s.country_code,
                     "valid": s.valid,
                     "retired": s.retired,
+                    "in_flight": leased,
                     "available": available,
                     "recently_successful": recently_successful,
                     "state": state,
@@ -554,7 +649,14 @@ class WebshareProxyPool:
                     "last_success_at": s.last_success_at,
                     "last_failure_at": s.last_failure_at,
                     "last_failure_kind": s.last_failure_kind,
-                    "last_error": s.last_error,
+                    "last_error": (
+                        redact_sensitive_text(
+                            s.last_error,
+                            (s.username, s.password),
+                        )
+                        if s.last_error
+                        else None
+                    ),
                 }
             )
         counts = {
@@ -564,6 +666,7 @@ class WebshareProxyPool:
                 for s in sessions
                 if s["available"] and s["recently_successful"]
             ),
+            "in_flight": len(in_flight),
             "untested": sum(1 for s in self._sessions if s.success == 0),
             "cooling": sum(1 for s in sessions if s["state"] == "cooldown"),
             "retired": sum(1 for s in sessions if s["state"] == "retired"),
@@ -721,12 +824,28 @@ def classify_transport_error(error: BaseException) -> str:
         return "rate_limited"
     if "ipblocked" in msg or "ip block" in msg or "blocked by youtube" in msg:
         return "blocked"
+    if isinstance(
+        error,
+        (
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.exceptions.ProxyError,
+            requests.exceptions.SSLError,
+        ),
+    ):
+        return "connection"
     transport_needles = (
         "proxy",
         "tunnel connection failed",
         "max retries exceeded",
         "connection reset",
         "connection aborted",
+        "failed to establish a new connection",
+        "remote end closed connection",
+        "connection refused",
+        "connection broken",
+        "network is unreachable",
+        "name resolution",
         "connect timeout",
         "read timeout",
         "timed out",

@@ -22,8 +22,10 @@ import requests
 from dotenv import load_dotenv
 
 from .proxy_pool import (
+    WebshareProxyError,
     classify_transport_error,
     get_pool,
+    redact_sensitive_text,
 )
 
 load_dotenv()
@@ -55,6 +57,7 @@ _api = None
 _proxy_configured = False
 _initialized = False
 _proxy_source = "direct"
+_primary_override: Optional[dict] = None
 
 
 class TranscriptRouteTimeout(TimeoutError):
@@ -74,6 +77,10 @@ class _BoundedSession(requests.Session):
 
     def __init__(self, connect_timeout: float, read_timeout: float) -> None:
         super().__init__()
+        # Proxy routes are resolved explicitly below. Leaving Requests'
+        # environment inheritance enabled would make a route labelled
+        # ``direct`` silently honor HTTP(S)_PROXY, breaking --no-proxy.
+        self.trust_env = False
         self._filmot_timeout = (connect_timeout, read_timeout)
 
     def request(self, method, url, **kwargs):  # noqa: ANN001 - requests signature
@@ -181,6 +188,7 @@ def _primary_from_environment() -> tuple[YouTubeTranscriptApi, str, bool]:
 def _init_api() -> None:
     """Initialise the "primary" client (the non-pool route)."""
     global _api, _proxy_configured, _initialized, _proxy_source
+    global _primary_override
 
     if _initialized:
         return
@@ -193,19 +201,23 @@ def _init_api() -> None:
         )
     else:
         _api, _proxy_source, _proxy_configured = _primary_from_environment()
+    _primary_override = None
     _initialized = True
 
 
 def _resolve_proxy_mode() -> str:
     """Decide the active routing mode.
 
-    ``FILMOT_PROXY_MODE`` may be set to ``auto``, ``proxy-only``, or
-    ``direct-only``. When unset, we default to ``proxy-only`` whenever a
-    Webshare API token is configured (typical AWS-host case where direct
-    fetches are routinely blocked) and ``auto`` otherwise.
+    ``FILMOT_PROXY_MODE`` may be set to ``auto``, ``proxy-only``,
+    ``primary-only``, or ``direct-only``. ``primary-only`` is also used by the
+    CLI's explicit ``--proxy`` override so a configured Webshare pool cannot
+    silently replace the operator-selected route. When unset, we default to
+    ``proxy-only`` whenever a Webshare API token is configured (typical
+    AWS-host case where direct fetches are routinely blocked) and ``auto``
+    otherwise.
     """
     mode = (os.getenv("FILMOT_PROXY_MODE") or "").strip().lower()
-    if mode in {"auto", "proxy-only", "direct-only"}:
+    if mode in {"auto", "proxy-only", "primary-only", "direct-only"}:
         return mode
     return "proxy-only" if os.getenv("WEBSHARE_API_TOKEN") else "auto"
 
@@ -215,11 +227,14 @@ def configure_proxy(
     webshare_password: Optional[str] = None,
     http_proxy: Optional[str] = None,
     https_proxy: Optional[str] = None,
+    *,
+    exclusive: bool = False,
 ) -> None:
     """Configure the transcript API to use a proxy as the *primary* client.
 
-    The dynamic Webshare pool (``WEBSHARE_API_TOKEN``) is unaffected by this
-    call; it remains as the first leg of the route ladder when present.
+    By default the dynamic Webshare pool remains the first leg of an ``auto``
+    route ladder. With ``exclusive=True`` the configured proxy is the only
+    route; this is the behavior of the CLI's explicit ``--proxy`` option.
 
     For Webshare (legacy single rotating endpoint):
         configure_proxy(webshare_username="user", webshare_password="pass")
@@ -228,24 +243,56 @@ def configure_proxy(
         configure_proxy(http_proxy="http://user:pass@host:port")
     """
     global _api, _proxy_configured, _initialized, _proxy_source
+    global _primary_override
 
     if webshare_username and webshare_password:
         _api = _build_webshare_api(webshare_username, webshare_password)
         _proxy_source = "legacy-webshare"
+        _primary_override = {
+            "kind": "webshare",
+            "username": webshare_username,
+            "password": webshare_password,
+        }
     elif http_proxy or https_proxy:
         _api = _build_generic_proxy_api(http_proxy or https_proxy, https_proxy)
         _proxy_source = "explicit-proxy"
+        _primary_override = {
+            "kind": "generic",
+            "http_proxy": http_proxy or https_proxy,
+            "https_proxy": https_proxy,
+        }
     else:
         raise ValueError("Must provide either Webshare credentials or proxy URL")
 
     _proxy_configured = True
     _initialized = True
+    if exclusive:
+        os.environ["FILMOT_PROXY_MODE"] = "primary-only"
 
 
 def get_api() -> YouTubeTranscriptApi:
     """Get the configured API instance."""
     _init_api()
     return _api
+
+
+def _fresh_primary_api() -> YouTubeTranscriptApi:
+    """Build a primary client whose Requests session is owned by one fetch."""
+    _init_api()
+    if _primary_override:
+        if _primary_override["kind"] == "webshare":
+            return _build_webshare_api(
+                _primary_override["username"],
+                _primary_override["password"],
+            )
+        return _build_generic_proxy_api(
+            _primary_override["http_proxy"],
+            _primary_override["https_proxy"],
+        )
+    if _resolve_proxy_mode() == "direct-only":
+        return _build_direct_api()
+    api, _, _ = _primary_from_environment()
+    return api
 
 
 def disable_proxy() -> None:
@@ -255,10 +302,12 @@ def disable_proxy() -> None:
     dynamic pool is also skipped, then resets the primary client.
     """
     global _api, _proxy_configured, _initialized, _proxy_source
+    global _primary_override
     os.environ["FILMOT_PROXY_MODE"] = "direct-only"
     _api = _build_direct_api()
     _proxy_configured = False
     _proxy_source = "direct"
+    _primary_override = None
     _initialized = True
 
 
@@ -270,8 +319,9 @@ def is_proxy_configured() -> bool:
 
 def reset_api() -> None:
     """Reset to default API without proxy."""
-    global _initialized
+    global _initialized, _primary_override
     _initialized = False
+    _primary_override = None
     _init_api()
 
 
@@ -286,7 +336,7 @@ def routing_plan() -> dict:
     """
     _init_api()
     mode = _resolve_proxy_mode()
-    pool = None if mode == "direct-only" else get_pool()
+    pool = None if mode in {"direct-only", "primary-only"} else get_pool()
     routes = []
     if pool is not None and mode in {"auto", "proxy-only"}:
         routes.append(
@@ -314,7 +364,7 @@ def routing_plan() -> dict:
     else:
         primary_label = _proxy_source
         primary_is_proxy = _proxy_configured
-        if mode == "auto":
+        if mode in {"auto", "primary-only"}:
             routes.append(
                 {
                     "kind": "primary",
@@ -398,6 +448,7 @@ def get_transcript(
     *,
     route_timeout: Optional[float] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    fresh_primary: bool = False,
 ) -> dict:
     """
     Fetch the full transcript for a YouTube video.
@@ -434,7 +485,14 @@ def get_transcript(
         else _env_timeout("FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT)
     )
 
-    for attempt_number, (label, api, on_outcome) in enumerate(_iter_routes(), 1):
+    for attempt_number, (label, api, on_outcome) in enumerate(
+        _iter_routes(
+            progress_callback,
+            route_errors,
+            fresh_primary=fresh_primary,
+        ),
+        1,
+    ):
         attempts.append(label)
         started = time.monotonic()
         _emit_progress(
@@ -469,11 +527,18 @@ def get_transcript(
                 error_type=type(terminal).__name__,
                 error=str(terminal),
             )
-            return _terminal_error_result(terminal, video_id, label)
+            return _terminal_error_result(
+                terminal,
+                video_id,
+                label,
+                routes_tried=attempts,
+                route_errors=route_errors,
+            )
         except Exception as exc:  # noqa: BLE001 - we re-raise via result dict
             kind = classify_transport_error(exc)
+            safe_error = redact_sensitive_text(exc)
             if on_outcome is not None:
-                on_outcome("failure", (kind or "other", str(exc)))
+                on_outcome("failure", (kind or "other", safe_error))
             last_error = exc
             elapsed = time.monotonic() - started
             route_errors.append(
@@ -481,7 +546,7 @@ def get_transcript(
                     "route": label,
                     "kind": kind or "other",
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "error": safe_error,
                     "elapsed_s": elapsed,
                 }
             )
@@ -497,7 +562,7 @@ def get_transcript(
                 elapsed_s=elapsed,
                 kind=kind or "other",
                 error_type=type(exc).__name__,
-                error=str(exc),
+                error=safe_error,
             )
             if not kind:
                 # Unknown / non-transport error — stop retrying.
@@ -510,6 +575,8 @@ def get_transcript(
         if isinstance(result, dict) and "error" not in result:
             result["route"] = label
             result["route_elapsed_seconds"] = time.monotonic() - started
+            result["routes_tried"] = list(attempts)
+            result["route_errors"] = list(route_errors)
         _emit_progress(
             progress_callback,
             event="route_success",
@@ -520,8 +587,11 @@ def get_transcript(
         return result
 
     if last_error is not None:
-        error_msg = str(last_error)
+        error_msg = redact_sensitive_text(last_error)
         error_type = type(last_error).__name__
+    elif route_errors:
+        error_msg = route_errors[-1]["error"]
+        error_type = route_errors[-1]["error_type"]
     elif _resolve_proxy_mode() == "proxy-only":
         error_msg = (
             "No proxy route is available in proxy-only mode. Configure a "
@@ -598,17 +668,36 @@ def _call_with_route_timeout(
     raise value
 
 
-def _terminal_error_result(exc: Exception, video_id: str, route: str) -> dict:
+def _terminal_error_result(
+    exc: Exception,
+    video_id: str,
+    route: str,
+    *,
+    routes_tried: Optional[list[str]] = None,
+    route_errors: Optional[list[dict]] = None,
+) -> dict:
     if isinstance(exc, TranscriptsDisabled):
         msg = "Transcripts are disabled for this video"
     elif isinstance(exc, VideoUnavailable):
         msg = "Video is unavailable"
     else:
         msg = str(exc) or "No transcript available"
-    return {"error": msg, "video_id": video_id, "route": route}
+    return {
+        "error": redact_sensitive_text(msg),
+        "error_type": type(exc).__name__,
+        "video_id": video_id,
+        "route": route,
+        "routes_tried": list(routes_tried or [route]),
+        "route_errors": list(route_errors or []),
+    }
 
 
-def _iter_routes():
+def _iter_routes(
+    progress_callback: Optional[Callable[[dict], None]] = None,
+    setup_errors: Optional[list[dict]] = None,
+    *,
+    fresh_primary: bool = False,
+):
     """Yield ``(label, api_client, on_outcome)`` tuples per the active mode.
 
     ``on_outcome`` is a callable invoked once per attempt with either
@@ -620,16 +709,50 @@ def _iter_routes():
     # could capture the default label before get_api inspected the environment.
     _init_api()
     mode = _resolve_proxy_mode()
-    pool = None if mode == "direct-only" else get_pool()
+    pool = None if mode in {"direct-only", "primary-only"} else get_pool()
 
     # 1. Pool sessions (try up to N).
     if pool is not None and mode in {"auto", "proxy-only"}:
+        # ``pick`` may refresh an empty/stale API-backed pool. Announce that
+        # bounded management step before it begins so the CLI never appears
+        # frozen while preparing the first route.
+        _emit_progress(
+            progress_callback,
+            event="pool_prepare",
+            route=f"{pool.source} pool",
+            available_sessions=pool.available_count(),
+            max_attempts=_POOL_RETRY_LIMIT,
+        )
         for _ in range(_POOL_RETRY_LIMIT):
-            session = pool.pick()
+            try:
+                session = pool.pick(lease=True)
+            except WebshareProxyError as exc:
+                safe_error = redact_sensitive_text(exc)
+                error = {
+                    "route": f"pool:{pool.source}:refresh",
+                    "kind": "pool_refresh",
+                    "error_type": type(exc).__name__,
+                    "error": safe_error,
+                    "elapsed_s": 0.0,
+                }
+                if setup_errors is not None:
+                    setup_errors.append(error)
+                _emit_progress(
+                    progress_callback,
+                    event="pool_prepare_failed",
+                    route=f"{pool.source} pool",
+                    error_type=type(exc).__name__,
+                    error=safe_error,
+                )
+                break
             if session is None:
                 break
             url = pool.proxy_url(session)
-            api = _build_generic_proxy_api(url, url)
+            try:
+                api = _build_generic_proxy_api(url, url)
+            except Exception:
+                pool.release(session)
+                raise
 
             def _cb(outcome, info, _s=session, _p=pool):
                 if outcome == "success":
@@ -642,9 +765,13 @@ def _iter_routes():
 
     # 2. Primary client (direct, env-proxy, legacy-webshare, or operator-supplied).
     if mode == "direct-only":
-        yield ("direct", get_api(), None)
-    elif mode == "auto":
-        primary_api = get_api()
+        yield (
+            "direct",
+            _fresh_primary_api() if fresh_primary else get_api(),
+            None,
+        )
+    elif mode in {"auto", "primary-only"}:
+        primary_api = _fresh_primary_api() if fresh_primary else get_api()
         primary_label = _proxy_source
         yield (primary_label, primary_api, None)
 
@@ -713,9 +840,13 @@ def probe_pool_session(
         return result
     except Exception as exc:  # noqa: BLE001 - normalized to a result
         kind = classify_transport_error(exc) or "other"
-        pool.report_failure(session, kind, summary=str(exc))
+        safe_error = redact_sensitive_text(
+            exc,
+            (session.username, session.password),
+        )
+        pool.report_failure(session, kind, summary=safe_error)
         result = {
-            "error": str(exc),
+            "error": safe_error,
             "error_type": type(exc).__name__,
             "video_id": video_id,
             "route": label,
@@ -735,7 +866,7 @@ def probe_pool_session(
             elapsed_s=result["route_elapsed_seconds"],
             kind=kind,
             error_type=type(exc).__name__,
-            error=str(exc),
+            error=safe_error,
         )
         return result
 
@@ -827,6 +958,10 @@ def get_transcript_with_timestamps(
     video_id: str,
     languages: Optional[list[str]] = None,
     chunk_minutes: float = 5.0,
+    *,
+    route_timeout: Optional[float] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+    fresh_primary: bool = False,
 ) -> dict:
     """
     Fetch transcript with timestamps, optionally chunked into time segments.
@@ -838,11 +973,20 @@ def get_transcript_with_timestamps(
         video_id: YouTube video ID or URL
         languages: Preferred languages
         chunk_minutes: Group segments into chunks of this duration
+        route_timeout: Maximum wall-clock seconds for each route attempt
+        progress_callback: Optional callable receiving structured route events
         
     Returns:
         dict with chunked transcript for easier navigation
     """
-    result = get_transcript(video_id, languages, preserve_formatting=False)
+    result = get_transcript(
+        video_id,
+        languages,
+        preserve_formatting=False,
+        route_timeout=route_timeout,
+        progress_callback=progress_callback,
+        fresh_primary=fresh_primary,
+    )
     
     if 'error' in result:
         return result
@@ -965,6 +1109,7 @@ def get_transcript_with_fallback(
     aws_progress_callback=None,
     route_timeout: Optional[float] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    fresh_primary: bool = False,
 ) -> dict:
     """
     Fetch transcript with AWS Transcribe fallback.
@@ -1013,6 +1158,7 @@ def get_transcript_with_fallback(
         preserve_formatting,
         route_timeout=route_timeout,
         progress_callback=progress_callback,
+        fresh_primary=fresh_primary,
     )
     
     if 'error' not in result:
@@ -1024,6 +1170,15 @@ def get_transcript_with_fallback(
     # If fallback disabled, return the error
     if not use_aws_fallback:
         return result
+
+    youtube_routes_tried = list(result.get("routes_tried") or [])
+    youtube_route_metadata = {
+        "youtube_error": youtube_error,
+        "youtube_error_type": result.get("error_type"),
+        "youtube_routes_tried": youtube_routes_tried,
+        "routes_tried": [*youtube_routes_tried, "aws-transcribe"],
+        "route_errors": list(result.get("route_errors") or []),
+    }
     
     # Try AWS Transcribe fallback
     try:
@@ -1033,8 +1188,14 @@ def get_transcript_with_fallback(
         deps_ok, deps_msg = check_dependencies()
         if not deps_ok:
             return {
-                'error': f"YouTube error: {youtube_error}. AWS fallback unavailable: {deps_msg}",
+                'error': redact_sensitive_text(
+                    f"YouTube error: {youtube_error}. "
+                    f"AWS fallback unavailable: {deps_msg}"
+                ),
+                'error_type': 'FallbackUnavailable',
                 'video_id': video_id,
+                'route': 'aws-transcribe',
+                **youtube_route_metadata,
             }
         
         # Run transcription
@@ -1054,10 +1215,17 @@ def get_transcript_with_fallback(
             'duration_seconds': 0,
             'segment_count': 0,
             'source': 'aws_transcribe',
+            'route': 'aws-transcribe',
+            **youtube_route_metadata,
         }
         
     except Exception as e:
         return {
-            'error': f"YouTube error: {youtube_error}. AWS fallback error: {str(e)}",
+            'error': redact_sensitive_text(
+                f"YouTube error: {youtube_error}. AWS fallback error: {e}"
+            ),
+            'error_type': type(e).__name__,
             'video_id': video_id,
+            'route': 'aws-transcribe',
+            **youtube_route_metadata,
         }

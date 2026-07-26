@@ -54,22 +54,29 @@ def normalize_topic_name(name: str, fallback: str = "uncategorized") -> str:
     if not canonical:
         return fallback
 
-    slug_chars = []
-    separator_pending = False
-    for char in canonical:
-        category = unicodedata.category(char)
-        is_word_char = category[0] in {"L", "N"} or (
-            category[0] == "M" and bool(slug_chars)
-        )
-        if is_word_char:
-            if separator_pending and slug_chars and slug_chars[-1] != "-":
-                slug_chars.append("-")
-            slug_chars.append(char)
-            separator_pending = False
-        else:
-            separator_pending = bool(slug_chars)
-
-    slug = "".join(slug_chars).strip("-")
+    if canonical.isascii():
+        # Preserve the exact historical mapping for existing ASCII topics.
+        # In particular, punctuation inside a token was removed rather than
+        # turned into a separator: ``foo.bar`` has always lived at ``foobar``.
+        slug = re.sub(r"[\s_]+", "-", canonical)
+        slug = re.sub(r"[^a-z0-9\-]", "", slug)
+        slug = re.sub(r"-+", "-", slug).strip("-")
+    else:
+        slug_chars = []
+        separator_pending = False
+        for char in canonical:
+            category = unicodedata.category(char)
+            is_word_char = category[0] in {"L", "N"} or (
+                category[0] == "M" and bool(slug_chars)
+            )
+            if is_word_char:
+                if separator_pending and slug_chars and slug_chars[-1] != "-":
+                    slug_chars.append("-")
+                slug_chars.append(char)
+                separator_pending = False
+            else:
+                separator_pending = bool(slug_chars)
+        slug = "".join(slug_chars).strip("-")
     if not slug:
         # Keep this independent of the caller's empty-name fallback so library
         # and ledger canonicalization remain identical for the same non-empty
@@ -174,6 +181,8 @@ class TranscriptLibrary:
             try:
                 with open(source_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                if not isinstance(data, dict):
+                    continue
                 data["topic"] = canonical_slug
                 with open(destination_path, "x", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)

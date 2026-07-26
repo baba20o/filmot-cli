@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import requests
 
 import filmot.proxy_pool as pp_mod
 from filmot.proxy_pool import (
@@ -75,6 +76,16 @@ class TestClassifyTransportError:
 
     def test_ssl(self):
         assert classify_transport_error(Exception("SSL: UNEXPECTED_EOF_WHILE_READING")) == "connection"
+
+    def test_common_connection_error_messages(self):
+        assert classify_transport_error(
+            requests.ConnectionError(
+                "Failed to establish a new connection"
+            )
+        ) == "connection"
+        assert classify_transport_error(
+            Exception("Remote end closed connection without response")
+        ) == "connection"
 
     def test_unknown(self):
         assert classify_transport_error(ValueError("unparseable")) == ""
@@ -195,6 +206,45 @@ class TestPick:
             picked = pool.pick()
         assert picked is not None and picked.id == "b-US-1"
 
+    def test_empty_pool_preserves_refresh_error(self, tmp_path):
+        pool = _make_pool(tmp_path, sessions=[])
+        pool._last_refresh = 0
+        with patch.object(
+            pool,
+            "_api_get",
+            side_effect=WebshareProxyError("Webshare rejected token (401)"),
+        ):
+            with pytest.raises(WebshareProxyError, match="401"):
+                pool.pick()
+
+    def test_can_exclude_already_attempted_sessions(self, tmp_path):
+        pool = _make_pool(tmp_path, sessions=[
+            WebshareSession(id="b-US-1", username="u1", password="p1"),
+            WebshareSession(id="b-US-2", username="u2", password="p2"),
+        ])
+
+        first = pool.pick()
+        second = pool.pick(exclude_ids={first.id})
+
+        assert second is not None
+        assert second.id != first.id
+        assert pool.pick(exclude_ids={first.id, second.id}) is None
+
+    def test_lease_excludes_in_flight_sessions_until_release(self, tmp_path):
+        first = WebshareSession(id="b-US-1", username="u1", password="p1")
+        second = WebshareSession(id="b-US-2", username="u2", password="p2")
+        # _make_pool deliberately constructs via __new__ and does not initialize
+        # lease state, exercising backwards-compatible lazy initialization.
+        pool = _make_pool(tmp_path, sessions=[first, second])
+
+        assert pool.pick(lease=True) is first
+        assert pool.pick(lease=True) is second
+        assert pool.pick() is None
+
+        pool.release(first)
+        pool.release(first)  # public release is idempotent
+        assert pool.pick(lease=True) is first
+
 
 # ── report_success / report_failure ───────────────────────────────
 
@@ -227,6 +277,41 @@ class TestReportOutcome:
         pool.report_failure(s, "blocked", summary="IpBlocked")
         assert s.fail_blocked == 1
         assert (s.cooldown_until - before) > 10 * 60
+
+    def test_outcomes_release_leased_sessions(self, tmp_path):
+        successful = WebshareSession(id="b-US-1", username="u1", password="p1")
+        failed = WebshareSession(id="b-US-2", username="u2", password="p2")
+        pool = _make_pool(tmp_path, sessions=[successful, failed])
+
+        assert pool.pick(lease=True) is successful
+        pool.report_success(successful)
+        assert successful.id not in pool._in_flight_ids
+
+        assert pool.pick(lease=True) is failed
+        pool.report_failure(failed, "connection", summary="timed out")
+        assert failed.id not in pool._in_flight_ids
+        assert pool.status_snapshot()["in_flight"] == 0
+
+    def test_failure_summary_redacts_proxy_credentials(self, tmp_path):
+        s = WebshareSession(
+            id="b-US-1",
+            username="secret-user",
+            password="secret-password",
+        )
+        pool = _make_pool(tmp_path, sessions=[s])
+
+        pool.report_failure(
+            s,
+            "connection",
+            summary=(
+                "ProxyError http://secret-user:"
+                "secret-password@proxy.example:80 failed"
+            ),
+        )
+
+        assert "secret-user" not in s.last_error
+        assert "secret-password" not in s.last_error
+        assert "***:***@proxy.example" in s.last_error
 
     def test_retires_after_threshold(self, tmp_path):
         s = WebshareSession(id="b-US-1", username="u", password="p")
@@ -266,6 +351,29 @@ class TestStatusSnapshot:
         assert pool.recently_healthy_count() == 1
         assert pool.status_snapshot()["sessions"][0]["state"] == "ready-tested"
 
+    def test_in_flight_session_is_not_available_or_healthy(self, tmp_path):
+        session = WebshareSession(
+            id="b-US-1",
+            username="u",
+            password="p",
+            success=1,
+            last_success_at=time.time(),
+        )
+        pool = _make_pool(tmp_path, sessions=[session])
+
+        assert pool.pick(lease=True) is session
+        snap = pool.status_snapshot()
+
+        assert pool.available_count() == 0
+        assert pool.recently_healthy_count() == 0
+        assert snap["available"] == 0
+        assert snap["recently_healthy"] == 0
+        assert snap["healthy"] == 0
+        assert snap["in_flight"] == 1
+        assert snap["sessions"][0]["in_flight"] is True
+        assert snap["sessions"][0]["available"] is False
+        assert snap["sessions"][0]["state"] == "in-flight"
+
     def test_expired_success_is_available_but_stale(self, tmp_path):
         session = WebshareSession(
             id="b-US-1",
@@ -280,6 +388,24 @@ class TestStatusSnapshot:
         assert snap["available"] == 1
         assert snap["recently_healthy"] == 0
         assert snap["sessions"][0]["state"] == "ready-stale"
+
+    def test_newer_failure_is_not_recently_healthy_after_cooldown(self, tmp_path):
+        session = WebshareSession(
+            id="b-US-1",
+            username="u",
+            password="p",
+            success=1,
+            last_success_at=time.time() - 10,
+            last_failure_at=time.time(),
+            consecutive_failures=1,
+            cooldown_until=time.time() - 1,
+        )
+        pool = _make_pool(tmp_path, sessions=[session])
+
+        snap = pool.status_snapshot()
+
+        assert snap["recently_healthy"] == 0
+        assert snap["sessions"][0]["state"] == "ready-failing"
 
     def test_cooling_and_failing_are_reported_separately(self, tmp_path):
         session = WebshareSession(id="b-US-1", username="u", password="p")

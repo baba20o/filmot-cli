@@ -64,6 +64,17 @@ class TestNormalizeTopic:
         assert normalize_topic_name("My_topic! name") == "my-topic-name"
         assert library._normalize_topic("My_topic! name") == "my-topic-name"
 
+    @pytest.mark.parametrize(("topic", "legacy_slug"), [
+        ("foo.bar", "foobar"),
+        ("foo/bar", "foobar"),
+        ("C#.NET", "cnet"),
+        ("my(topic)", "mytopic"),
+    ])
+    def test_internal_ascii_punctuation_preserves_legacy_slug(
+        self, library, topic, legacy_slug
+    ):
+        assert library._normalize_topic(topic) == legacy_slug
+
 
 # ── Save / Get ───────────────────────────────────────────────────
 
@@ -152,6 +163,45 @@ class TestSaveAndGet:
         # directory until an operator explicitly chooses its owner.
         assert library.get("vid123456789", "AI 人工知能") is None
         assert library.get("vid123456789", "AI 초전도체") is None
+
+    def test_legacy_migration_preserves_non_object_json(self, library):
+        legacy_dir = library.transcripts_dir / "uncategorized"
+        legacy_dir.mkdir()
+        invalid_shape = legacy_dir / "not-an-entry.json"
+        invalid_shape.write_text("[]", encoding="utf-8")
+
+        assert library.migrate_legacy_topic("人工知能") == 0
+        assert invalid_shape.read_text(encoding="utf-8") == "[]"
+
+
+class TestLedgerRobustness:
+    def test_non_object_jsonl_records_are_ignored_and_preserved_on_migration(
+        self, tmp_path
+    ):
+        from filmot.ledger import (
+            list_sessions,
+            migrate_legacy_session,
+            read_events,
+        )
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        legacy = sessions_dir / "uncategorized.jsonl"
+        legacy.write_text(
+            "[]\n"
+            + json.dumps({
+                "ts": "2026-01-01T00:00:00",
+                "kind": "research",
+                "query": "人工知能",
+            }, ensure_ascii=False)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        assert migrate_legacy_session("人工知能", str(tmp_path)) == 1
+        assert legacy.read_text(encoding="utf-8") == "[]\n"
+        assert len(read_events("人工知能", str(tmp_path))) == 1
+        assert all(row["name"] != "uncategorized" for row in list_sessions(str(tmp_path)))
 
 
 # ── Exists ────────────────────────────────────────────────────────
