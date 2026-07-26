@@ -4,7 +4,7 @@ import pytest
 import json
 from pathlib import Path
 
-from filmot.library import TranscriptLibrary
+from filmot.library import TranscriptLibrary, normalize_topic_name
 
 
 # ── Topic normalization ──────────────────────────────────────────
@@ -30,11 +30,39 @@ class TestNormalizeTopic:
     def test_empty_returns_uncategorized(self, library):
         assert library._normalize_topic("") == "uncategorized"
 
-    def test_only_special_chars(self, library):
-        assert library._normalize_topic("!!!") == "uncategorized"
+    def test_only_special_chars_get_distinct_stable_slugs(self, library):
+        exclamation = library._normalize_topic("!!!")
+        assert exclamation.startswith("topic-")
+        assert exclamation == library._normalize_topic("!!!")
+        assert exclamation != library._normalize_topic("???")
 
     def test_multiple_hyphens_collapsed(self, library):
         assert library._normalize_topic("a--b---c") == "a-b-c"
+
+    @pytest.mark.parametrize("topic", [
+        "人工知能",
+        "초전도체",
+        "искусственный интеллект",
+        "الذكاء الاصطناعي",
+    ])
+    def test_non_latin_topics_remain_readable(self, library, topic):
+        slug = library._normalize_topic(topic)
+        assert slug not in {"uncategorized", "session"}
+        assert any(char.isalnum() for char in slug)
+
+    def test_non_latin_topics_are_distinct(self, library):
+        topics = ["人工知能", "초전도체", "искусственный интеллект", "الذكاء الاصطناعي"]
+        assert len({library._normalize_topic(topic) for topic in topics}) == len(topics)
+
+    def test_unicode_equivalent_spellings_normalize_consistently(self, library):
+        assert library._normalize_topic("Ｃａｆé") == library._normalize_topic("Cafe\u0301")
+        assert library._normalize_topic("ИСКУССТВЕННЫЙ ИНТЕЛЛЕКТ") == (
+            library._normalize_topic("искусственный интеллект")
+        )
+
+    def test_shared_normalizer_preserves_historical_ascii_slugs(self, library):
+        assert normalize_topic_name("My_topic! name") == "my-topic-name"
+        assert library._normalize_topic("My_topic! name") == "my-topic-name"
 
 
 # ── Save / Get ───────────────────────────────────────────────────
@@ -80,6 +108,33 @@ class TestSaveAndGet:
         library.save("vid123456789", "ml", "second")
         result = library.get("vid123456789", "ml")
         assert result["transcript"] == "second"
+
+    def test_same_video_in_distinct_unicode_topics_does_not_overwrite(self, library):
+        library.save("vid123456789", "人工知能", "Japanese corpus")
+        library.save("vid123456789", "초전도체", "Korean corpus")
+
+        assert library.get("vid123456789", "人工知能")["transcript"] == "Japanese corpus"
+        assert library.get("vid123456789", "초전도체")["transcript"] == "Korean corpus"
+
+    def test_reads_and_explicitly_migrates_legacy_non_latin_topic(self, library):
+        legacy_dir = library.transcripts_dir / "uncategorized"
+        legacy_dir.mkdir()
+        legacy_file = legacy_dir / "vid123456789.json"
+        legacy_file.write_text(json.dumps({
+            "video_id": "vid123456789",
+            "topic": "uncategorized",
+            "saved_at": "2026-01-01T00:00:00",
+            "transcript": "legacy text",
+            "metadata": {},
+        }), encoding="utf-8")
+
+        # The ambiguous shared corpus must not be silently attributed to an
+        # arbitrary Unicode topic.
+        assert library.get("vid123456789", "人工知能") is None
+        assert library.migrate_legacy_topic("人工知能") == 1
+        migrated = library.get("vid123456789", "人工知能")
+        assert migrated["topic"] == "人工知能"
+        assert not legacy_file.exists()
 
 
 # ── Exists ────────────────────────────────────────────────────────
@@ -161,6 +216,24 @@ class TestSearch:
     def test_search_returns_match_count(self, populated_library):
         results = populated_library.search("neural")
         assert results[0]["match_count"] >= 1
+
+    def test_substring_search_preserves_match_mode_and_excerpt(self, library):
+        library.save(
+            "vid123456789",
+            "water",
+            "The facility consumed twelve liters before recycling two more liters.",
+        )
+
+        assert library.search("liter", topic="water") == []
+        results = library.search("liter", topic="water", substring=True)
+
+        assert results[0]["match_count"] == 2
+        assert results[0]["match_mode"] == "substring"
+        assert "liters" in results[0]["matches"][0]
+
+    def test_word_search_identifies_match_mode(self, populated_library):
+        results = populated_library.search("neural")
+        assert results[0]["match_mode"] == "word"
 
 
 # ── get_context ───────────────────────────────────────────────────

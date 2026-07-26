@@ -15,12 +15,88 @@ Structure:
             _index.json  (optional: metadata about all transcripts)
 """
 
+import hashlib
 import json
-import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+
+
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "con", "prn", "aux", "nul", "clock$",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+})
+_MAX_TOPIC_SLUG_LENGTH = 120
+
+
+def _short_hash(value: str) -> str:
+    """Return a stable suffix for otherwise lossy filesystem names."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+
+
+def normalize_topic_name(name: str, fallback: str = "uncategorized") -> str:
+    """Return a deterministic, Unicode-safe filesystem slug.
+
+    Existing ASCII topic names keep their historical spelling. Unicode letters,
+    combining marks, and numbers are retained instead of being discarded, so
+    investigations in different scripts no longer collapse into one directory.
+    NFKC normalization plus case-folding makes canonically equivalent spellings
+    resolve to the same slug.
+
+    A non-empty name containing no letters or numbers receives a stable hashed
+    slug rather than sharing the generic fallback. This matters for punctuation-
+    or symbol-only topics, which were previously all stored together.
+    """
+    canonical = unicodedata.normalize("NFKC", str(name or "")).casefold().strip()
+    if not canonical:
+        return fallback
+
+    slug_chars = []
+    separator_pending = False
+    for char in canonical:
+        category = unicodedata.category(char)
+        is_word_char = category[0] in {"L", "N"} or (
+            category[0] == "M" and bool(slug_chars)
+        )
+        if is_word_char:
+            if separator_pending and slug_chars and slug_chars[-1] != "-":
+                slug_chars.append("-")
+            slug_chars.append(char)
+            separator_pending = False
+        else:
+            separator_pending = bool(slug_chars)
+
+    slug = "".join(slug_chars).strip("-")
+    if not slug:
+        # Keep this independent of the caller's empty-name fallback so library
+        # and ledger canonicalization remain identical for the same non-empty
+        # punctuation/symbol-only topic.
+        return "topic-{}".format(_short_hash(canonical))
+
+    # Keep path components comfortably below Windows' filename limit and avoid
+    # device names that cannot be created there.
+    if len(slug) > _MAX_TOPIC_SLUG_LENGTH:
+        suffix = _short_hash(canonical)
+        slug = "{}-{}".format(
+            slug[:_MAX_TOPIC_SLUG_LENGTH - len(suffix) - 1].rstrip("-"),
+            suffix,
+        )
+    if slug in _WINDOWS_RESERVED_NAMES:
+        slug = "{}-{}".format(slug, _short_hash(canonical))
+
+    return slug
+
+
+def _legacy_normalize_topic(name: str, fallback: str = "uncategorized") -> str:
+    """Reproduce the pre-Unicode slug algorithm for compatibility/migration."""
+    normalized = str(name or "").lower().strip()
+    normalized = re.sub(r"[\s_]+", "-", normalized)
+    normalized = re.sub(r"[^a-z0-9\-]", "", normalized)
+    normalized = re.sub(r"-+", "-", normalized).strip("-")
+    return normalized or fallback
 
 
 class TranscriptLibrary:
@@ -41,18 +117,33 @@ class TranscriptLibrary:
         """
         Normalize topic name for filesystem.
         
-        Converts to lowercase, replaces spaces/special chars with hyphens.
+        Uses the shared Unicode-safe topic canonicalizer.
         """
-        # Lowercase and replace spaces/underscores with hyphens
-        normalized = topic.lower().strip()
-        normalized = re.sub(r'[\s_]+', '-', normalized)
-        # Remove any chars that aren't alphanumeric or hyphens
-        normalized = re.sub(r'[^a-z0-9\-]', '', normalized)
-        # Collapse multiple hyphens
-        normalized = re.sub(r'-+', '-', normalized)
-        # Strip leading/trailing hyphens
-        normalized = normalized.strip('-')
-        return normalized or "uncategorized"
+        return normalize_topic_name(topic)
+
+    def _topic_dirs_for_read(self, topic: str) -> List[Path]:
+        """Return the canonical topic directory or its legacy predecessor.
+
+        The old normalizer stripped Unicode from mixed-script names and collapsed
+        pure non-Latin topics into ``uncategorized``. A specific legacy slug is
+        safe to read as a compatibility fallback; the shared ``uncategorized``
+        directory is not, so assigning that corpus requires an explicit
+        :meth:`migrate_legacy_topic` call.
+        """
+        current = self.transcripts_dir / self._normalize_topic(topic)
+        if current.exists() and any(current.glob("*.json")):
+            return [current]
+
+        legacy_slug = _legacy_normalize_topic(topic)
+        legacy = self.transcripts_dir / legacy_slug
+        if (
+            legacy_slug != "uncategorized"
+            and legacy != current
+            and legacy.exists()
+            and any(legacy.glob("*.json"))
+        ):
+            return [legacy]
+        return [current]
     
     def _get_topic_dir(self, topic: str) -> Path:
         """Get the directory for a topic, creating if needed."""
@@ -60,6 +151,52 @@ class TranscriptLibrary:
         topic_dir = self.transcripts_dir / topic_normalized
         topic_dir.mkdir(parents=True, exist_ok=True)
         return topic_dir
+
+    def migrate_legacy_topic(self, topic: str) -> int:
+        """Move a pre-Unicode topic directory to its canonical location.
+
+        Migration is explicit because old pure non-Latin topics all shared the
+        same ``uncategorized`` directory, so Filmot cannot infer how that corpus
+        should be split. Call this only after the user has identified which new
+        topic owns the legacy directory. Existing destination files are never
+        overwritten; conflicts remain in the legacy directory.
+
+        Returns:
+            Number of transcript files migrated.
+        """
+        canonical_slug = self._normalize_topic(topic)
+        legacy_slug = _legacy_normalize_topic(topic)
+        if canonical_slug == legacy_slug:
+            return 0
+
+        source = self.transcripts_dir / legacy_slug
+        if not source.exists():
+            return 0
+
+        destination = self.transcripts_dir / canonical_slug
+        destination.mkdir(parents=True, exist_ok=True)
+        migrated = 0
+
+        for source_path in sorted(source.glob("*.json")):
+            destination_path = destination / source_path.name
+            if destination_path.exists():
+                continue
+            try:
+                with open(source_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                data["topic"] = canonical_slug
+                with open(destination_path, "x", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                source_path.unlink()
+                migrated += 1
+            except (json.JSONDecodeError, IOError, OSError):
+                continue
+
+        try:
+            source.rmdir()
+        except OSError:
+            pass
+        return migrated
     
     def _sanitize_video_id(self, video_id: str) -> str:
         """
@@ -121,10 +258,11 @@ class TranscriptLibrary:
         
         if topic:
             # Look in specific topic
-            file_path = self._get_topic_dir(topic) / f"{safe_id}.json"
-            if file_path.exists():
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+            for topic_dir in self._topic_dirs_for_read(topic):
+                file_path = topic_dir / f"{safe_id}.json"
+                if file_path.exists():
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        return json.load(f)
             return None
         
         # Search all topics
@@ -170,23 +308,23 @@ class TranscriptLibrary:
         Returns:
             List of transcript metadata
         """
-        topic_dir = self._get_topic_dir(topic)
         transcripts = []
         
-        for file_path in sorted(topic_dir.glob("*.json")):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                transcripts.append({
-                    "video_id": data.get("video_id"),
-                    "saved_at": data.get("saved_at"),
-                    "title": data.get("metadata", {}).get("title", "Unknown"),
-                    "channel": data.get("metadata", {}).get("channel", "Unknown"),
-                    "char_count": len(data.get("transcript", "")),
-                    "path": str(file_path),
-                })
-            except (json.JSONDecodeError, IOError):
-                continue
+        for topic_dir in self._topic_dirs_for_read(topic):
+            for file_path in sorted(topic_dir.glob("*.json")):
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    transcripts.append({
+                        "video_id": data.get("video_id"),
+                        "saved_at": data.get("saved_at"),
+                        "title": data.get("metadata", {}).get("title", "Unknown"),
+                        "channel": data.get("metadata", {}).get("channel", "Unknown"),
+                        "char_count": len(data.get("transcript", "")),
+                        "path": str(file_path),
+                    })
+                except (json.JSONDecodeError, IOError):
+                    continue
         
         return transcripts
     
@@ -219,15 +357,15 @@ class TranscriptLibrary:
 
         # Determine which topics to search
         if topic:
-            topics_to_search = [self._normalize_topic(topic)]
+            topic_dirs = self._topic_dirs_for_read(topic)
         else:
-            topics_to_search = [d.name for d in self.transcripts_dir.iterdir()
-                               if d.is_dir() and not d.name.startswith('_')]
+            topic_dirs = [d for d in self.transcripts_dir.iterdir()
+                          if d.is_dir() and not d.name.startswith('_')]
 
-        for topic_name in topics_to_search:
-            topic_dir = self.transcripts_dir / topic_name
+        for topic_dir in topic_dirs:
             if not topic_dir.exists():
                 continue
+            topic_name = topic_dir.name
 
             for file_path in topic_dir.glob("*.json"):
                 try:
@@ -245,6 +383,7 @@ class TranscriptLibrary:
                             "channel": data.get("metadata", {}).get("channel", "Unknown"),
                             "match_count": len(matches),
                             "matches": matches[:5],  # First 5 matches with context
+                            "match_mode": "substring" if substring else "word",
                         })
                 except (json.JSONDecodeError, IOError):
                     continue
@@ -350,10 +489,12 @@ class TranscriptLibrary:
         deleted = False
         
         if topic:
-            file_path = self._get_topic_dir(topic) / f"{safe_id}.json"
-            if file_path.exists():
-                file_path.unlink()
-                deleted = True
+            for topic_dir in self._topic_dirs_for_read(topic):
+                file_path = topic_dir / f"{safe_id}.json"
+                if file_path.exists():
+                    file_path.unlink()
+                    deleted = True
+                    break
         else:
             # Delete from all topics
             for topic_dir in self.transcripts_dir.iterdir():
