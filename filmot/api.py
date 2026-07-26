@@ -5,6 +5,7 @@ import time
 import logging
 import requests
 from typing import Optional, Dict, Any, List, Generator
+from .api_contract import FilmotAPIContractError, validate_api_response
 from .config import BASE_URL, get_headers, validate_config
 from .cache import get_cache
 from .rate_limiter import get_rate_limiter
@@ -86,7 +87,7 @@ class FilmotClient:
         self.last_query_rewrite = None
     
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None,
-                 data: Optional[Dict] = None, skip_cache: bool = False) -> Dict[str, Any]:
+                 data: Optional[Dict] = None, skip_cache: bool = False) -> Any:
         """Make an API request with caching, rate limiting, and 429 retry."""
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
 
@@ -101,6 +102,11 @@ class FilmotClient:
         if method == "GET" and self.use_cache and self.cache and not skip_cache:
             cached = self.cache.get(endpoint, params)
             if cached is not None:
+                try:
+                    validate_api_response(endpoint, cached)
+                except FilmotAPIContractError as contract_error:
+                    logger.error("%s", contract_error)
+                    return contract_error.as_response()
                 self.last_cache_hit = True
                 return cached
 
@@ -119,13 +125,26 @@ class FilmotClient:
                 )
                 response.raise_for_status()
                 result = response.json()
+                try:
+                    validate_api_response(endpoint, result)
+                except FilmotAPIContractError as contract_error:
+                    logger.error("%s", contract_error)
+                    return contract_error.as_response()
 
                 # Report success to adaptive rate limiter
                 if hasattr(self.rate_limiter, 'report_success'):
                     self.rate_limiter.report_success()
 
                 # Cache successful responses
-                if method == "GET" and self.use_cache and self.cache and "error" not in result:
+                if (
+                    method == "GET"
+                    and self.use_cache
+                    and self.cache
+                    and not (
+                        isinstance(result, dict)
+                        and "error" in result
+                    )
+                ):
                     self.cache.set(endpoint, params, result)
 
                 if attempt > 0:
@@ -166,13 +185,13 @@ class FilmotClient:
 
         return {"error": str(last_error) if last_error else "max retries exceeded"}
     
-    def get(self, endpoint: str, params: Optional[Dict] = None, skip_cache: bool = False) -> Dict[str, Any]:
+    def get(self, endpoint: str, params: Optional[Dict] = None, skip_cache: bool = False) -> Any:
         """Make a GET request."""
         return self._request("GET", endpoint, params=params, skip_cache=skip_cache)
     
     # ========== API ENDPOINTS ==========
     
-    def search_channels(self, term: str) -> Dict[str, Any]:
+    def search_channels(self, term: str) -> Any:
         """
         Find YouTube Channels by name or handle.
         
@@ -184,7 +203,7 @@ class FilmotClient:
         """
         return self.get("/getsearchchannels", params={"term": term})
     
-    def get_videos(self, video_ids: str, flags: Optional[int] = None) -> Dict[str, Any]:
+    def get_videos(self, video_ids: str, flags: Optional[int] = None) -> Any:
         """
         Get basic metadata for a single video or list of videos.
         

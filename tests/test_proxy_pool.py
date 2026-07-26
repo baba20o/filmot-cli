@@ -554,6 +554,33 @@ class TestGetPool:
 # ── persistence round-trip ────────────────────────────────────────
 
 class TestPersistence:
+    def test_public_pool_rejects_non_sqlite_health_state(self, tmp_path):
+        state_path = tmp_path / "credential-bearing-health.json"
+
+        with pytest.raises(WebshareProxyError, match="SQLite"):
+            WebshareProxyPool("test-token", state_path=state_path)
+
+        assert not state_path.exists()
+
+    def test_file_pool_rejects_non_sqlite_health_state(self, tmp_path):
+        state_path = tmp_path / "credential-bearing-file-health.json"
+        pool = WebshareProxyPool.__new__(WebshareProxyPool)
+
+        with pytest.raises(WebshareProxyError, match="SQLite"):
+            pool._init_file_backed(
+                [
+                    WebshareSession(
+                        id="session-id",
+                        username="secret-user",
+                        password="secret-password",
+                    )
+                ],
+                session_file_path=tmp_path / "sessions.txt",
+                state_path=state_path,
+            )
+
+        assert not state_path.exists()
+
     def test_load_after_save(self, tmp_path):
         pool = _make_pool(tmp_path, sessions=[
             WebshareSession(id="b-US-1", username="u", password="p", country_code="US")

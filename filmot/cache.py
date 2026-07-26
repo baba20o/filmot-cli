@@ -6,11 +6,13 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from .paths import user_cache_dir
+
 
 class Cache:
     """Simple file-based cache with TTL support."""
     
-    def __init__(self, cache_dir: str = ".filmot_cache", ttl: int = 3600):
+    def __init__(self, cache_dir=None, ttl: int = 3600):
         """
         Initialize the cache.
         
@@ -18,9 +20,9 @@ class Cache:
             cache_dir: Directory to store cache files
             ttl: Time-to-live in seconds (default: 1 hour)
         """
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = user_cache_dir(cache_dir)
         self.ttl = ttl
-        self.cache_dir.mkdir(exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._auto_purge()
     
     def _auto_purge(self) -> None:
@@ -192,8 +194,9 @@ _cache: Optional[Cache] = None
 
 
 def get_cache(ttl: int = 3600) -> Cache:
-    """Get or create the global cache instance."""
+    """Get the cache for the active per-user cache root."""
     global _cache
-    if _cache is None:
-        _cache = Cache(ttl=ttl)
+    root = user_cache_dir()
+    if _cache is None or _cache.cache_dir != root:
+        _cache = Cache(cache_dir=root, ttl=ttl)
     return _cache

@@ -76,6 +76,180 @@ class TestDownloadAudio:
         assert "HTTPS_PROXY" not in first_env
         assert second_env["HTTPS_PROXY"] == "http://proxy.example:8080"
 
+    @patch.dict(os.environ, {"FILMOT_PROXY_RETRY_LIMIT": "2"}, clear=False)
+    @patch("subprocess.run")
+    def test_pool_attempts_are_sequential_with_deadline_sized_leases(
+        self, mock_run, tmp_path
+    ):
+        from filmot.aws_transcribe import (
+            YTDLP_DOWNLOAD_TIMEOUT_SECONDS,
+            YTDLP_LEASE_MARGIN_SECONDS,
+        )
+        from filmot.proxy_pool import WebshareSession
+
+        first = WebshareSession(
+            id="raw-session-one",
+            username="proxy-user-one",
+            password="proxy-password-one",
+        )
+        second = WebshareSession(
+            id="raw-session-two",
+            username="proxy-user-two",
+            password="proxy-password-two",
+        )
+        urls = {
+            first.id: "http://proxy-user-one:proxy-password-one@proxy.test:80",
+            second.id: "http://proxy-user-two:proxy-password-two@proxy.test:80",
+        }
+        pool = MagicMock()
+        pool.source = "session-file"
+        events = []
+        remaining_sessions = iter((first, second))
+
+        def pick_session(**_kwargs):
+            session = next(remaining_sessions)
+            events.append(f"pick:{session.id}")
+            return session
+
+        def run_attempt(_command, **kwargs):
+            proxy_url = kwargs["env"]["HTTPS_PROXY"]
+            session = first if proxy_url == urls[first.id] else second
+            events.append(f"run:{session.id}")
+            if session is first:
+                return MagicMock(
+                    returncode=1,
+                    stdout="",
+                    stderr="proxy connection failed",
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        def report_failure(session, *_args, **_kwargs):
+            events.append(f"failure:{session.id}")
+
+        def report_success(session):
+            events.append(f"success:{session.id}")
+
+        pool.pick.side_effect = pick_session
+        pool.proxy_url.side_effect = lambda session: urls[session.id]
+        pool.redacted_session_id.side_effect = (
+            lambda session: f"redacted-{session.id[-3:]}"
+        )
+        pool.report_failure.side_effect = report_failure
+        pool.report_success.side_effect = report_success
+        mock_run.side_effect = run_attempt
+        (tmp_path / "abc12345678.mp3").write_bytes(b"audio")
+
+        with (
+            patch("filmot.proxy_pool.get_pool", return_value=pool),
+            patch(
+                "filmot.transcript._resolve_proxy_mode",
+                return_value="proxy-only",
+            ),
+        ):
+            path = download_audio("abc12345678", output_dir=str(tmp_path))
+
+        assert path.endswith("abc12345678.mp3")
+        assert pool.pick.call_count == 2
+        assert all(
+            call_item.kwargs["lease"] is True
+            and call_item.kwargs["lease_seconds"]
+            == (
+                YTDLP_DOWNLOAD_TIMEOUT_SECONDS
+                + YTDLP_LEASE_MARGIN_SECONDS
+            )
+            for call_item in pool.pick.call_args_list
+        )
+        assert events == [
+            f"pick:{first.id}",
+            f"run:{first.id}",
+            f"failure:{first.id}",
+            f"pick:{second.id}",
+            f"run:{second.id}",
+            f"success:{second.id}",
+        ]
+        command_text = " ".join(
+            part
+            for call_item in mock_run.call_args_list
+            for part in call_item.args[0]
+        )
+        assert "--proxy" not in command_text
+        for secret in (
+            first.id,
+            first.username,
+            first.password,
+            second.id,
+            second.username,
+            second.password,
+            urls[first.id],
+            urls[second.id],
+        ):
+            assert secret not in command_text
+        assert (
+            mock_run.call_args_list[0].kwargs["env"]["HTTPS_PROXY"]
+            == urls[first.id]
+        )
+        assert (
+            mock_run.call_args_list[1].kwargs["env"]["HTTPS_PROXY"]
+            == urls[second.id]
+        )
+        pool.report_success.assert_called_once_with(second)
+        pool.release.assert_not_called()
+
+    @patch.dict(os.environ, {"FILMOT_PROXY_RETRY_LIMIT": "1"}, clear=False)
+    @patch("subprocess.run")
+    def test_pool_failure_redacts_all_credentials(
+        self, mock_run, tmp_path
+    ):
+        from filmot.proxy_pool import WebshareSession
+
+        session = WebshareSession(
+            id="raw-session-id",
+            username="private-proxy-user",
+            password="private-proxy-password",
+        )
+        proxy_url = (
+            "http://private-proxy-user:private-proxy-password@proxy.test:80"
+        )
+        diagnostic = (
+            f"failed {session.id} {session.username} "
+            f"{session.password} via {proxy_url}"
+        )
+        pool = MagicMock()
+        pool.source = "session-file"
+        pool.pick.return_value = session
+        pool.proxy_url.return_value = proxy_url
+        pool.redacted_session_id.return_value = "session-deadbeef"
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr=diagnostic,
+        )
+
+        with (
+            patch("filmot.proxy_pool.get_pool", return_value=pool),
+            patch(
+                "filmot.transcript._resolve_proxy_mode",
+                return_value="proxy-only",
+            ),
+            pytest.raises(AWSTranscribeError) as raised,
+        ):
+            download_audio("abc12345678", output_dir=str(tmp_path))
+
+        message = str(raised.value)
+        summary = pool.report_failure.call_args.kwargs["summary"]
+        assert "session-deadbeef" in message
+        for secret in (
+            session.id,
+            session.username,
+            session.password,
+            proxy_url,
+        ):
+            assert secret not in message
+            assert secret not in summary
+        command = mock_run.call_args.args[0]
+        assert "--proxy" not in command
+        assert proxy_url not in " ".join(command)
+
 
 # ── upload_to_s3 ─────────────────────────────────────────────────
 

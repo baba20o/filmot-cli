@@ -30,6 +30,8 @@ _PROXY_ENV_VARS = (
     "ALL_PROXY",
     "all_proxy",
 )
+YTDLP_DOWNLOAD_TIMEOUT_SECONDS = 300
+YTDLP_LEASE_MARGIN_SECONDS = 30
 
 
 class AWSTranscribeError(Exception):
@@ -115,81 +117,154 @@ def download_audio(video_id: str, output_dir: Optional[str] = None) -> str:
         "--no-playlist",
     ]
 
-    # Build the attempt ladder: pool sessions first (when AWS-host IPs are blocked),
-    # then direct, then env-proxy. Each attempt is (label, command, env, on_outcome).
-    attempts = []
-    pool_attempts: list = []
-    try:
-        from .proxy_pool import get_pool, classify_transport_error
-        from .transcript import _resolve_proxy_mode
+    # Run the attempt ladder: pool sessions first (when AWS-host IPs are
+    # blocked), then direct, then env-proxy. Acquire only the session being
+    # attempted, with a lease longer than yt-dlp's hard deadline. Proxy
+    # credentials are passed only through the child environment, never through
+    # argv where process-list viewers could observe them.
+    from .proxy_pool import (
+        classify_transport_error,
+        get_pool,
+        redact_sensitive_text,
+    )
+    from .transcript import _resolve_proxy_mode
 
+    errors = []
+    succeeded = False
+    pool_attempted = False
+    try:
         mode = _resolve_proxy_mode()
         pool = None if mode == "direct-only" else get_pool()
-        if pool is not None and mode in {"auto", "proxy-only"}:
-            for _ in range(int(os.environ.get("FILMOT_PROXY_RETRY_LIMIT", "3"))):
-                session = pool.pick()
-                if session is None:
-                    break
-                proxy_url = pool.proxy_url(session)
-                cmd = base_command + ["--proxy", proxy_url, youtube_url]
-
-                def _cb(rc, stderr, _s=session, _p=pool, _ce=classify_transport_error):
-                    if rc == 0:
-                        _p.report_success(_s)
-                    else:
-                        kind = _ce(Exception(stderr or "")) or "other"
-                        _p.report_failure(_s, kind, summary=stderr[:200])
-
-                pool_attempts.append((f"pool:{session.id}", cmd, _direct_ytdlp_env(), _cb))
-        if mode == "direct-only" or mode == "auto":
-            pass  # direct/env attempts added below
     except Exception:
         # Pool is best-effort; never block AWS fallback because of pool errors.
         pool = None
         mode = "auto"
 
-    attempts.extend(pool_attempts)
-    if mode != "proxy-only" or not pool_attempts:
-        attempts.append((
+    if pool is not None and mode in {"auto", "proxy-only"}:
+        retry_limit = int(os.environ.get("FILMOT_PROXY_RETRY_LIMIT", "3"))
+        attempted_ids: set[str] = set()
+        for _ in range(retry_limit):
+            try:
+                session = pool.pick(
+                    lease=True,
+                    lease_seconds=(
+                        YTDLP_DOWNLOAD_TIMEOUT_SECONDS
+                        + YTDLP_LEASE_MARGIN_SECONDS
+                    ),
+                    exclude_ids=attempted_ids,
+                )
+            except Exception:
+                mode = "auto"
+                break
+            if session is None:
+                break
+            attempted_ids.add(session.id)
+            pool_attempted = True
+            try:
+                proxy_url = pool.proxy_url(session)
+            except BaseException:
+                pool.release(session)
+                raise
+            proxy_env = _direct_ytdlp_env()
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                proxy_env[key] = proxy_url
+            secrets = (
+                session.id,
+                session.username,
+                session.password,
+                proxy_url,
+            )
+            label = "pool:{}:{}".format(
+                pool.source,
+                pool.redacted_session_id(session),
+            )
+            try:
+                result = subprocess.run(
+                    base_command + [youtube_url],
+                    capture_output=True,
+                    text=True,
+                    timeout=YTDLP_DOWNLOAD_TIMEOUT_SECONDS,
+                    env=proxy_env,
+                )
+            except subprocess.TimeoutExpired:
+                pool.report_failure(
+                    session,
+                    "connection",
+                    summary="yt-dlp timed out",
+                )
+                raise AWSTranscribeError("Audio download timed out (5 minutes)")
+            except FileNotFoundError:
+                pool.release(session)
+                raise AWSTranscribeError("yt-dlp not found")
+            except BaseException:
+                pool.release(session)
+                raise
+
+            if result.returncode == 0:
+                pool.report_success(session)
+                succeeded = True
+                break
+
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"exit code {result.returncode}"
+            )
+            detail = redact_sensitive_text(detail, secrets)
+            kind = (
+                classify_transport_error(
+                    Exception(result.stderr or result.stdout or "")
+                )
+                or "other"
+            )
+            pool.report_failure(session, kind, summary=detail[:200])
+            errors.append(f"{label}: {detail}")
+
+    if not succeeded and (mode != "proxy-only" or not pool_attempted):
+        direct_attempts = [(
             "direct connection",
-            base_command + [youtube_url],
             _direct_ytdlp_env(),
-            None,
-        ))
+            (),
+        )]
         if any(os.environ.get(key) for key in _PROXY_ENV_VARS):
-            attempts.append((
+            environment = os.environ.copy()
+            direct_attempts.append((
                 "environment proxy",
-                base_command + [youtube_url],
-                os.environ.copy(),
-                None,
+                environment,
+                tuple(
+                    environment.get(key, "")
+                    for key in _PROXY_ENV_VARS
+                    if environment.get(key)
+                ),
             ))
 
-    errors = []
-    for label, command, env, on_outcome in attempts:
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5 minute timeout for download
-                env=env,
+        for label, environment, secrets in direct_attempts:
+            try:
+                result = subprocess.run(
+                    base_command + [youtube_url],
+                    capture_output=True,
+                    text=True,
+                    timeout=YTDLP_DOWNLOAD_TIMEOUT_SECONDS,
+                    env=environment,
+                )
+            except subprocess.TimeoutExpired:
+                raise AWSTranscribeError("Audio download timed out (5 minutes)")
+            except FileNotFoundError:
+                raise AWSTranscribeError("yt-dlp not found")
+
+            if result.returncode == 0:
+                succeeded = True
+                break
+
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"exit code {result.returncode}"
             )
-        except subprocess.TimeoutExpired:
-            if on_outcome is not None:
-                on_outcome(124, "timeout")
-            raise AWSTranscribeError("Audio download timed out (5 minutes)")
-        except FileNotFoundError:
-            raise AWSTranscribeError("yt-dlp not found")
+            detail = redact_sensitive_text(detail, secrets)
+            errors.append(f"{label}: {detail}")
 
-        if on_outcome is not None:
-            on_outcome(result.returncode, result.stderr or "")
-
-        if result.returncode == 0:
-            break
-
-        detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
-        errors.append(f"{label}: {detail}")
-    else:
+    if not succeeded:
         raise AWSTranscribeError(f"yt-dlp failed: {' | '.join(errors)}")
     
     mp3_path = output_path / f"{video_id}.mp3"

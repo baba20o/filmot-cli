@@ -2,29 +2,38 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  ubuntu:
+    name: Ubuntu / ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - python-version: "3.9"
+          - label: Python 3.9 floor
+            python-version: "3.9"
             transcript_dependency: "youtube-transcript-api==1.1.0"
-          - python-version: "3.x"
+          - label: Python 3.14 latest
+            python-version: "3.14"
             transcript_dependency: "youtube-transcript-api>=1.1.0"
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -41,3 +50,29 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest -q
+
+  windows-cancellation:
+    name: Windows / transcript cancellation
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" "youtube-transcript-api>=1.1.0"
+
+      - name: Run transcript worker and cancellation tests
+        run: >-
+          python -m pytest -q
+          tests/test_transcript.py
+          tests/test_transcript_worker.py
+          tests/test_process.py

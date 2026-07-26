@@ -6,6 +6,10 @@ from unittest.mock import patch, MagicMock
 import time
 import filmot.transcript as transcript_module
 
+from filmot._process import (
+    IsolatedWorkerProtocolError,
+    IsolatedWorkerTimeout,
+)
 from filmot.transcript import (
     TranscriptRouteTimeout,
     describe_routing_plan,
@@ -16,6 +20,28 @@ from filmot.transcript import (
     probe_pool_session,
     routing_plan,
 )
+
+
+def _worker_success(result):
+    return {
+        "protocol_version": 1,
+        "status": "success",
+        "result": result,
+    }
+
+
+def _worker_error(status, error_type, message, failure_kind=None):
+    error = {
+        "error_type": error_type,
+        "message": message,
+    }
+    if failure_kind is not None:
+        error["failure_kind"] = failure_kind
+    return {
+        "protocol_version": 1,
+        "status": status,
+        "error": error,
+    }
 
 
 # ── extract_video_id ──────────────────────────────────────────────
@@ -88,21 +114,21 @@ class TestFormatTimestamp:
 class TestGetTranscript:
     """Tests for get_transcript() with mocked API."""
 
-    @patch("filmot.transcript.get_api")
-    def test_success(self, mock_get_api):
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_success(self, mock_route):
         """Successful transcript fetch returns expected structure."""
-        mock_api = MagicMock()
-        mock_get_api.return_value = mock_api
-
-        # Build a mock transcript object that is iterable
-        seg1 = MagicMock(text="Hello", start=0.0, duration=1.5)
-        seg2 = MagicMock(text="world", start=1.5, duration=1.0)
-        mock_transcript = MagicMock()
-        mock_transcript.__iter__ = MagicMock(return_value=iter([seg1, seg2]))
-        mock_transcript.video_id = "abc12345678"
-        mock_transcript.language_code = "en"
-        mock_transcript.is_generated = True
-        mock_api.fetch.return_value = mock_transcript
+        mock_route.return_value = _worker_success({
+            "video_id": "abc12345678",
+            "language": "en",
+            "is_generated": True,
+            "segments": [
+                {"text": "Hello", "start": 0.0, "duration": 1.5},
+                {"text": "world", "start": 1.5, "duration": 1.0},
+            ],
+            "full_text": "Hello world",
+            "duration_seconds": 2.5,
+            "segment_count": 2,
+        })
 
         result = get_transcript("abc12345678")
 
@@ -114,52 +140,51 @@ class TestGetTranscript:
         assert "Hello" in result["full_text"]
         assert "world" in result["full_text"]
 
-    @patch("filmot.transcript.get_api")
-    def test_transcripts_disabled(self, mock_get_api):
-        from youtube_transcript_api._errors import TranscriptsDisabled
-
-        mock_api = MagicMock()
-        mock_get_api.return_value = mock_api
-        mock_api.fetch.side_effect = TranscriptsDisabled("abc12345678")
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_transcripts_disabled(self, mock_route):
+        mock_route.return_value = _worker_error(
+            "terminal",
+            "TranscriptsDisabled",
+            "captions disabled",
+        )
 
         result = get_transcript("abc12345678")
         assert "error" in result
         assert "disabled" in result["error"].lower()
 
-    @patch("filmot.transcript.get_api")
-    def test_video_unavailable(self, mock_get_api):
-        from youtube_transcript_api._errors import VideoUnavailable
-
-        mock_api = MagicMock()
-        mock_get_api.return_value = mock_api
-        mock_api.fetch.side_effect = VideoUnavailable("abc12345678")
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_video_unavailable(self, mock_route):
+        mock_route.return_value = _worker_error(
+            "terminal",
+            "VideoUnavailable",
+            "unavailable",
+        )
 
         result = get_transcript("abc12345678")
         assert "error" in result
         assert "unavailable" in result["error"].lower()
 
-    @patch("filmot.transcript.get_api")
-    def test_url_input_extracts_id(self, mock_get_api):
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_url_input_extracts_id(self, mock_route):
         """Passing a URL correctly extracts the video ID."""
-        mock_api = MagicMock()
-        mock_get_api.return_value = mock_api
-
-        seg = MagicMock(text="Test", start=0.0, duration=1.0)
-        mock_transcript = MagicMock()
-        mock_transcript.__iter__ = MagicMock(return_value=iter([seg]))
-        mock_transcript.video_id = "dQw4w9WgXcQ"
-        mock_transcript.language_code = "en"
-        mock_transcript.is_generated = False
-        mock_api.fetch.return_value = mock_transcript
+        mock_route.return_value = _worker_success({
+            "video_id": "dQw4w9WgXcQ",
+            "language": "en",
+            "is_generated": False,
+            "segments": [{"text": "Test", "start": 0.0, "duration": 1.0}],
+            "full_text": "Test",
+            "duration_seconds": 1.0,
+            "segment_count": 1,
+        })
 
         result = get_transcript("https://youtu.be/dQw4w9WgXcQ")
         assert result["video_id"] == "dQw4w9WgXcQ"
+        assert mock_route.call_args.kwargs["video_id"] == "dQw4w9WgXcQ"
 
-    @patch("filmot.transcript._fetch_transcript_from_api")
-    def test_pool_session_retried_on_transport_error(self, mock_fetch):
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_pool_session_retried_on_transport_error(self, mock_route):
         """A transport-class failure on one pool session triggers a retry on the next."""
         from filmot.proxy_pool import WebshareProxyPool, WebshareSession
-        import filmot.proxy_pool as pp_mod
 
         # Two fake sessions in the pool, no auto-refresh.
         pool = WebshareProxyPool.__new__(WebshareProxyPool)
@@ -179,10 +204,18 @@ class TestGetTranscript:
         ]
         pool._last_refresh = 9e12  # far future, never refresh
         pool._cursor = 0
+        pool._file_backed = False
+        pool._health_store = None
+        pool._in_flight_ids = set()
 
-        mock_fetch.side_effect = [
-            Exception("Tunnel connection failed: 400 Bad Request"),
-            {
+        mock_route.side_effect = [
+            _worker_error(
+                "transport_error",
+                "ProxyError",
+                "Tunnel connection failed: 400 Bad Request",
+                "connection",
+            ),
+            _worker_success({
                 "video_id": "abc12345678",
                 "language": "en",
                 "is_generated": True,
@@ -190,7 +223,7 @@ class TestGetTranscript:
                 "full_text": "Recovered via second session",
                 "duration_seconds": 10,
                 "segment_count": 1,
-            },
+            }),
         ]
 
         with patch("filmot.transcript.get_pool", return_value=pool), \
@@ -200,28 +233,39 @@ class TestGetTranscript:
         assert result["full_text"] == "Recovered via second session"
         assert result["route"].startswith("pool:webshare-api:session-")
         assert "b-US-2" not in result["route"]
-        assert mock_fetch.call_count == 2
+        assert mock_route.call_count == 2
         # First session should now be in cooldown after the connection error.
         assert pool._sessions[0].fail_other + pool._sessions[0].fail_429 + pool._sessions[0].fail_blocked == 1
         assert pool._sessions[0].cooldown_until > 0
         assert pool._sessions[1].success == 1
 
-    @patch("filmot.transcript._fetch_transcript_from_api")
+    @patch("filmot.transcript._call_with_route_timeout")
     @patch("filmot.transcript._iter_routes")
     def test_direct_success_retains_prior_pool_route_diagnostics(
-        self, mock_routes, mock_fetch
+        self, mock_routes, mock_route
     ):
         pool_outcome = MagicMock()
-        pool_api = MagicMock(name="pool_api")
-        direct_api = MagicMock(name="direct_api")
         pool_route = "pool:webshare-api:session-deadbeef"
         mock_routes.return_value = iter([
-            (pool_route, pool_api, pool_outcome),
-            ("direct", direct_api, None),
+            (
+                pool_route,
+                {
+                    "kind": "generic-proxy",
+                    "http_proxy": "http://u:p@proxy.invalid",
+                    "https_proxy": "http://u:p@proxy.invalid",
+                },
+                pool_outcome,
+            ),
+            ("direct", {"kind": "direct"}, None),
         ])
-        mock_fetch.side_effect = [
-            Exception("Tunnel connection failed: 400 Bad Request"),
-            {
+        mock_route.side_effect = [
+            _worker_error(
+                "transport_error",
+                "ProxyError",
+                "Tunnel connection failed: 400 Bad Request",
+                "connection",
+            ),
+            _worker_success({
                 "video_id": "abc12345678",
                 "language": "en",
                 "is_generated": True,
@@ -229,7 +273,7 @@ class TestGetTranscript:
                 "full_text": "Recovered directly",
                 "duration_seconds": 1,
                 "segment_count": 0,
-            },
+            }),
         ]
 
         result = get_transcript("abc12345678")
@@ -239,16 +283,126 @@ class TestGetTranscript:
         assert len(result["route_errors"]) == 1
         assert result["route_errors"][0]["route"] == pool_route
         assert result["route_errors"][0]["kind"] == "connection"
-        assert result["route_errors"][0]["error_type"] == "Exception"
+        assert result["route_errors"][0]["error_type"] == "ProxyError"
         pool_outcome.assert_called_once_with(
             "failure",
             ("connection", "Tunnel connection failed: 400 Bad Request"),
         )
 
-    @patch("filmot.transcript._fetch_transcript_from_api")
-    def test_terminal_error_short_circuits_routes(self, mock_fetch):
+    @patch("filmot.transcript._call_with_route_timeout")
+    @patch("filmot.transcript._iter_routes")
+    def test_internal_worker_error_releases_route_without_penalizing_it(
+        self, mock_routes, mock_route
+    ):
+        outcome = MagicMock()
+        secret = "route-password"
+        route_config = {
+            "kind": "generic-proxy",
+            "http_proxy": f"http://user:{secret}@proxy.invalid",
+            "https_proxy": f"http://user:{secret}@proxy.invalid",
+        }
+        mock_routes.return_value = iter([
+            ("pool:test:session-redacted", route_config, outcome),
+        ])
+        mock_route.return_value = _worker_error(
+            "internal_error",
+            "ValueError",
+            f"bad worker setup for http://user:{secret}@proxy.invalid",
+        )
+
+        result = get_transcript("abc12345678")
+
+        assert result["error_type"] == "ValueError"
+        assert result["route_errors"][0]["kind"] == "internal"
+        assert secret not in result["error"]
+        outcome.assert_called_once_with("release", None)
+
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_internal_worker_error_leaves_actual_proxy_health_unchanged(
+        self, mock_route, tmp_path
+    ):
+        from filmot.proxy_pool import WebshareSession
+        from test_proxy_pool import _make_pool
+
+        session = WebshareSession(
+            id="credential",
+            username="proxy-user",
+            password="proxy-password",
+        )
+        pool = _make_pool(tmp_path, sessions=[session])
+        pool._health_store = None
+        pool._in_flight_ids = set()
+        mock_route.return_value = _worker_error(
+            "internal_error",
+            "ValueError",
+            "parser invariant failed",
+        )
+
+        with patch("filmot.transcript.get_pool", return_value=pool), \
+             patch.dict("os.environ", {"FILMOT_PROXY_MODE": "proxy-only"}):
+            result = get_transcript("abc12345678")
+
+        assert result["error_type"] == "ValueError"
+        assert session.fail_429 == 0
+        assert session.fail_blocked == 0
+        assert session.fail_other == 0
+        assert session.consecutive_failures == 0
+        assert session.id not in pool._in_flight_ids
+
+    @patch("filmot.transcript._call_with_route_timeout")
+    @patch("filmot.transcript._iter_routes")
+    def test_protocol_error_releases_route_without_penalizing_it(
+        self, mock_routes, mock_route
+    ):
+        outcome = MagicMock()
+        mock_routes.return_value = iter([
+            (
+                "pool:test:session-redacted",
+                {
+                    "kind": "generic-proxy",
+                    "http_proxy": "http://user:password@proxy.invalid",
+                    "https_proxy": "http://user:password@proxy.invalid",
+                },
+                outcome,
+            ),
+        ])
+        mock_route.side_effect = IsolatedWorkerProtocolError(
+            "worker returned invalid JSON"
+        )
+
+        result = get_transcript("abc12345678")
+
+        assert result["error_type"] == "IsolatedWorkerProtocolError"
+        assert result["route_errors"][0]["kind"] == "internal"
+        outcome.assert_called_once_with("release", None)
+
+    @patch("filmot.transcript._call_with_route_timeout")
+    @patch("filmot.transcript._iter_routes")
+    def test_parent_interruption_releases_route_before_propagating(
+        self, mock_routes, mock_route
+    ):
+        outcome = MagicMock()
+        mock_routes.return_value = iter([
+            (
+                "pool:test:session-redacted",
+                {
+                    "kind": "generic-proxy",
+                    "http_proxy": "http://user:password@proxy.invalid",
+                    "https_proxy": "http://user:password@proxy.invalid",
+                },
+                outcome,
+            ),
+        ])
+        mock_route.side_effect = KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            get_transcript("abc12345678")
+
+        outcome.assert_called_once_with("release", None)
+
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_terminal_error_short_circuits_routes(self, mock_route):
         """TranscriptsDisabled on the first route stops route iteration."""
-        from youtube_transcript_api._errors import TranscriptsDisabled
         from filmot.proxy_pool import WebshareProxyPool, WebshareSession
         import threading as _t
 
@@ -268,8 +422,15 @@ class TestGetTranscript:
         ]
         pool._last_refresh = 9e12
         pool._cursor = 0
+        pool._file_backed = False
+        pool._health_store = None
+        pool._in_flight_ids = set()
 
-        mock_fetch.side_effect = TranscriptsDisabled("abc12345678")
+        mock_route.return_value = _worker_error(
+            "terminal",
+            "TranscriptsDisabled",
+            "captions disabled",
+        )
 
         with patch("filmot.transcript.get_pool", return_value=pool), \
              patch.dict("os.environ", {"FILMOT_PROXY_MODE": "proxy-only"}):
@@ -277,19 +438,23 @@ class TestGetTranscript:
 
         assert "disabled" in result["error"].lower()
         # Only one fetch attempt: terminal error short-circuits the route ladder.
-        assert mock_fetch.call_count == 1
+        assert mock_route.call_count == 1
+        assert pool._sessions[0].success == 1
+        assert pool._sessions[0].consecutive_failures == 0
 
-    @patch("filmot.transcript._fetch_transcript_from_api")
+    @patch("filmot.transcript._call_with_route_timeout")
     @patch("filmot.transcript._iter_routes")
     def test_terminal_result_has_normalized_route_metadata(
-        self, mock_routes, mock_fetch
+        self, mock_routes, mock_route
     ):
-        from youtube_transcript_api._errors import TranscriptsDisabled
-
         mock_routes.return_value = iter([
-            ("direct", MagicMock(name="direct_api"), None),
+            ("direct", {"kind": "direct"}, None),
         ])
-        mock_fetch.side_effect = TranscriptsDisabled("abc12345678")
+        mock_route.return_value = _worker_error(
+            "terminal",
+            "TranscriptsDisabled",
+            "captions disabled",
+        )
 
         result = get_transcript("abc12345678")
 
@@ -298,12 +463,10 @@ class TestGetTranscript:
         assert result["routes_tried"] == ["direct"]
         assert result["route_errors"] == []
 
-    @patch("filmot.transcript._fetch_transcript_from_api")
-    def test_fresh_primary_uses_isolated_client_and_default_keeps_mock_path(
-        self, mock_fetch, monkeypatch
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_primary_attempts_are_always_process_isolated(
+        self, mock_route, monkeypatch
     ):
-        shared_api = MagicMock(name="shared_primary")
-        fresh_api = MagicMock(name="fresh_primary")
         payload = {
             "video_id": "abc12345678",
             "language": "en",
@@ -313,38 +476,30 @@ class TestGetTranscript:
             "duration_seconds": 1,
             "segment_count": 0,
         }
-        mock_fetch.side_effect = [dict(payload), dict(payload)]
+        mock_route.side_effect = [
+            _worker_success(dict(payload)),
+            _worker_success(dict(payload)),
+        ]
         monkeypatch.setattr(transcript_module, "_initialized", True)
-        monkeypatch.setattr(transcript_module, "_api", shared_api)
+        monkeypatch.setattr(transcript_module, "_api", MagicMock())
         monkeypatch.setattr(transcript_module, "_proxy_source", "direct")
         monkeypatch.setenv("FILMOT_PROXY_MODE", "direct-only")
 
-        with (
-            patch(
-                "filmot.transcript._fresh_primary_api",
-                return_value=fresh_api,
-            ) as mock_fresh,
-            patch(
-                "filmot.transcript.get_api",
-                return_value=shared_api,
-            ) as mock_get_api,
-        ):
-            isolated = get_transcript(
-                "abc12345678",
-                fresh_primary=True,
-            )
-            regular = get_transcript("abc12345678")
+        isolated = get_transcript(
+            "abc12345678",
+            fresh_primary=True,
+        )
+        regular = get_transcript("abc12345678")
 
         assert isolated["route"] == "direct"
         assert regular["route"] == "direct"
-        assert mock_fetch.call_args_list[0].args[0] is fresh_api
-        assert mock_fetch.call_args_list[1].args[0] is shared_api
-        mock_fresh.assert_called_once_with()
-        mock_get_api.assert_called_once_with()
+        assert mock_route.call_count == 2
+        assert mock_route.call_args_list[0].args[0] == {"kind": "direct"}
+        assert mock_route.call_args_list[1].args[0] == {"kind": "direct"}
 
-    @patch("filmot.transcript._fetch_transcript_from_api")
-    def test_route_timeout_advances_to_next_pool_session(self, mock_fetch, tmp_path):
-        """A hung route is bounded, marked failed, and does not stop the ladder."""
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_route_timeout_advances_to_next_pool_session(self, mock_route, tmp_path):
+        """A killed route is marked failed and does not stop the ladder."""
         from filmot.proxy_pool import WebshareProxyPool, WebshareSession
         import threading as _t
 
@@ -366,13 +521,14 @@ class TestGetTranscript:
         pool._last_refresh = 9e12
         pool._cursor = 0
         pool._file_backed = False
+        pool._health_store = None
+        pool._in_flight_ids = set()
         events = []
 
-        def fetch_side_effect(*args, **kwargs):
-            if mock_fetch.call_count == 1:
-                time.sleep(1.0)
-                return {"full_text": "too late"}
-            return {
+        def route_side_effect(*args, **kwargs):
+            if mock_route.call_count == 1:
+                raise TranscriptRouteTimeout(kwargs["route"], 0.03)
+            return _worker_success({
                 "video_id": "abc12345678",
                 "language": "en",
                 "is_generated": True,
@@ -380,9 +536,9 @@ class TestGetTranscript:
                 "full_text": "second route",
                 "duration_seconds": 1,
                 "segment_count": 0,
-            }
+            })
 
-        mock_fetch.side_effect = fetch_side_effect
+        mock_route.side_effect = route_side_effect
         started = time.monotonic()
         with patch("filmot.transcript.get_pool", return_value=pool), \
              patch.dict("os.environ", {"FILMOT_PROXY_MODE": "proxy-only"}):
@@ -394,6 +550,7 @@ class TestGetTranscript:
 
         assert time.monotonic() - started < 0.8
         assert result["full_text"] == "second route"
+        assert result["route_errors"][0]["worker_terminated"] is True
         assert pool._sessions[0].last_failure_kind == "connection"
         assert pool._sessions[1].success == 1
         assert [event["event"] for event in events] == [
@@ -407,9 +564,9 @@ class TestGetTranscript:
             str(event.get("route", "")) for event in events
         )
 
-    @patch("filmot.transcript._fetch_transcript_from_api")
+    @patch("filmot.transcript._call_with_route_timeout")
     def test_all_route_timeouts_return_structured_diagnostics(
-        self, mock_fetch, tmp_path
+        self, mock_route, tmp_path
     ):
         from filmot.proxy_pool import WebshareProxyPool, WebshareSession
         import threading as _t
@@ -431,7 +588,11 @@ class TestGetTranscript:
         pool._last_refresh = 9e12
         pool._cursor = 0
         pool._file_backed = False
-        mock_fetch.side_effect = lambda *a, **k: time.sleep(0.1)
+        pool._health_store = None
+        pool._in_flight_ids = set()
+        mock_route.side_effect = lambda *a, **k: (
+            _ for _ in ()
+        ).throw(TranscriptRouteTimeout(k["route"], 0.01))
 
         with patch("filmot.transcript.get_pool", return_value=pool), \
              patch.dict("os.environ", {"FILMOT_PROXY_MODE": "proxy-only"}):
@@ -439,25 +600,27 @@ class TestGetTranscript:
 
         assert result["error_type"] == "TranscriptRouteTimeout"
         assert result["route_errors"][0]["kind"] == "connection"
+        assert result["route_errors"][0]["worker_terminated"] is True
         assert len(result["routes_tried"]) == 1
 
-    def test_progress_callback_errors_do_not_break_fetch(self):
-        mock_api = MagicMock()
-        mock_transcript = MagicMock()
-        mock_transcript.__iter__ = MagicMock(return_value=iter([]))
-        mock_transcript.video_id = "abc12345678"
-        mock_transcript.language_code = "en"
-        mock_transcript.is_generated = True
-        mock_api.fetch.return_value = mock_transcript
-
+    @patch("filmot.transcript._call_with_route_timeout")
+    def test_progress_callback_errors_do_not_break_fetch(self, mock_route):
+        mock_route.return_value = _worker_success({
+            "video_id": "abc12345678",
+            "language": "en",
+            "is_generated": True,
+            "segments": [],
+            "full_text": "",
+            "duration_seconds": 0,
+            "segment_count": 0,
+        })
         def broken_callback(event):
             raise RuntimeError("renderer is broken")
 
-        with patch("filmot.transcript.get_api", return_value=mock_api):
-            result = get_transcript(
-                "abc12345678",
-                progress_callback=broken_callback,
-            )
+        result = get_transcript(
+            "abc12345678",
+            progress_callback=broken_callback,
+        )
         assert "error" not in result
 
 
@@ -484,6 +647,24 @@ class TestTransportConfiguration:
         error = TranscriptRouteTimeout("pool:session-123", 2.5)
         assert error.route == "pool:session-123"
         assert "2.5 seconds" in str(error)
+        assert error.worker_terminated is True
+
+    @patch("filmot.transcript.run_json_worker")
+    def test_process_timeout_maps_to_route_timeout(self, mock_worker):
+        mock_worker.side_effect = IsolatedWorkerTimeout(2.5, 123, -9)
+
+        with pytest.raises(TranscriptRouteTimeout) as captured:
+            transcript_module._call_with_route_timeout(
+                {"kind": "direct"},
+                route="direct",
+                timeout_seconds=2.5,
+                video_id="abc12345678",
+                languages=["en"],
+                preserve_formatting=False,
+            )
+
+        assert captured.value.route == "direct"
+        assert captured.value.worker_terminated is True
 
 
 class TestRoutingPlan:
@@ -596,16 +777,21 @@ class TestRoutingPlan:
 
 
 class TestProbePoolSession:
-    @patch("filmot.transcript._fetch_transcript_from_api")
+    @patch("filmot.transcript._call_with_route_timeout")
     def test_probe_uses_shared_timeout_and_updates_health(
-        self, mock_fetch, tmp_path
+        self, mock_route, tmp_path
     ):
         from filmot.proxy_pool import WebshareSession
         from test_proxy_pool import _make_pool
 
         session = WebshareSession(id="credential", username="u", password="p")
         pool = _make_pool(tmp_path, sessions=[session])
-        mock_fetch.side_effect = lambda *a, **k: time.sleep(0.1)
+        pool._health_store = None
+        pool._in_flight_ids = set()
+        mock_route.side_effect = TranscriptRouteTimeout(
+            "pool:webshare-api:session-e265b6f5",
+            0.01,
+        )
         events = []
 
         result = probe_pool_session(
@@ -619,6 +805,7 @@ class TestProbePoolSession:
         assert result["error_type"] == "TranscriptRouteTimeout"
         assert result["failure_kind"] == "connection"
         assert result["transport_ok"] is False
+        assert result["worker_terminated"] is True
         assert session.consecutive_failures == 1
         assert [event["event"] for event in events] == [
             "route_start",

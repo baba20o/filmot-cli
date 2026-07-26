@@ -16,9 +16,17 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional, Union
 
 from .library import _legacy_normalize_topic, normalize_topic_name
+from .paths import project_data_dir
+from .schemas import (
+    CommandResult,
+    ErrorDetail,
+    EventRecord,
+    ResultStatus,
+    normalize_event_dict,
+)
 
 
 def _normalize(name: str) -> str:
@@ -26,12 +34,14 @@ def _normalize(name: str) -> str:
     return normalize_topic_name(name, fallback="session")
 
 
-def _sessions_dir(data_dir: str = ".filmot_data") -> Path:
-    return Path(data_dir) / "sessions"
+def _sessions_dir(
+    data_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    return project_data_dir(data_dir) / "sessions"
 
 
 def _read_path(path: Path) -> list:
-    """Read valid JSON events from one physical ledger path."""
+    """Read and normalize valid JSON events from one physical ledger path."""
     if not path.exists():
         return []
     events = []
@@ -43,7 +53,7 @@ def _read_path(path: Path) -> list:
                     try:
                         event = json.loads(line)
                         if isinstance(event, dict):
-                            events.append(event)
+                            events.append(normalize_event_dict(event))
                     except json.JSONDecodeError:
                         continue
     except OSError:
@@ -53,8 +63,13 @@ def _read_path(path: Path) -> list:
 
 def _event_matches_topic(event: dict, topic_slug: str) -> bool:
     """Whether an old event can be safely attributed to a Unicode topic."""
+    data = event.get("data")
+    if not isinstance(data, dict):
+        data = event
     for field in ("topic", "research_topic", "query"):
         value = event.get(field)
+        if value is None:
+            value = data.get(field)
         if isinstance(value, str) and _normalize(value) == topic_slug:
             return True
     return False
@@ -72,7 +87,10 @@ def _legacy_session_slugs(name: str) -> list:
     return list(dict.fromkeys(slugs))
 
 
-def migrate_legacy_session(name: str, data_dir: str = ".filmot_data") -> int:
+def migrate_legacy_session(
+    name: str,
+    data_dir: Optional[Union[str, Path]] = None,
+) -> int:
     """Move safely attributable events out of an old ASCII-only session file.
 
     The old normalizer collapsed pure non-Latin names into ``session.jsonl``.
@@ -110,6 +128,7 @@ def migrate_legacy_session(name: str, data_dir: str = ".filmot_data") -> int:
             if not isinstance(event, dict):
                 remaining_lines.append(line)
                 continue
+            event = normalize_event_dict(event)
             if _event_matches_topic(event, topic_slug):
                 matching.append(event)
             else:
@@ -144,8 +163,80 @@ def migrate_legacy_session(name: str, data_dir: str = ".filmot_data") -> int:
     return migrated
 
 
-def log_event(kind: str, topic: Optional[str] = None, data_dir: str = ".filmot_data", **fields) -> None:
-    """Append one event to the ledger. Never raises.
+_STATUS_ALIASES = {
+    "completed_with_failures": ResultStatus.PARTIAL.value,
+    "failed_closed": ResultStatus.FAILED.value,
+    "error": ResultStatus.FAILED.value,
+    "failure": ResultStatus.FAILED.value,
+    "accepted_explicit": ResultStatus.COMPLETED.value,
+    "added": ResultStatus.COMPLETED.value,
+    "fetched": ResultStatus.COMPLETED.value,
+    "found": ResultStatus.COMPLETED.value,
+    "passed": ResultStatus.COMPLETED.value,
+    "ready": ResultStatus.COMPLETED.value,
+    "rendered": ResultStatus.COMPLETED.value,
+    "saved": ResultStatus.COMPLETED.value,
+    "blocked": ResultStatus.SKIPPED.value,
+    "disabled": ResultStatus.SKIPPED.value,
+    "not_found": ResultStatus.SKIPPED.value,
+}
+_CANONICAL_STATUSES = {item.value for item in ResultStatus}
+
+
+def _normalize_status(value: object) -> tuple[str, Optional[str]]:
+    detail = str(value or ResultStatus.COMPLETED.value)
+    if detail in _CANONICAL_STATUSES:
+        return detail, None
+    normalized = _STATUS_ALIASES.get(detail, ResultStatus.COMPLETED.value)
+    return normalized, detail
+
+
+def _append_record(
+    record: EventRecord,
+    data_dir: Optional[Union[str, Path]],
+) -> None:
+    sessions = _sessions_dir(data_dir)
+    sessions.mkdir(parents=True, exist_ok=True)
+    name = record.topic or datetime.now().strftime("%Y-%m-%d")
+    with open(sessions / "{}.jsonl".format(name), "a", encoding="utf-8") as f:
+        f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+
+
+def log_result(
+    kind: str,
+    result: CommandResult,
+    *,
+    topic: Optional[str] = None,
+    data_dir: Optional[Union[str, Path]] = None,
+    data: Optional[Mapping[str, object]] = None,
+) -> None:
+    """Append a compact event derived from a typed command result.
+
+    Like :func:`log_event`, this is deliberately best-effort.
+    """
+    try:
+        topic_slug = _normalize(topic) if topic else None
+        if topic:
+            migrate_legacy_session(topic, data_dir)
+        _append_record(
+            result.to_event(
+                kind,
+                topic=topic_slug,
+                data=data,
+            ),
+            data_dir,
+        )
+    except Exception:
+        pass
+
+
+def log_event(
+    kind: str,
+    topic: Optional[str] = None,
+    data_dir: Optional[Union[str, Path]] = None,
+    **fields
+) -> None:
+    """Append one versioned event to the ledger. Never raises.
 
     Args:
         kind: Event type ("search", "research", "channel-search", "transcript", ...).
@@ -153,32 +244,57 @@ def log_event(kind: str, topic: Optional[str] = None, data_dir: str = ".filmot_d
         fields: Arbitrary JSON-serializable event data (query, results, saved, ...).
     """
     try:
-        sessions = _sessions_dir(data_dir)
-        sessions.mkdir(parents=True, exist_ok=True)
-        name = _normalize(topic) if topic else datetime.now().strftime("%Y-%m-%d")
-        record = {"ts": datetime.now().isoformat(timespec="seconds"), "kind": kind}
-        if topic:
-            # Retaining the canonical topic in each event makes future
-            # migrations and per-event attribution unambiguous.
-            record["topic"] = name
-        for k, v in fields.items():
-            if v is not None:
-                record[k] = v
+        topic_slug = _normalize(topic) if topic else None
+        cleaned = {
+            str(key): value
+            for key, value in fields.items()
+            if value is not None and key != "status"
+        }
+        status, detail_status = _normalize_status(fields.get("status"))
+        if detail_status is not None:
+            cleaned["detail_status"] = detail_status
+
+        errors = []
+        if status == ResultStatus.FAILED.value and fields.get("error") is not None:
+            errors.append(
+                ErrorDetail(
+                    type=str(fields.get("error_type") or "CommandError"),
+                    message=str(fields["error"]),
+                    stage=(
+                        str(fields["failure_stage"])
+                        if fields.get("failure_stage") is not None
+                        else None
+                    ),
+                )
+            )
+
         if topic:
             migration_name = topic
             for field in ("research_topic", "query"):
                 value = fields.get(field)
-                if isinstance(value, str) and _normalize(value) == name:
+                if isinstance(value, str) and _normalize(value) == topic_slug:
                     migration_name = value
                     break
             migrate_legacy_session(migration_name, data_dir)
-        with open(sessions / f"{name}.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        record = EventRecord(
+            kind=kind,
+            command=kind.replace("_", "-"),
+            status=status,
+            data=cleaned,
+            errors=errors,
+            topic=topic_slug,
+            ts=datetime.now().isoformat(timespec="seconds"),
+        )
+        _append_record(record, data_dir)
     except Exception:
         pass  # ledger is best-effort; never break the caller
 
 
-def read_events(name: str, data_dir: str = ".filmot_data") -> list:
+def read_events(
+    name: str,
+    data_dir: Optional[Union[str, Path]] = None,
+) -> list:
     """Read all events from a session file (by topic slug or date). Empty on miss."""
     is_date = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", name))
     slug = name if is_date else _normalize(name)
@@ -203,7 +319,9 @@ def read_events(name: str, data_dir: str = ".filmot_data") -> list:
     return events
 
 
-def list_sessions(data_dir: str = ".filmot_data") -> list:
+def list_sessions(
+    data_dir: Optional[Union[str, Path]] = None,
+) -> list:
     """Return [{name, events, last_ts}] for every session file, newest activity first."""
     sessions = _sessions_dir(data_dir)
     if not sessions.exists():

@@ -1,0 +1,35 @@
+{
+  "totalresultcount": 2,
+  "result": [
+    {
+      "id": "recorded-video-001",
+      "title": "Recorded video title 001",
+      "duration": 642,
+      "uploaddate": "2026-01-01",
+      "viewcount": 12034,
+      "likecount": 512,
+      "license": 1,
+      "category": "Science & Technology",
+      "channelname": "Recorded channel 001",
+      "channelsubcount": 45000,
+      "channelcountryname": "Recorded country",
+      "channelthumbnailurl": "https://example.invalid/channel.jpg",
+      "channelid": "recorded-channel-001",
+      "lang": "en",
+      "hits": [
+        {
+          "id": 1042,
+          "start": 117.25,
+          "token": "recorded phrase",
+          "lines": [
+            {
+              "start": 116.8,
+              "dur": 4,
+              "text": "recorded transcript line"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

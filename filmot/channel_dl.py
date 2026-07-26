@@ -24,9 +24,9 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Callable
 
-from dotenv import load_dotenv
-
-load_dotenv()
+# Importing config runs the explicit process/user/project environment sequence.
+from . import config as _config  # noqa: F401
+from .paths import project_data_dir
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +326,8 @@ def list_all_video_ids(uploads_playlist_id: str, progress_callback: Optional[Cal
 class ChannelDownloader:
     """Manages downloading and storing all transcripts for a YouTube channel."""
     
-    def __init__(self, data_dir: str = ".filmot_data"):
-        self.data_dir = Path(data_dir)
+    def __init__(self, data_dir=None):
+        self.data_dir = project_data_dir(data_dir)
         self.channels_dir = self.data_dir / "channels"
         self.channels_dir.mkdir(parents=True, exist_ok=True)
     

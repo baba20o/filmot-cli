@@ -98,13 +98,40 @@ python main.py --help
 
 ### Configure API credentials
 
-Create a `.env` file in the project root:
+Create a `.env` file in the directory where you run Filmot:
 ```env
 RAPIDAPI_KEY=your_rapidapi_key_here
 RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com
 ```
 
 Get your API key from [Filmot API on RapidAPI](https://filmot.com/api).
+For credentials shared across projects, use Filmot's per-user `config.env`
+instead. See [Storage and configuration](#storage-and-configuration).
+
+### Storage and configuration
+
+Filmot deliberately separates research artifacts from machine-level runtime
+state:
+
+| Kind | Default location | Override |
+| --- | --- | --- |
+| Transcripts, research libraries, watchlists, and session ledgers | `<current directory>/.filmot_data` | `FILMOT_DATA_DIR` |
+| Per-user configuration and proxy credentials | Windows `%APPDATA%\filmot`; macOS `~/Library/Application Support/filmot`; Linux `${XDG_CONFIG_HOME:-~/.config}/filmot` | `FILMOT_CONFIG_DIR` |
+| Per-user mutable state, including proxy health and rate limiting | Windows `%LOCALAPPDATA%\filmot`; macOS `~/Library/Application Support/filmot`; Linux `${XDG_STATE_HOME:-~/.local/state}/filmot` | `FILMOT_STATE_DIR` |
+| Response cache | Native per-user cache directory (`%LOCALAPPDATA%`, `~/Library/Caches`, or `${XDG_CACHE_HOME:-~/.cache}`) under `filmot` | `FILMOT_CACHE_DIR` |
+
+Configuration precedence is: existing process environment, per-user
+`config.env`, then an explicit `.env` in the current working directory. The
+per-user file can be redirected with `FILMOT_CONFIG_FILE`. Filmot does not
+search parent directories for `.env`, so editable and packaged installs behave
+the same way.
+
+Proxy credential inventories are stored in the per-user configuration
+directory with owner-only permissions where the platform supports them.
+Credential-free proxy health, cooldown, rotation, and short-lived leases live
+in `proxy/health.sqlite3` under the per-user state directory, allowing
+concurrent Filmot processes to coordinate safely without writing secrets to
+the database.
 
 ## Usage
 
@@ -568,21 +595,36 @@ python main.py config
 
 ```
 filmot-cli/
-├── .env                    # API credentials (git-ignored)
+├── .env                    # Optional project-specific settings (git-ignored)
 ├── .gitignore              # Git ignore rules
 ├── requirements.txt        # Python dependencies
 ├── main.py                 # CLI entry point
 ├── README.md               # This file
 ├── AGENTS_README.md        # Agent-specific usage guide
 └── filmot/
-    ├── __init__.py         # Package init with version
+    ├── __init__.py         # Package exports
+    ├── _version.py         # Single source for package/CLI version
     ├── __main__.py         # Python -m filmot support
     ├── config.py           # Configuration & environment loading
-    ├── api.py              # FilmotClient API wrapper with caching/rate limiting
-    ├── cli.py              # Click CLI commands & Rich formatting
+    ├── paths.py            # Project and per-user storage resolution
+    ├── api.py              # Filmot API wrapper with caching/rate limiting
+    ├── api_contract.py     # Recorded-response structural validation
+    ├── cli.py              # Root group and command registration
+    ├── cli_support.py      # Shared raw/human/error presentation boundary
+    ├── schemas.py          # Versioned result and ledger-event contracts
+    ├── ledger.py           # Project-local append-only research events
+    ├── commands/
+    │   ├── search.py       # Search, metadata, export, and scout commands
+    │   ├── research.py     # Staged research workflow
+    │   ├── transcript.py   # Transcript and channel-corpus commands
+    │   ├── library.py      # Library and session commands
+    │   └── proxy.py        # Machine-global proxy operations
+    ├── _process.py         # Killable JSON subprocess boundary
+    ├── _transcript_worker.py # Isolated transcript route worker
+    ├── transcript.py       # Transcript routing and failure classification
+    ├── proxy_pool.py       # Cross-process proxy health and leases
     ├── cache.py            # File-based response caching with auto-purge
     ├── rate_limiter.py     # Token bucket rate limiter
-    ├── transcript.py       # YouTube transcript download with proxy support
     ├── channel_dl.py       # Channel corpus downloader: parallel download, resume, proximity search
     ├── library.py          # Transcript library: storage, search, compare
     ├── export.py           # JSON/CSV export functionality
@@ -778,7 +820,7 @@ This CLI requires a RapidAPI key for the Filmot Tube Metadata Archive API:
 1. Create a free account at [RapidAPI](https://rapidapi.com/)
 2. Subscribe to the [Filmot API](https://filmot.com/api)
 3. Copy your API key from the dashboard
-4. Add it to your `.env` file
+4. Add it to your per-user `config.env` (recommended) or project `.env`
 
 ## Webshare Proxy Pool (transcript fetching)
 
@@ -793,7 +835,7 @@ retires sessions that get rate-limited / blocked / fail to connect.
 
 1. Sign up at [webshare.io](https://www.webshare.io/) and get a residential plan.
 2. Copy your API token from the [user API keys page](https://dashboard.webshare.io/userapi/keys).
-3. Add it to `.env`:
+3. Add it to the per-user `config.env` (recommended) or project `.env`:
    ```bash
    WEBSHARE_API_TOKEN=your_40_char_token_here
    ```
@@ -809,13 +851,14 @@ retires sessions that get rate-limited / blocked / fail to connect.
 | Env var                      | Default       | Purpose                                                            |
 | ---------------------------- | ------------- | ------------------------------------------------------------------ |
 | `WEBSHARE_API_TOKEN`         | _(unset)_     | Enables API-backed pool discovery and remote refresh.               |
-| `WEBSHARE_SESSION_FILE`      | `.filmot_data/webshare_info.txt` | Optional file-backed `host:port:user:password` pool. |
+| `WEBSHARE_SESSION_FILE`      | Per-user config `webshare_info.txt` | Optional file-backed `host:port:user:password` pool. |
 | `FILMOT_PROXY_MODE`          | `proxy-only` if token set, else `auto` | `auto` \| `proxy-only` \| `primary-only` \| `direct-only` |
 | `FILMOT_PROXY_COUNTRIES`     | _(all)_       | Comma-separated ISO-2 codes (e.g. `US,GB,CA`).                     |
 | `FILMOT_PROXY_REFRESH_HOURS` | `6`           | How often the pool re-pulls the session list from Webshare.        |
 | `FILMOT_PROXY_MAX_SESSIONS`  | `50`          | Cap on sessions kept in the pool.                                  |
 | `FILMOT_PROXY_RETRY_LIMIT`   | `4`           | Max pool sessions to try per transcript before giving up.          |
 | `FILMOT_PROXY_HEALTH_HOURS`  | `24`          | Recent-success window used by the “healthy” metric.                 |
+| `FILMOT_PROXY_LEASE_SECONDS` | `120`         | Cross-process lease lifetime for a selected proxy session.          |
 | `FILMOT_TRANSCRIPT_CONNECT_TIMEOUT` | `8`    | Per-request connection deadline in seconds.                        |
 | `FILMOT_TRANSCRIPT_READ_TIMEOUT` | `15`       | Per-request read deadline in seconds.                              |
 | `FILMOT_TRANSCRIPT_ROUTE_TIMEOUT` | `30`      | Overall deadline for one transcript route in seconds.              |
@@ -840,6 +883,26 @@ initialized primary route; the CLI selects it for an explicit `--proxy`.
   `proxy refresh` first if no sessions are loaded. It prints the redacted route
   before the call, streams each result, and enforces per-route and total
   command budgets.
+
+### Storage and legacy migration
+
+API-discovered credentials are cached in an owner-only inventory in Filmot's
+per-user configuration directory. Proxy health and active leases are stored
+transactionally in the credential-free per-user SQLite health database. This
+keeps rotation coordinated across projects and prevents one process from
+clobbering another process's counters or selecting the same leased session.
+
+On first use, Filmot non-destructively migrates the former project-local proxy
+files:
+
+- `.filmot_data/webshare_info.txt` is copied to the per-user configuration
+  directory.
+- `.filmot_data/webshare_pool.json` and
+  `.filmot_data/webshare_pool_file.json` contribute health counters to SQLite;
+  API credentials are split into the private inventory.
+- The legacy files are retained. An existing destination is never overwritten.
+
+An explicitly configured custom `WEBSHARE_SESSION_FILE` remains authoritative.
 
 ### Legacy fallback
 
@@ -904,11 +967,16 @@ filmot search "tutorial" --raw | jq '.result[0].hits'
 
 Raw mode suppresses interactive progress and keeps any remaining diagnostics
 off stdout. Stdout contains one JSON value on success and one JSON error value
-with a nonzero exit status on operational failure. For `search`, this is the
+with a nonzero exit status on operational failure. Every raw command result
+uses the `filmot.result/v1` contract. Mapping payloads retain their useful
+top-level domain keys and add `_filmot` metadata containing `schema`,
+`command`, `status`, `errors`, and `warnings`. For `search`, the payload is the
 processed response after channel validation, client-side filtering/ranking,
 `--limit`, and `--max-hits`, with explicit scope metadata; it is not an
-untouched copy of the upstream API payload. `filmot sessions NAME --raw`
-similarly emits one JSON array containing all session events, not JSONL.
+untouched copy of the upstream API payload. `video` uses `videos`, `channels`
+uses `channels`, and `filmot sessions NAME --raw` uses `events`. Every session
+entry is itself a `filmot.event/v1` record with the same
+command/status/data/errors/warnings vocabulary.
 
 ### Example Agent Workflow (Python)
 
