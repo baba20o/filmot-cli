@@ -4,6 +4,7 @@ freshness hint, transcript grep, and the session ledger."""
 from datetime import date, timedelta
 
 import filmot.ledger as ledger
+from filmot.library import normalize_topic_name
 from filmot.cli import (
     _deep_link,
     _hit_start,
@@ -104,6 +105,107 @@ def test_ledger_skips_none_fields(tmp_path):
     ev = ledger.read_events(date.today().strftime("%Y-%m-%d"), data_dir=d)[0]
     assert "lang" not in ev
     assert ev["results"] == 3
+
+
+def test_ledger_uses_same_unicode_slug_as_library(tmp_path):
+    d = str(tmp_path / ".filmot_data")
+    topics = ["人工知能", "초전도체", "искусственный интеллект", "الذكاء الاصطناعي"]
+
+    for index, topic in enumerate(topics):
+        ledger.log_event("research", topic=topic, data_dir=d, query=topic, saved=index)
+
+    sessions = {session["name"] for session in ledger.list_sessions(data_dir=d)}
+    expected = {normalize_topic_name(topic) for topic in topics}
+    assert expected.issubset(sessions)
+    assert len(expected) == len(topics)
+
+    for index, topic in enumerate(topics):
+        events = ledger.read_events(topic, data_dir=d)
+        assert len(events) == 1
+        assert events[0]["saved"] == index
+        assert events[0]["topic"] == normalize_topic_name(topic)
+
+
+def test_ledger_punctuation_topics_are_deterministic_and_distinct():
+    assert ledger._normalize("!!!") == ledger._normalize("!!!")
+    assert ledger._normalize("!!!") != ledger._normalize("???")
+    assert ledger._normalize("!!!").startswith("topic-")
+    assert ledger._normalize("!!!") == normalize_topic_name("!!!")
+
+
+def test_ledger_reads_and_migrates_only_matching_legacy_events(tmp_path):
+    d = tmp_path / ".filmot_data"
+    sessions = d / "sessions"
+    sessions.mkdir(parents=True)
+    legacy_path = sessions / "session.jsonl"
+    legacy_path.write_text(
+        "\n".join([
+            '{"ts":"2026-01-01T00:00:00","kind":"research","query":"人工知能","saved":1}',
+            '{"ts":"2026-01-02T00:00:00","kind":"research","query":"초전도체","saved":2}',
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    # Backward-compatible read does not expose the Korean event under Japanese.
+    events = ledger.read_events("人工知能", data_dir=str(d))
+    assert [event["saved"] for event in events] == [1]
+
+    # The next write checkpoints the attributable old history into the new
+    # Unicode-safe file and leaves unrelated legacy history untouched.
+    ledger.log_event(
+        "research", topic="人工知能", data_dir=str(d), query="人工知能", saved=3
+    )
+    assert [event["saved"] for event in ledger.read_events("人工知能", data_dir=str(d))] == [1, 3]
+    assert [event["saved"] for event in ledger.read_events("초전도체", data_dir=str(d))] == [2]
+    assert '"초전도체"' in legacy_path.read_text(encoding="utf-8")
+    assert '"人工知能"' not in legacy_path.read_text(encoding="utf-8")
+
+
+def test_ledger_migrates_research_events_from_old_uncategorized_file(tmp_path):
+    d = tmp_path / ".filmot_data"
+    sessions = d / "sessions"
+    sessions.mkdir(parents=True)
+    legacy_path = sessions / "uncategorized.jsonl"
+    legacy_path.write_text(
+        '{"ts":"2026-01-01T00:00:00","kind":"research","query":"人工知能","saved":1}\n',
+        encoding="utf-8",
+    )
+
+    # Old research normalized through the library before reaching the ledger,
+    # producing uncategorized.jsonl rather than session.jsonl.
+    assert [event["saved"] for event in ledger.read_events("人工知能", data_dir=str(d))] == [1]
+    ledger.log_event(
+        "research", topic="人工知能", data_dir=str(d), query="人工知能", saved=2
+    )
+
+    assert [event["saved"] for event in ledger.read_events("人工知能", data_dir=str(d))] == [1, 2]
+    assert not legacy_path.exists()
+
+
+def test_library_compare_substring_fallback_renders_excerpt(
+    library, tmp_path, monkeypatch
+):
+    """B17: counts and excerpts must use the same fallback match mode."""
+    from click.testing import CliRunner
+    from filmot.cli import cli as cli_group
+    import filmot.library as library_module
+
+    library.save(
+        "abc12345678",
+        "water",
+        "Cooling consumed twelve liters before recycling two more liters.",
+        metadata={"title": "Cooling design", "channel": "Engineering"},
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(library_module, "get_library", lambda: library)
+
+    result = CliRunner().invoke(
+        cli_group, ["library", "compare", "liter", "--topic", "water"]
+    )
+
+    assert result.exit_code == 0
+    assert "2 times across 1 sources" in result.output
+    assert "liters" in result.output
 
 
 def test_yt_search_logs_to_ledger(tmp_path, monkeypatch):

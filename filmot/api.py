@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 # Retry config for 429 responses
 MAX_RETRIES = 4
 DEFAULT_RETRY_WAIT = 5  # seconds, if no Retry-After header
+DEFAULT_REQUEST_TIMEOUT = (10, 45)  # connect, read seconds
 
 
 def _rewrite_pipe_phrase_operand(operand: str) -> tuple[str, bool]:
@@ -55,7 +56,8 @@ class FilmotClient:
     """Client for interacting with the Filmot API."""
     
     def __init__(self, use_cache: bool = True, cache_ttl: int = 3600,
-                 rate_limit: float = 2.0, burst_size: int = 5):
+                 rate_limit: float = 2.0, burst_size: int = 5,
+                 request_timeout=DEFAULT_REQUEST_TIMEOUT):
         """
         Initialize the Filmot client.
         
@@ -77,6 +79,7 @@ class FilmotClient:
         
         # Rate limiting
         self.rate_limiter = get_rate_limiter(rate_limit, burst_size)
+        self.request_timeout = request_timeout
 
         # Track cache hits for caller feedback
         self.last_cache_hit = False
@@ -111,7 +114,8 @@ class FilmotClient:
                     method=method,
                     url=url,
                     params=params,
-                    json=data
+                    json=data,
+                    timeout=self.request_timeout,
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -308,6 +312,7 @@ class FilmotClient:
             Each page of results as a dictionary
         """
         total_results = 0
+        kwargs.pop("page", None)
         
         for page_num in range(1, max_pages + 1):
             result = self.search_subtitles(query, page=page_num, **kwargs)
@@ -318,8 +323,12 @@ class FilmotClient:
             
             videos = result.get("result", result.get("videos", []))
             if not videos:
+                # The request still consumed a page and may carry an accurate
+                # total count. Yield it so aggregate scope does not misleadingly
+                # report that zero pages were fetched.
+                yield result
                 break  # No more results
-            
+
             yield result
             
             total_results += len(videos)
@@ -358,18 +367,38 @@ class FilmotClient:
             Aggregated results with all videos combined
         """
         all_videos = []
+        seen_video_ids = set()
+        duplicates_skipped = 0
         total_count = 0
         pages_fetched = 0
+        page_error = None
         
-        for page_result in self.search_subtitles_paginated(query, max_pages, max_results, **kwargs):
+        # Enforce max_results on distinct IDs here. Passing it into the raw
+        # paginator could stop early when a changing index repeats a video
+        # across adjacent pages.
+        for page_result in self.search_subtitles_paginated(
+            query,
+            max_pages,
+            None,
+            **kwargs,
+        ):
             if "error" in page_result:
                 if all_videos:
-                    # Return what we have so far
+                    # Preserve partial work, but make incompleteness explicit to
+                    # callers instead of silently presenting a complete corpus.
+                    page_error = page_result.get("error")
                     break
                 return page_result
             
             videos = page_result.get("result", page_result.get("videos", []))
-            all_videos.extend(videos)
+            for video in videos:
+                video_id = video.get("id") or video.get("videoid")
+                if video_id and video_id in seen_video_ids:
+                    duplicates_skipped += 1
+                    continue
+                if video_id:
+                    seen_video_ids.add(video_id)
+                all_videos.append(video)
             total_count = page_result.get("totalresultcount", len(all_videos))
             pages_fetched += 1
             
@@ -378,10 +407,14 @@ class FilmotClient:
                 all_videos = all_videos[:max_results]
                 break
         
-        return {
+        aggregated = {
             "result": all_videos,
             "totalresultcount": total_count,
             "pages_fetched": pages_fetched,
-            "results_returned": len(all_videos)
+            "results_returned": len(all_videos),
+            "duplicates_skipped": duplicates_skipped,
+            "partial": page_error is not None,
         }
-
+        if page_error is not None:
+            aggregated["page_error"] = page_error
+        return aggregated

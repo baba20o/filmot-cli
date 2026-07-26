@@ -1,7 +1,12 @@
 """Filmot CLI - Command Line Interface."""
 
 import click
+from contextlib import nullcontext
+import errno
+import math
+import os
 import re
+import sys
 from typing import Optional
 from rich.console import Console
 from rich.table import Table
@@ -16,10 +21,306 @@ console = Console()
 stderr_console = Console(stderr=True)
 
 
+class _PipeFlushWrapper:
+    """Proxy a text stream while suppressing shutdown flush pipe errors."""
+
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+    def flush(self):
+        try:
+            self.wrapped.flush()
+        except OSError as error:
+            if error.errno not in (errno.EPIPE, errno.EINVAL):
+                raise
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
+
+
+def _silence_broken_pipe_streams() -> None:
+    """Prevent interpreter shutdown from retrying a closed consumer pipe."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name)
+        if not isinstance(stream, _PipeFlushWrapper):
+            setattr(sys, stream_name, _PipeFlushWrapper(stream))
+
+
+def _redact_diagnostic(value):
+    """Recursively redact credential-bearing proxy userinfo."""
+    from .proxy_pool import redact_sensitive_text
+
+    if isinstance(value, dict):
+        return {
+            key: _redact_diagnostic(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_diagnostic(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_diagnostic(item) for item in value)
+    if isinstance(value, str) or isinstance(value, Exception):
+        return redact_sensitive_text(value)
+    return value
+
+
+def _command_error(message: str, *, raw: bool = False, payload: Optional[dict] = None):
+    """Terminate a command with a machine-detectable failure.
+
+    Human mode uses Click's standard non-zero error path.  Raw mode emits one
+    JSON value on stdout and exits non-zero, preserving the stdout contract for
+    callers that always parse JSON (including failures).
+    """
+    safe_message = _redact_diagnostic(str(message))
+    if raw:
+        body = (
+            _redact_diagnostic(payload)
+            if payload is not None
+            else {"error": safe_message}
+        )
+        click.echo(json_mod.dumps(body, indent=2, ensure_ascii=False))
+        raise click.exceptions.Exit(1)
+    raise click.ClickException(safe_message)
+
+
+def _diagnostic(message: str, *, raw: bool = False) -> None:
+    """Write a human diagnostic without contaminating raw JSON stdout."""
+    if raw:
+        return
+    console.print(message)
+
+
+def _search_status(message: str, *, raw: bool = False):
+    """Return a Rich status context only when stdout is human-oriented."""
+    return nullcontext() if raw else console.status(message)
+
+
+def _result_videos(results: dict) -> list:
+    return results.get("result", results.get("videos", results.get("items", [])))
+
+
+def _channel_candidates(payload: object) -> list:
+    """Normalize the Filmot channel-search response to candidate dictionaries."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("channels", "items", "result"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _resolve_channel_filter(client, term: str, count: Optional[int]) -> tuple[str, list]:
+    """Resolve fuzzy channel text explicitly and fail closed on no match."""
+    response = client.search_channels(term)
+    if isinstance(response, dict) and response.get("error"):
+        raise click.ClickException(
+            f'Could not resolve --channel "{term}": {response["error"]}'
+        )
+
+    candidates = _channel_candidates(response)
+    requested = max(1, count or 10)
+
+    # Exact labels/handles are safer than broad fuzzy matches.  If the API
+    # supplies an exact candidate, keep it first without silently widening to
+    # every other fuzzy result.
+    folded = term.casefold().strip().lstrip("@")
+    exact = [
+        item for item in candidates
+        if str(item.get("label", "")).casefold().strip() == folded
+        or str(item.get("newshortname", "")).casefold().strip().lstrip("@") == folded
+    ]
+    selected = (exact or candidates)[:requested]
+    selected = [
+        item for item in selected
+        if item.get("value") or item.get("channelid") or item.get("id")
+    ]
+    if not selected:
+        raise click.ClickException(
+            f'No channels resolved for --channel "{term}". '
+            "Use `filmot channels TERM` and pass an exact --channel-id."
+        )
+
+    ids = [
+        str(item.get("value") or item.get("channelid") or item.get("id"))
+        for item in selected
+    ]
+    normalized = [
+        {
+            "id": channel_id,
+            "name": str(item.get("label") or item.get("name") or item.get("title") or "Unknown"),
+        }
+        for item, channel_id in zip(selected, ids)
+    ]
+    return ",".join(ids), normalized
+
+
+def _merge_channel_ids(explicit_ids: Optional[str], resolved_ids: Optional[str]) -> Optional[str]:
+    values = []
+    for group in (explicit_ids, resolved_ids):
+        if group:
+            values.extend(part.strip() for part in group.split(",") if part.strip())
+    return ",".join(dict.fromkeys(values)) or None
+
+
+def _density(video: dict) -> float:
+    duration = video.get("duration", 0) or 0
+    hits = len(video.get("hits", []))
+    return hits / (duration / 60) if duration > 0 else 0.0
+
+
+def _search_scope(results: dict, requested_page: Optional[int] = None) -> dict:
+    videos = _result_videos(results)
+    total = results.get("totalresultcount")
+    if total is None:
+        total = len(videos)
+    return {
+        "api_total": total,
+        "candidates_fetched": len(videos),
+        "pages_fetched": results.get("pages_fetched", 1),
+        "page": requested_page or 1,
+        "partial": bool(results.get("partial")),
+    }
+
+
+def _low_result_query_hint(query: str, count: int) -> Optional[str]:
+    """Suggest recall-preserving variants without weakening strict matching."""
+    if count > 5:
+        return None
+    has_phrase = '"' in query
+    has_proximity = bool(re.search(r"\b(?:NOT)?NEAR\s*/\s*\d+\b|\"[^\"\n]+\"~\d+", query, re.I))
+    if not (has_phrase or has_proximity):
+        return None
+    return (
+        f"Only {count} result{'s' if count != 1 else ''} matched the literal "
+        "phrase/proximity query. Try singular/plural, inflection, spelling, or "
+        "caption-transcription variants; strict matching is unchanged."
+    )
+
+
+def _whole_word_summary(value: object, max_chars: int = 220) -> str:
+    """Cap an error on a word boundary, retaining useful detail."""
+    text = " ".join(str(_redact_diagnostic(value)).split())
+    if len(text) <= max_chars:
+        return text
+    prefix = text[: max_chars - 1]
+    if " " in prefix:
+        prefix = prefix.rsplit(" ", 1)[0]
+    return prefix.rstrip(" ,.;:-") + "…"
+
+
+def _transcript_failure_detail(result: dict, *, verbose: bool) -> str:
+    """Render a redacted transcript failure with optional route diagnostics."""
+    error_type = str(result.get("error_type") or "TranscriptError")
+    message = _whole_word_summary(result.get("error") or "unknown error", 500)
+    base = f"{error_type}: {message}"
+    if not verbose:
+        return _whole_word_summary(base)
+
+    details = []
+    if result.get("route"):
+        details.append(f"route={result['route']}")
+    if result.get("routes_tried"):
+        details.append(
+            "routes_tried=" + ",".join(map(str, result["routes_tried"]))
+        )
+    if result.get("route_errors"):
+        route_errors = [
+            {
+                "route": item.get("route"),
+                "kind": item.get("kind"),
+                "error_type": item.get("error_type"),
+                "error": _whole_word_summary(item.get("error", ""), 500),
+            }
+            for item in result["route_errors"]
+            if isinstance(item, dict)
+        ]
+        details.append(
+            "route_errors="
+            + json_mod.dumps(
+                _redact_diagnostic(route_errors),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    return " | ".join([base, *details])
+
+
+def _transcript_route_progress(event: dict, *, context: Optional[str] = None) -> None:
+    """Render one structured transcript-route event to stderr.
+
+    Route labels are already redacted by ``filmot.transcript``. Deliberately
+    avoid printing raw transport exception text here because Requests errors
+    can contain credential-bearing proxy URLs.
+    """
+    event_name = event.get("event", "")
+    route = str(event.get("route") or "route")
+    prefix = f"{context}: " if context else ""
+    attempt = event.get("attempt")
+    elapsed = float(event.get("elapsed_s") or 0)
+
+    if event_name == "pool_prepare":
+        click.echo(
+            f"{prefix}preparing {route} "
+            f"({event.get('available_sessions', 0)} available; "
+            f"up to {event.get('max_attempts', 0)} attempts)",
+            err=True,
+        )
+    elif event_name == "pool_prepare_failed":
+        detail = event.get("error_type") or "pool refresh failed"
+        click.echo(
+            f"{prefix}could not prepare {route} ({detail})",
+            err=True,
+        )
+    elif event_name == "route_start":
+        click.echo(
+            f"{prefix}route {attempt}: {route} "
+            f"(deadline {float(event.get('timeout_s') or 0):g}s)",
+            err=True,
+        )
+    elif event_name == "route_success":
+        click.echo(
+            f"{prefix}route {attempt} succeeded: {route} ({elapsed:.2f}s)",
+            err=True,
+        )
+    elif event_name == "route_timeout":
+        click.echo(
+            f"{prefix}route {attempt} timed out: {route} ({elapsed:.2f}s)",
+            err=True,
+        )
+    elif event_name == "route_failed":
+        detail = event.get("kind") or event.get("error_type") or "transport error"
+        click.echo(
+            f"{prefix}route {attempt} failed: "
+            f"{route} ({detail}, {elapsed:.2f}s)",
+            err=True,
+        )
+    elif event_name == "route_terminal":
+        detail = event.get("error_type") or "transcript unavailable"
+        click.echo(
+            f"{prefix}route {attempt} reached YouTube: "
+            f"{route} ({detail}, {elapsed:.2f}s)",
+            err=True,
+        )
+    elif event_name == "routes_exhausted":
+        click.echo(
+            f"{prefix}all transcript routes exhausted "
+            f"({event.get('attempts', 0)} attempted)",
+            err=True,
+        )
+
+
+def _route_progress_for(context: Optional[str] = None):
+    """Create a callback carrying a video/title label."""
+    return lambda event: _transcript_route_progress(event, context=context)
+
+
 class VideoIdType(click.ParamType):
     """Custom type for YouTube video IDs that handles IDs starting with dashes."""
     name = "video_id"
-    
+
     def convert(self, value, param, ctx):
         if value is None:
             return None
@@ -43,125 +344,380 @@ def cli():
 @cli.command()
 @click.argument("query")
 @click.option("--lang", "-l", default=None, help="Language code (e.g., en, nl, fr, de)")
-@click.option("--page", "-p", default=None, type=int, help="Page number (50 results per page)")
+@click.option("--page", "-p", default=None, type=click.IntRange(1), help="Page number (50 results per page)")
+@click.option("--pages", default=1, type=click.IntRange(1, 50), show_default=True,
+              help="Fetch this many pages before client-side filtering/ranking")
+@click.option("--candidate-pool", default=None, type=click.IntRange(1),
+              help="Maximum candidates to fetch across --pages")
 @click.option("--category", "-c", default=None, help="Video category (e.g., 'Science & Technology')")
 @click.option("--exclude", default=None, help="Categories to exclude (comma-separated)")
 @click.option("--channel-id", default=None, help="Limit to specific channel ID")
 @click.option("--channel", default=None, help="Find top channels matching this text, then search those")
-@click.option("--channel-count", default=None, type=int, help="Limit top channels when using --channel (default 10)")
+@click.option("--channel-count", default=None, type=click.IntRange(1), help="Limit top channels when using --channel (default 10)")
 @click.option("--title", default=None, help="Filter by video title")
-@click.option("--min-views", default=None, type=int, help="Minimum view count")
-@click.option("--max-views", default=None, type=int, help="Maximum view count")
-@click.option("--min-likes", default=None, type=int, help="Minimum like count")
-@click.option("--max-likes", default=None, type=int, help="Maximum like count")
-@click.option("--min-duration", default=None, type=int, help="Minimum duration in seconds")
-@click.option("--max-duration", default=None, type=int, help="Maximum duration in seconds")
+@click.option("--min-views", default=None, type=click.IntRange(0), help="Minimum view count")
+@click.option("--max-views", default=None, type=click.IntRange(0), help="Maximum view count")
+@click.option("--min-likes", default=None, type=click.IntRange(0), help="Minimum like count")
+@click.option("--max-likes", default=None, type=click.IntRange(0), help="Maximum like count")
+@click.option("--min-duration", default=None, type=click.IntRange(0), help="Minimum duration in seconds")
+@click.option("--max-duration", default=None, type=click.IntRange(0), help="Maximum duration in seconds")
 @click.option("--start-date", default=None, help="Start date (yyyy-mm-dd)")
 @click.option("--end-date", default=None, help="End date (yyyy-mm-dd)")
-@click.option("--country", default=None, type=int, help="Country code (e.g., 217=US, 153=UK)")
+@click.option("--country", default=None, type=click.IntRange(0), help="Country code (e.g., 217=US, 153=UK)")
 @click.option("--license", "license_type", default=None, type=click.Choice(["1", "2"]), help="License: 1=Standard, 2=Creative Commons")
 @click.option("--sort", default=None, type=click.Choice(["viewcount", "likecount", "uploaddate", "duration", "chanrank", "id", "density"]), help="Sort field (density = client-side matches/min sort)")
 @click.option("--order", default=None, type=click.Choice(["asc", "desc"]), help="Sort order")
 @click.option("--manual-subs", is_flag=True, help="Search manual subtitles only (default: auto subs). Cannot search both in same request.")
-@click.option("--max-query-time", default=None, type=int, help="Max query time in ms (4-15000)")
+@click.option("--max-query-time", default=None, type=click.IntRange(4, 15000), help="Max query time in ms (4-15000)")
 @click.option("--hit-format", default=None, type=click.Choice(["0", "1"]), help="Hit format: 0=context, 1=full lines")
-@click.option("--full", is_flag=True, help="Show all matches (no truncation) - useful for AI agents")
-@click.option("--raw", is_flag=True, help="Output raw JSON response")
-@click.option("--min-matches", default=None, type=int, help="Only show videos with at least N subtitle matches")
-@click.option("--context", "context_chars", default=50, type=int, help="Characters of context per side in snippets (raise for fuller quotes)")
+@click.option("--full", is_flag=True, help="Show all hit details for each displayed video on fetched pages")
+@click.option(
+    "--raw",
+    is_flag=True,
+    help="Output one processed JSON response with scope metadata",
+)
+@click.option("--min-matches", default=None, type=click.IntRange(0), help="Only show videos with at least N subtitle matches")
+@click.option("--limit", "--top", "limit", default=None, type=click.IntRange(0),
+              help="Maximum video results to display/output")
+@click.option("--max-hits", default=None, type=click.IntRange(0),
+              help="Maximum hit details to display per video")
+@click.option("--context", "context_chars", default=50, type=click.IntRange(0), help="Characters of context per side in snippets (raise for fuller quotes)")
 @click.option("--bulk-download", default=None, help="Download top N transcripts to TOPIC (e.g., --bulk-download prompt-injection:10)")
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback during bulk download when captions unavailable")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts during bulk download")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy during bulk download, connect directly")
-def search(query: str, lang: str, page: int, category: str, exclude: str,
+def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
+           category: str, exclude: str,
            channel_id: str, channel: str, channel_count: int, title: str,
            min_views: int, max_views: int, min_likes: int, max_likes: int,
            min_duration: int, max_duration: int, start_date: str, end_date: str,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
            max_query_time: int, hit_format: str, full: bool, raw: bool, min_matches: int,
-           context_chars: int, bulk_download: str, fallback: bool, dedupe: bool, no_proxy: bool):
+           limit: int, max_hits: int, context_chars: int, bulk_download: str,
+           fallback: bool, dedupe: bool, no_proxy: bool):
     """Search for videos by subtitle/transcript content.
-    
+
+    Unquoted words use loose transcript-wide implicit AND: each word may occur
+    anywhere in the same transcript and does not imply a relationship. Use an
+    exact phrase or NEAR/N when the relationship itself matters. ``--full``
+    expands hit details; it does not fetch additional result pages.
+
     Examples:
-    
-        filmot search "hello world"
-        
-        filmot search "machine learning" --lang en --category "Science & Technology"
-        
-        filmot search "recipe" --min-views 10000 --sort viewcount --order desc
-        
+
+    \b
+        filmot search "machine learning"             # loose transcript-wide AND
+        filmot search '"machine learning"'           # exact phrase
+        filmot search 'OpenAI|Anthropic'             # OR
+        filmot search '"AI" NEAR/20 "job loss"'      # relationship/proximity
+        filmot search "recipe" --pages 3 --sort density --limit 20
         filmot search "tutorial" --channel "programming" --channel-count 5
-        
-        filmot search "news" --country 217 --license 2
     """
-    try:
-        client = FilmotClient()
-        with console.status(f"[bold green]Searching subtitles for '{query}'..."):
-            results = client.search_subtitles(
-                query=query,
-                lang=lang,
-                page=page,
-                category=category,
-                exclude_category=exclude,
-                channel_id=channel_id,
-                channel=channel,
-                channel_count=channel_count,
-                title=title,
-                min_views=min_views,
-                max_views=max_views,
-                min_likes=min_likes,
-                max_likes=max_likes,
-                start_duration=min_duration,
-                end_duration=max_duration,
-                start_date=start_date,
-                end_date=end_date,
-                country=country,
-                license_type=int(license_type) if license_type else None,
-                sort_field=sort if sort != "density" else None,
-                sort_order=order if sort != "density" else None,
-                search_manual_subs=1 if manual_subs else None,
-                max_query_time=max_query_time,
-                hit_format=int(hit_format) if hit_format else None,
+    from .ledger import log_event
+
+    if raw and bulk_download:
+        raise click.UsageError("--raw and --bulk-download cannot be combined")
+    if not bulk_download and (fallback or dedupe or no_proxy):
+        raise click.UsageError(
+            "--fallback, --dedupe, and --no-proxy require --bulk-download"
+        )
+    for minimum, maximum, label in (
+        (min_views, max_views, "views"),
+        (min_likes, max_likes, "likes"),
+        (min_duration, max_duration, "duration"),
+    ):
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise click.UsageError(
+                f"minimum {label} cannot exceed maximum {label}"
             )
 
+    try:
+        client = FilmotClient()
+        resolved_channels = []
+        resolved_channel_ids = None
+        if channel:
+            try:
+                resolved_channel_ids, resolved_channels = _resolve_channel_filter(
+                    client, channel, channel_count
+                )
+            except click.ClickException as error:
+                log_event(
+                    "search",
+                    query=query,
+                    channel=channel,
+                    channel_count=channel_count,
+                    status="failed",
+                    error=str(error),
+                    raw=raw,
+                )
+                _command_error(str(error), raw=raw)
+        effective_channel_ids = _merge_channel_ids(channel_id, resolved_channel_ids)
+
+        api_kwargs = dict(
+            lang=lang,
+            category=category,
+            exclude_category=exclude,
+            channel_id=effective_channel_ids,
+            title=title,
+            min_views=min_views,
+            max_views=max_views,
+            min_likes=min_likes,
+            max_likes=max_likes,
+            start_duration=min_duration,
+            end_duration=max_duration,
+            start_date=start_date,
+            end_date=end_date,
+            country=country,
+            license_type=int(license_type) if license_type else None,
+            sort_field=sort if sort != "density" else None,
+            sort_order=order if sort != "density" else None,
+            search_manual_subs=1 if manual_subs else None,
+            max_query_time=max_query_time,
+            hit_format=int(hit_format) if hit_format else None,
+        )
+
+        if page is not None and (pages > 1 or candidate_pool is not None):
+            raise click.UsageError(
+                "--page cannot be combined with --pages or --candidate-pool"
+            )
+
+        fetch_many = pages > 1 or candidate_pool is not None
+        with _search_status(
+            f"[bold green]Searching subtitles for '{query}'...", raw=raw
+        ):
+            if fetch_many:
+                results = client.search_subtitles_all(
+                    query=query,
+                    max_pages=pages,
+                    max_results=candidate_pool,
+                    **api_kwargs,
+                )
+            else:
+                results = client.search_subtitles(
+                    query=query,
+                    page=page,
+                    **api_kwargs,
+                )
+
+        diagnostics = []
         if client.last_query_rewrite and not raw:
-            console.print(
+            diagnostics.append(
                 f"[dim]Rewrote unsupported proximity syntax:[/dim] "
                 f"[dim]{client.last_query_rewrite['from']}[/dim] "
                 f"[dim]->[/dim] "
                 f"[dim]{client.last_query_rewrite['to']}[/dim]"
             )
-        
+
         if "error" in results:
-            console.print(f"[red]Error: {results['error']}[/red]")
-            return
+            log_event(
+                "search",
+                query=query,
+                lang=lang,
+                status="failed",
+                error=str(results["error"]),
+                channel=channel,
+                channel_id=effective_channel_ids,
+                title=title,
+            )
+            _command_error(
+                str(results["error"]),
+                raw=raw,
+                payload=results if raw else None,
+            )
+
+        # Fail closed if the API ever returns a video outside the displayed
+        # fuzzy-channel resolution.  Do not let a dropped upstream constraint
+        # masquerade as a channel-scoped search.
+        if effective_channel_ids:
+            allowed = set((effective_channel_ids or "").split(","))
+            outside = [
+                video for video in _result_videos(results)
+                if str(
+                    video.get("channelid")
+                    or video.get("channel_id")
+                    or ""
+                ) not in allowed
+            ]
+            if outside:
+                message = (
+                    "Filmot returned results outside, or without an ID in, the "
+                    "requested channel set; discarding the response rather "
+                    "than failing open."
+                )
+                log_event(
+                    "search",
+                    query=query,
+                    channel=channel,
+                    channel_id=effective_channel_ids,
+                    resolved_channels=resolved_channels or None,
+                    status="failed",
+                    failure_stage="channel_validation",
+                    outside_results=len(outside),
+                    error=message,
+                    raw=raw,
+                )
+                _command_error(
+                    message,
+                    raw=raw,
+                )
 
         # Apply --min-matches filter (client-side)
+        fetched_count = len(_result_videos(results))
         if min_matches is not None:
-            videos = results.get("result", [])
+            videos = _result_videos(results)
             filtered = [v for v in videos if len(v.get("hits", [])) >= min_matches]
             original_count = len(videos)
             results["result"] = filtered
             if original_count != len(filtered):
-                console.print(f"[dim]Filtered: {original_count} -> {len(filtered)} videos (min {min_matches} matches)[/dim]")
+                diagnostics.append(
+                    f"[dim]Filtered: {original_count} -> {len(filtered)} videos "
+                    f"(min {min_matches} matches)[/dim]"
+                )
 
         # Apply --sort density (client-side sort by matches per minute)
         if sort == "density":
-            videos = results.get("result", [])
-            def _density_key(v):
-                dur = v.get("duration", 0)
-                hits = len(v.get("hits", []))
-                return hits / (dur / 60) if dur > 0 else 0
-            results["result"] = sorted(videos, key=_density_key, reverse=(order != "asc"))
-            console.print(f"[dim]Sorted by density (matches/min)[/dim]")
+            videos = _result_videos(results)
+            results["result"] = sorted(
+                videos, key=_density, reverse=(order != "asc")
+            )
+            diagnostics.append("[dim]Sorted by density (matches/min)[/dim]")
+
+        scope = _search_scope(results, page)
+        scope["candidates_fetched"] = fetched_count
+        scope["post_filter_count"] = len(_result_videos(results))
+        results["scope"] = scope
+
+        if scope["partial"]:
+            diagnostics.append(
+                "[yellow]Partial result set:[/yellow] pagination stopped early"
+                + (
+                    f" ({_whole_word_summary(results['page_error'])})"
+                    if results.get("page_error")
+                    else ""
+                )
+                + "."
+            )
+
+        if (sort == "density" or min_matches is not None) and \
+                scope["api_total"] > scope["candidates_fetched"]:
+            scope_message = (
+                f"Client-side {'sorting/filtering' if sort == 'density' and min_matches is not None else 'sorting' if sort == 'density' else 'filtering'} "
+                f"covered {scope['candidates_fetched']} fetched candidate(s) across "
+                f"{scope['pages_fetched']} page(s), not all {scope['api_total']:,} API results. "
+                "Increase --pages/--candidate-pool for a wider ranking scope."
+            )
+            diagnostics.append(f"[yellow]Scope:[/yellow] {scope_message}")
 
         # Hint if --title filter produced no results
-        videos_list = results.get("result", [])
+        videos_list = _result_videos(results)
         if not videos_list and title:
-            console.print(f"[yellow]No results with --title \"{title}\". Try without --title to broaden the search.[/yellow]")
+            diagnostics.append(
+                f"[yellow]No results with --title \"{title}\". "
+                "Try without --title to broaden the search.[/yellow]"
+            )
+
+        low_result_hint = _low_result_query_hint(
+            query,
+            int(results.get("totalresultcount", fetched_count) or 0),
+        )
+        if low_result_hint:
+            diagnostics.append(
+                f"[yellow]Recall hint:[/yellow] {low_result_hint}"
+            )
+
+        # B1/B6c: write the complete event before any render, raw return, bulk
+        # return, or pipe-sensitive output.
+        log_event(
+            "search",
+            query=query,
+            effective_query=(
+                client.last_query_rewrite["to"]
+                if client.last_query_rewrite else query
+            ),
+            lang=lang,
+            page=page or 1,
+            pages=scope["pages_fetched"],
+            candidate_pool=candidate_pool,
+            category=category,
+            exclude_category=exclude,
+            channel=channel,
+            resolved_channels=resolved_channels or None,
+            channel_id=effective_channel_ids,
+            channel_count=channel_count,
+            title=title,
+            min_views=min_views,
+            max_views=max_views,
+            min_likes=min_likes,
+            max_likes=max_likes,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            start_date=start_date,
+            end_date=end_date,
+            country=country,
+            license=license_type,
+            sort=sort,
+            order=order,
+            manual_subs=manual_subs,
+            max_query_time=max_query_time,
+            hit_format=hit_format,
+            min_matches=min_matches,
+            full=full,
+            context_chars=context_chars,
+            api_total=scope["api_total"],
+            page_count=scope["candidates_fetched"],
+            post_filter_count=scope["post_filter_count"],
+            duplicates_skipped=results.get("duplicates_skipped", 0),
+            # Backward-compatible aliases used by the sessions renderer.
+            total=scope["api_total"],
+            results=scope["post_filter_count"],
+            partial=scope["partial"],
+            raw=raw,
+            bulk_download=bulk_download,
+            fallback=fallback,
+            dedupe=dedupe,
+            no_proxy=no_proxy,
+            limit=limit,
+            max_hits=max_hits,
+            status="partial" if scope["partial"] else "completed",
+        )
+
+        if resolved_channels:
+            rendered = ", ".join(
+                f'{item["name"]} ({item["id"]})' for item in resolved_channels
+            )
+            diagnostics.insert(
+                0, f"[cyan]Resolved --channel:[/cyan] {rendered}"
+            )
+
+        # Rendering can encounter EPIPE. The durable event above is already on
+        # disk before any of these human diagnostics are emitted.
+        for message in diagnostics:
+            _diagnostic(message, raw=raw)
 
         if raw:
-            click.echo(json_mod.dumps(results, indent=2, ensure_ascii=False))
+            raw_results = dict(results)
+            output_videos = _result_videos(results)
+            if limit is not None:
+                output_videos = output_videos[:limit]
+            if max_hits is not None:
+                output_videos = [
+                    dict(
+                        video,
+                        hits=list(video.get("hits", []))[:max_hits],
+                    )
+                    for video in output_videos
+                ]
+            raw_results["result"] = output_videos
+            raw_results["scope"] = dict(
+                scope, output_count=len(output_videos),
+                max_hits=max_hits,
+            )
+            raw_results["effective_filters"] = {
+                "channel_id": effective_channel_ids,
+                "resolved_channels": resolved_channels,
+                "title": title,
+                "lang": lang,
+            }
+            click.echo(json_mod.dumps(raw_results, indent=2, ensure_ascii=False))
             return
 
         if client.last_cache_hit:
@@ -173,28 +729,70 @@ def search(query: str, lang: str, page: int, category: str, exclude: str,
                 from .transcript import disable_proxy
                 disable_proxy()
                 console.print("[dim]Proxy disabled, using direct connection[/dim]")
-            _bulk_download_transcripts(results, bulk_download, console, fallback=fallback, dedupe=dedupe)
+            _bulk_download_transcripts(
+                results,
+                bulk_download,
+                console,
+                fallback=fallback,
+                dedupe=dedupe,
+                lang=lang,
+            )
             return
 
         # Display formatted results
-        _display_subtitle_results(results, query, full=full, context_chars=context_chars)
+        _display_subtitle_results(
+            results,
+            query,
+            full=full,
+            context_chars=context_chars,
+            limit=limit,
+            max_hits=max_hits,
+        )
 
         hint = _freshness_hint(start_date, end_date, query)
         if hint:
             console.print(f"\n{hint}")
 
-        from .ledger import log_event
-        _vids = results.get("result", [])
+    except BrokenPipeError:
+        _silence_broken_pipe_streams()
+        return
+    except OSError as error:
+        if error.errno in (errno.EPIPE, errno.EINVAL):
+            _silence_broken_pipe_streams()
+            return
         log_event(
-            "search", query=query, lang=lang, sort=sort,
-            start_date=start_date, end_date=end_date,
-            results=len(_vids), total=results.get("totalresultcount"),
+            "search",
+            query=query,
+            status="failed",
+            failure_stage="io",
+            error=f"{type(error).__name__}: {error}",
+            raw=raw,
         )
-
+        _command_error(str(error), raw=raw)
+    except click.exceptions.Exit:
+        raise
+    except click.ClickException:
+        raise
     except ValueError as e:
-        console.print(f"[red]Configuration Error: {e}[/red]")
+        log_event(
+            "search",
+            query=query,
+            status="failed",
+            failure_stage="configuration",
+            error=f"{type(e).__name__}: {e}",
+            raw=raw,
+        )
+        _command_error(f"Configuration error: {e}", raw=raw)
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        log_event(
+            "search",
+            query=query,
+            status="failed",
+            failure_stage="unexpected",
+            error=f"{type(e).__name__}: {e}",
+            raw=raw,
+        )
+        _command_error(str(e), raw=raw)
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -345,7 +943,7 @@ def _format_count(count: int) -> str:
         return str(count)
 
 
-def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> None:
+def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> bool:
     """Run a proximity/plain query against a fetched transcript and print matches.
 
     Reuses the local proximity engine from channel_dl (NEAR/N, OR-groups, ~N tilde,
@@ -366,7 +964,7 @@ def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> None
     segments = result.get("segments", [])
     if not text:
         console.print("[yellow]No transcript text to search.[/yellow]")
-        return
+        return False
 
     # Build a char-offset → segment-start-time index matching how full_text was joined
     offsets = []  # (start_char, seg_start_seconds)
@@ -393,7 +991,7 @@ def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> None
             "[red]Error:[/red] query has proximity operators but couldn't be parsed. "
             'Use \'"a" NEAR/N "b"\', \'("a"|"b") NEAR/N "c"\', or \'"a b"~N\'.'
         )
-        return
+        return False
 
     text_lower = text.lower()
     if parsed[0] == "near":
@@ -408,7 +1006,7 @@ def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> None
 
     if not spans:
         console.print(f"[dim]No matches for '{query}' in transcript.[/dim]")
-        return
+        return True
 
     console.print(f"[bold]{len(spans)} match(es) for '{query}':[/bold]\n")
     for start_c, end_c in spans:
@@ -423,6 +1021,7 @@ def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> None
             snippet = snippet + "..."
         loc = f"[link={link}]{_format_timestamp(ts)}[/link]" if link else _format_timestamp(ts)
         console.print(f"  [[cyan]{loc}[/cyan]] {snippet}\n")
+    return True
 
 
 def _all_substring_positions(haystack: str, needle: str) -> list:
@@ -496,7 +1095,14 @@ def _backfill_metadata(video_id: str, title: str, channel: str) -> tuple:
     return title, channel
 
 
-def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallback: bool = False, dedupe: bool = False):
+def _bulk_download_transcripts(
+    results: dict,
+    bulk_download: str,
+    console,
+    fallback: bool = False,
+    dedupe: bool = False,
+    lang: str = None,
+):
     """Download transcripts from search results to library.
 
     Args:
@@ -505,10 +1111,17 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
         console: Rich console for output
         fallback: If True, use AWS Transcribe when YouTube captions unavailable
         dedupe: If True, skip transcripts that are near-duplicates of already downloaded ones
+        lang: Optional preferred transcript language
     """
     import hashlib
     from .library import get_library
-    from .transcript import get_transcript, get_transcript_with_fallback
+    from .ledger import log_event
+    from .transcript import (
+        describe_routing_plan,
+        get_transcript,
+        get_transcript_with_fallback,
+        routing_plan,
+    )
 
     # Parse bulk_download format: "topic:10" or just "topic"
     if ":" in bulk_download:
@@ -527,10 +1140,31 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
 
     if not videos:
         console.print("[yellow]No videos to download.[/yellow]")
-        return
+        log_event(
+            "bulk_download",
+            topic=topic,
+            selected=0,
+            saved=0,
+            skipped=0,
+            failed=0,
+            status="empty",
+        )
+        return {
+            "selected": 0,
+            "saved": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
 
     # Limit to max_count
     videos_to_download = videos[:max_count]
+    route_plan = routing_plan()
+    click.echo(
+        f"Transcript routes ({route_plan['mode']}): "
+        f"{describe_routing_plan(route_plan)}; "
+        f"route deadline {route_plan['route_timeout_s']:g}s",
+        err=True,
+    )
 
     library = get_library()
     success_count = 0
@@ -560,21 +1194,76 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
 
         # Check if already cached
         if library.exists(video_id, topic):
-            console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {video_id} - already in library")
+            log_event(
+                "transcript_save", topic=topic, video_id=video_id,
+                status="skipped", reason="already_exists", source="bulk_download",
+            )
             skip_count += 1
+            console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {video_id} - already in library")
             continue
 
         try:
+            log_event(
+                "transcript_save",
+                topic=topic,
+                video_id=video_id,
+                status="started",
+                source="bulk_download",
+                index=i,
+                selected=len(videos_to_download),
+                lang=lang,
+            )
+            console.print(
+                f"  [{i}/{len(videos_to_download)}] [dim]Fetching {video_id} "
+                f"(transcript route ladder)...[/dim]"
+            )
+            route_progress = _route_progress_for(video_id)
             if fallback:
-                result = get_transcript_with_fallback(video_id, use_aws_fallback=True)
+                result = get_transcript_with_fallback(
+                    video_id,
+                    languages=[lang] if lang else None,
+                    use_aws_fallback=True,
+                    aws_progress_callback=lambda stage, message, _id=video_id: (
+                        click.echo(
+                            f"{_id} AWS:{stage} {message}",
+                            err=True,
+                        )
+                    ),
+                    progress_callback=route_progress,
+                    fresh_primary=True,
+                )
             else:
-                result = get_transcript(video_id)
+                result = get_transcript(
+                    video_id,
+                    languages=[lang] if lang else None,
+                    progress_callback=route_progress,
+                    fresh_primary=True,
+                )
+
+            if any(
+                str(route).startswith("pool:")
+                for route in result.get("routes_tried", [])
+            ) and result.get("route_errors"):
+                proxy_errors = True
 
             if "error" in result:
-                console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {result['error']}")
+                log_event(
+                    "transcript_save", topic=topic, video_id=video_id,
+                    status="failed", source="bulk_download",
+                    error=_whole_word_summary(result["error"], 500),
+                    error_type=result.get("error_type"),
+                    route=result.get("route"),
+                    routes_tried=result.get("routes_tried"),
+                    route_errors=result.get("route_errors"),
+                )
                 if "proxy" in str(result["error"]).lower():
                     proxy_errors = True
                 fail_count += 1
+                console.print(
+                    f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] "
+                    f"{video_id} - "
+                    f"{_transcript_failure_detail(result, verbose=False)}"
+                )
                 continue
 
             full_text = result.get('full_text', '')
@@ -583,8 +1272,12 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
             if dedupe and full_text:
                 text_hash = hashlib.md5(full_text[:500].encode()).hexdigest()
                 if text_hash in seen_hashes:
-                    console.print(f"  [{i}/{len(videos_to_download)}] [magenta]Dedupe[/magenta] {video_id} - duplicate content")
+                    log_event(
+                        "transcript_save", topic=topic, video_id=video_id,
+                        status="skipped", reason="duplicate", source="bulk_download",
+                    )
                     dedupe_count += 1
+                    console.print(f"  [{i}/{len(videos_to_download)}] [magenta]Dedupe[/magenta] {video_id} - duplicate content")
                     continue
                 seen_hashes.add(text_hash)
 
@@ -597,6 +1290,7 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
                 "duration_seconds": result.get("duration_seconds"),
                 "segment_count": result.get("segment_count"),
                 "views": video.get("viewcount"),
+                "route": result.get("route"),
             }
             library.save(
                 video_id=video_id,
@@ -604,25 +1298,74 @@ def _bulk_download_transcripts(results: dict, bulk_download: str, console, fallb
                 transcript_text=full_text,
                 metadata=metadata,
             )
-            console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {title[:50]}...")
+            log_event(
+                "transcript_save", topic=topic, video_id=video_id,
+                status="saved", source="bulk_download",
+                chars=len(full_text), route=result.get("route"),
+            )
             success_count += 1
+            console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {title[:50]}...")
 
         except Exception as e:
-            console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}")
+            log_event(
+                "transcript_save", topic=topic, video_id=video_id,
+                status="failed", source="bulk_download",
+                error=f"{type(e).__name__}: {_whole_word_summary(e, 500)}",
+            )
             if "proxy" in str(e).lower():
                 proxy_errors = True
             fail_count += 1
+            console.print(
+                f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] "
+                f"{video_id} - "
+                f"{type(e).__name__}: {_whole_word_summary(e)}"
+            )
 
     summary = f"\n[bold]Complete:[/bold] {success_count} saved, {skip_count} skipped, {fail_count} failed"
     if dedupe_count:
         summary += f", {dedupe_count} deduplicated"
+    outcome = {
+        "selected": len(videos_to_download),
+        "saved": success_count,
+        "skipped": skip_count + dedupe_count,
+        "failed": fail_count,
+        "deduped": dedupe_count,
+    }
+    log_event(
+        "bulk_download",
+        topic=topic,
+        status=(
+            "failed"
+            if videos_to_download and fail_count == len(videos_to_download)
+            else "completed_with_failures"
+            if fail_count
+            else "completed"
+        ),
+        routing_plan=route_plan,
+        fallback=fallback,
+        dedupe=dedupe,
+        lang=lang,
+        **outcome,
+    )
     console.print(summary)
     if proxy_errors:
         console.print("[yellow]Proxy connection failures detected — your proxy may be down. Try --no-proxy to connect directly.[/yellow]")
     console.print(f"[dim]View with: filmot library list {topic}[/dim]")
+    if videos_to_download and fail_count == len(videos_to_download):
+        _command_error(
+            f"All {fail_count} selected transcript downloads failed."
+        )
+    return outcome
 
 
-def _display_subtitle_results(results: dict, query: str, full: bool = False, context_chars: int = 50):
+def _display_subtitle_results(
+    results: dict,
+    query: str,
+    full: bool = False,
+    context_chars: int = 50,
+    limit: Optional[int] = None,
+    max_hits: Optional[int] = None,
+):
     """Display subtitle search results with rich formatting.
 
     Args:
@@ -631,14 +1374,24 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False, con
         full: If True, show all matches without truncation (useful for AI agents)
         context_chars: Characters of surrounding context per side for snippets
     """
-    videos = results.get("result", results.get("videos", results.get("items", [])))
+    all_videos = _result_videos(results)
+    videos = all_videos[:limit] if limit is not None else all_videos
 
     if not videos:
         console.print("[yellow]No results found.[/yellow]")
         return
 
     total = results.get("totalresultcount", len(videos))
-    console.print(Panel(f"[bold]Found {total:,} results for: {query}[/bold]"))
+    scope = results.get("scope", {})
+    fetched = scope.get("candidates_fetched", len(all_videos))
+    pages = scope.get("pages_fetched", results.get("pages_fetched", 1))
+    panel_text = f"[bold]Found {total:,} API results for: {query}[/bold]"
+    if fetched != total or len(videos) != fetched or pages > 1:
+        panel_text += (
+            f"\n[dim]Fetched {fetched:,} candidate(s) across {pages} page(s); "
+            f"displaying {len(videos):,}.[/dim]"
+        )
+    console.print(Panel(panel_text))
 
     # Echo detection: flag results that share near-identical phrasing (research
     # guide §3 — convergence vs echo). Computed across the whole result set.
@@ -669,7 +1422,8 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False, con
         duration_str = _format_duration(duration)
         channel_subs_str = _format_count(channel_subs) if channel_subs else "N/A"
 
-        # Engagement ratio (likes/views) — credibility signal per research guide §1
+        # Engagement ratio (likes/views) — a visible source-triage signal, not
+        # a credibility or truth score.
         eng_str = ""
         if views and views > 0:
             eng_pct = (likes / views) * 100
@@ -707,7 +1461,8 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False, con
             console.print(f"   [bold green]Matches ({len(hits)}{density_str}):[/bold green]{live_tag}")
 
             # Deduplicate near-identical hit segments (looping live streams)
-            display_hits = hits if full else hits[:3]
+            hit_cap = max_hits if max_hits is not None else (None if full else 3)
+            display_hits = hits if hit_cap is None else hits[:hit_cap]
             seen_texts = set()
             deduped_hits = []
             for hit in display_hits:
@@ -728,8 +1483,9 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False, con
             hidden = len(display_hits) - len(deduped_hits)
             if hidden > 0:
                 console.print(f"      [dim]... {hidden} duplicate segments hidden[/dim]")
-            if not full and len(hits) > 3:
-                remaining = len(hits) - 3
+            shown_cap = len(display_hits)
+            if shown_cap < len(hits):
+                remaining = len(hits) - shown_cap
                 console.print(f"      [dim]... and {remaining} more matches[/dim]")
 
 
@@ -741,7 +1497,7 @@ def _display_subtitle_results(results: dict, query: str, full: bool = False, con
 @click.option("--raw", is_flag=True, help="Output raw JSON response")
 def video(video_ids: str, flags: int, raw: bool):
     """Get metadata for one or more videos.
-    
+
     VIDEO_IDS can be a single ID or comma-separated list.
     
     Examples:
@@ -752,12 +1508,18 @@ def video(video_ids: str, flags: int, raw: bool):
     """
     try:
         client = FilmotClient()
-        with console.status(f"[bold green]Fetching video metadata..."):
+        with _search_status("[bold green]Fetching video metadata...", raw=raw):
             result = client.get_videos(video_ids, flags=flags)
         
         if "error" in result:
-            console.print(f"[red]Error: {result['error']}[/red]")
-            return
+            _command_error(str(result["error"]), raw=raw, payload=result)
+
+        from .ledger import log_event
+        videos = result if isinstance(result, list) else [result]
+        log_event(
+            "video", video_ids=video_ids, flags=flags,
+            results=len(videos), raw=raw,
+        )
         
         if raw:
             click.echo(json_mod.dumps(result, indent=2, ensure_ascii=False))
@@ -769,10 +1531,14 @@ def video(video_ids: str, flags: int, raw: bool):
         # Display formatted results
         _display_video_results(result)
 
+    except click.exceptions.Exit:
+        raise
+    except click.ClickException:
+        raise
     except ValueError as e:
-        console.print(f"[red]Configuration Error: {e}[/red]")
+        _command_error(f"Configuration error: {e}", raw=raw)
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        _command_error(str(e), raw=raw)
 
 
 def _display_video_results(results):
@@ -846,12 +1612,19 @@ def channels(term: str, raw: bool):
     """
     try:
         client = FilmotClient()
-        with console.status(f"[bold green]Searching channels for '{term}'..."):
+        with _search_status(
+            f"[bold green]Searching channels for '{term}'...", raw=raw
+        ):
             result = client.search_channels(term)
         
         if "error" in result:
-            console.print(f"[red]Error: {result['error']}[/red]")
-            return
+            _command_error(str(result["error"]), raw=raw, payload=result)
+
+        from .ledger import log_event
+        log_event(
+            "channels", query=term,
+            results=len(_channel_candidates(result)), raw=raw,
+        )
         
         if raw:
             click.echo(json_mod.dumps(result, indent=2, ensure_ascii=False))
@@ -863,10 +1636,14 @@ def channels(term: str, raw: bool):
         # Display formatted results
         _display_channel_results(result, term)
         
+    except click.exceptions.Exit:
+        raise
+    except click.ClickException:
+        raise
     except ValueError as e:
-        console.print(f"[red]Configuration Error: {e}[/red]")
+        _command_error(f"Configuration error: {e}", raw=raw)
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        _command_error(str(e), raw=raw)
 
 
 def _display_channel_results(results: dict, term: str):
@@ -921,6 +1698,7 @@ def config():
     """Show current configuration status."""
     from .config import API_KEY, API_HOST, BASE_URL
     from .cache import get_cache
+    from .ledger import log_event
     from .rate_limiter import get_rate_limiter
     
     table = Table(title="Filmot CLI Configuration")
@@ -944,7 +1722,14 @@ def config():
     rl = get_rate_limiter()
     rl_stats = rl.stats()
     table.add_row("Requests Made", str(rl_stats["total_requests"]))
-    
+
+    log_event(
+        "config",
+        api_host=API_HOST,
+        cache_entries=stats["valid_entries"],
+        cache_size_mb=stats["size_mb"],
+        requests_made=rl_stats["total_requests"],
+    )
     console.print(table)
 
 
@@ -954,6 +1739,9 @@ def config():
 def interactive():
     """Start interactive REPL mode."""
     from .interactive import start_repl
+    from .ledger import log_event
+
+    log_event("interactive", status="started")
     start_repl()
 
 
@@ -965,17 +1753,21 @@ def interactive():
 def cache(clear: bool, clear_expired: bool):
     """Manage the response cache."""
     from .cache import get_cache
+    from .ledger import log_event
     
     cache_instance = get_cache()
     
     if clear:
         count = cache_instance.clear()
+        log_event("cache", action="clear", removed=count)
         console.print(f"[green]✓ Cleared {count} cache entries[/green]")
     elif clear_expired:
         count = cache_instance.clear_expired()
+        log_event("cache", action="clear_expired", removed=count)
         console.print(f"[green]✓ Cleared {count} expired entries[/green]")
     else:
         stats = cache_instance.stats()
+        log_event("cache", action="status", **stats)
         table = Table(title="Cache Statistics")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
@@ -996,10 +1788,10 @@ def cache(clear: bool, clear_expired: bool):
 @click.argument("query")
 @click.option("--output", "-o", required=True, help="Output file path")
 @click.option("--format", "-f", "fmt", type=click.Choice(["json", "csv"]), default="json", help="Export format")
-@click.option("--pages", "-p", default=1, type=int, help="Number of pages to fetch (default 1)")
+@click.option("--pages", "-p", default=1, type=click.IntRange(1), help="Number of pages to fetch (default 1)")
 @click.option("--detailed", is_flag=True, help="Export detailed hits (one row per hit for CSV)")
 @click.option("--lang", "-l", default=None, help="Language code")
-@click.option("--min-views", default=None, type=int, help="Minimum view count")
+@click.option("--min-views", default=None, type=click.IntRange(0), help="Minimum view count")
 @click.option("--category", "-c", default=None, help="Video category")
 def export(query: str, output: str, fmt: str, pages: int, detailed: bool,
            lang: str, min_views: int, category: str):
@@ -1029,8 +1821,7 @@ def export(query: str, output: str, fmt: str, pages: int, detailed: bool,
             )
     
     if "error" in results:
-        console.print(f"[red]Error: {results['error']}[/red]")
-        return
+        _command_error(str(results["error"]))
     
     try:
         if fmt == "json":
@@ -1041,9 +1832,16 @@ def export(query: str, output: str, fmt: str, pages: int, detailed: bool,
             path = export_csv(results, output)
         
         video_count = len(results.get("result", []))
+        from .ledger import log_event
+        log_event(
+            "export", query=query, output=str(path), format=fmt,
+            detailed=detailed, requested_pages=pages,
+            pages_fetched=results.get("pages_fetched", 1),
+            results=video_count,
+        )
         console.print(f"[green]✓ Exported {video_count} videos to: {path}[/green]")
     except Exception as e:
-        console.print(f"[red]Export failed: {e}[/red]")
+        _command_error(f"Export failed: {e}")
 
 
 # ========== BATCH OPERATIONS ==========
@@ -1067,9 +1865,9 @@ def batch(file: str, output: str, fmt: str):
     from pathlib import Path
     
     if not Path(file).exists():
-        console.print(f"[red]File not found: {file}[/red]")
-        console.print("[dim]Tip: Use 'filmot batch-template' to create a sample file[/dim]")
-        return
+        _command_error(
+            f"File not found: {file}. Use `filmot batch-template` to create a sample."
+        )
     
     client = FilmotClient()
     processor = BatchProcessor(client)
@@ -1077,8 +1875,7 @@ def batch(file: str, output: str, fmt: str):
     try:
         queries = processor.load_queries_from_file(file)
     except Exception as e:
-        console.print(f"[red]Failed to load queries: {e}[/red]")
-        return
+        _command_error(f"Failed to load queries: {e}")
     
     console.print(f"[bold]Loaded {len(queries)} queries from {file}[/bold]")
     
@@ -1097,6 +1894,19 @@ def batch(file: str, output: str, fmt: str):
     
     # Show summary
     stats = processor.stats()
+    from .ledger import log_event
+    log_event(
+        "batch", file=file, output=output, format=fmt,
+        queries=len(queries), successful=stats["successful"],
+        failed=stats["failed"], total_results=stats["total_results"],
+        status=(
+            "failed"
+            if queries and stats["successful"] == 0 and stats["failed"]
+            else "completed_with_failures"
+            if stats["failed"]
+            else "completed"
+        ),
+    )
     console.print(f"\n[bold]Results:[/bold]")
     console.print(f"  Successful: [green]{stats['successful']}[/green]")
     console.print(f"  Failed: [red]{stats['failed']}[/red]")
@@ -1109,7 +1919,10 @@ def batch(file: str, output: str, fmt: str):
             path = processor.export_results(output, fmt)
             console.print(f"\n[green]✓ Results exported to: {path}[/green]")
         except Exception as e:
-            console.print(f"[red]Export failed: {e}[/red]")
+            _command_error(f"Export failed: {e}")
+
+    if queries and stats["successful"] == 0 and stats["failed"]:
+        _command_error(f"All {stats['failed']} batch queries failed.")
 
 
 @cli.command("batch-template")
@@ -1130,6 +1943,12 @@ def batch_template(fmt: str, output: str):
         output = f"queries_template.{fmt}"
     
     path = create_batch_file_template(output, fmt)
+    from .ledger import log_event
+    log_event(
+        "batch_template",
+        output=str(path),
+        format=fmt,
+    )
     console.print(f"[green]✓ Created template: {path}[/green]")
 
 
@@ -1147,11 +1966,18 @@ def watchlist():
 def watchlist_list(unwatched: bool, tag: str):
     """Show all watchlist items."""
     from .watchlist import get_watchlist
+    from .ledger import log_event
     
     wl = get_watchlist()
     watched_filter = False if unwatched else None
     items = wl.get_watchlist(tag=tag, watched=watched_filter)
-    
+    log_event(
+        "watchlist_list",
+        unwatched=unwatched,
+        tag=tag,
+        results=len(items),
+    )
+
     if not items:
         console.print("[yellow]Watchlist is empty.[/yellow]")
         return
@@ -1189,6 +2015,7 @@ def watchlist_list(unwatched: bool, tag: str):
 def watchlist_add(video_id: str, notes: str):
     """Add a video to watchlist by ID."""
     from .watchlist import get_watchlist
+    from .ledger import log_event
     
     # Fetch video info first
     client = FilmotClient()
@@ -1196,14 +2023,31 @@ def watchlist_add(video_id: str, notes: str):
         result = client.get_videos(video_id)
     
     if "error" in result or not result:
-        console.print(f"[red]Could not fetch video: {video_id}[/red]")
-        return
+        detail = (
+            result.get("error")
+            if isinstance(result, dict)
+            else "empty video response"
+        )
+        log_event(
+            "watchlist_add",
+            video_id=video_id,
+            status="failed",
+            error=str(detail),
+        )
+        _command_error(f"Could not fetch video {video_id}: {detail}")
     
     video = result[0] if isinstance(result, list) else result
     video["id"] = video_id  # Ensure ID is set
     
     wl = get_watchlist()
-    if wl.add_video(video, notes):
+    added = wl.add_video(video, notes)
+    log_event(
+        "watchlist_add",
+        video_id=video_id,
+        status="added" if added else "already_present",
+        has_notes=bool(notes),
+    )
+    if added:
         console.print(f"[green]✓ Added: {video.get('title', video_id)}[/green]")
     else:
         console.print("[yellow]Video already in watchlist.[/yellow]")
@@ -1214,9 +2058,16 @@ def watchlist_add(video_id: str, notes: str):
 def watchlist_remove(video_id: str):
     """Remove a video from watchlist."""
     from .watchlist import get_watchlist
+    from .ledger import log_event
     
     wl = get_watchlist()
-    if wl.remove_video(video_id):
+    removed = wl.remove_video(video_id)
+    log_event(
+        "watchlist_remove",
+        video_id=video_id,
+        removed=removed,
+    )
+    if removed:
         console.print(f"[green]✓ Removed video: {video_id}[/green]")
     else:
         console.print(f"[yellow]Video not found in watchlist.[/yellow]")
@@ -1227,9 +2078,16 @@ def watchlist_remove(video_id: str):
 def watchlist_watched(video_id: str):
     """Mark a video as watched."""
     from .watchlist import get_watchlist
+    from .ledger import log_event
     
     wl = get_watchlist()
-    if wl.mark_watched(video_id, True):
+    updated = wl.mark_watched(video_id, True)
+    log_event(
+        "watchlist_watched",
+        video_id=video_id,
+        updated=updated,
+    )
+    if updated:
         console.print(f"[green]✓ Marked as watched[/green]")
     else:
         console.print(f"[yellow]Video not found in watchlist.[/yellow]")
@@ -1240,9 +2098,11 @@ def watchlist_watched(video_id: str):
 def watchlist_clear():
     """Clear all watchlist items."""
     from .watchlist import get_watchlist
+    from .ledger import log_event
     
     wl = get_watchlist()
     count = wl.clear_watchlist()
+    log_event("watchlist_clear", removed=count)
     console.print(f"[green]✓ Cleared {count} items from watchlist[/green]")
 
 
@@ -1250,10 +2110,10 @@ def watchlist_clear():
 
 @cli.command("search-all")
 @click.argument("query")
-@click.option("--pages", "-p", default=5, type=int, help="Max pages to fetch (default 5)")
-@click.option("--max-results", default=None, type=int, help="Max total results")
+@click.option("--pages", "-p", default=5, type=click.IntRange(1), help="Max pages to fetch (default 5)")
+@click.option("--max-results", default=None, type=click.IntRange(1), help="Max total results")
 @click.option("--lang", "-l", default=None, help="Language code")
-@click.option("--min-views", default=None, type=int, help="Minimum view count")
+@click.option("--min-views", default=None, type=click.IntRange(0), help="Minimum view count")
 @click.option("--category", "-c", default=None, help="Video category")
 @click.option("--output", "-o", default=None, help="Export results to file")
 @click.option("--format", "-f", "fmt", type=click.Choice(["json", "csv"]), default="json")
@@ -1268,40 +2128,124 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
         filmot search-all "tutorial" --max-results 200 -o results.json
     """
     from .export import export_json, export_csv
+    from .ledger import log_event
     
-    client = FilmotClient()
-    
-    with console.status(f"[bold green]Fetching up to {pages} pages for '{query}'..."):
-        results = client.search_subtitles_all(
+    try:
+        client = FilmotClient()
+
+        with console.status(f"[bold green]Fetching up to {pages} pages for '{query}'..."):
+            results = client.search_subtitles_all(
+                query=query,
+                max_pages=pages,
+                max_results=max_results,
+                lang=lang,
+                min_views=min_views,
+                category=category
+            )
+
+        if "error" in results:
+            log_event(
+                "search_all",
+                query=query,
+                lang=lang,
+                category=category,
+                min_views=min_views,
+                requested_pages=pages,
+                max_results=max_results,
+                output=output,
+                format=fmt,
+                status="failed",
+                failure_stage="api",
+                error=str(results["error"]),
+            )
+            _command_error(str(results["error"]))
+    except click.ClickException:
+        raise
+    except Exception as e:
+        log_event(
+            "search_all",
             query=query,
-            max_pages=pages,
-            max_results=max_results,
             lang=lang,
+            category=category,
             min_views=min_views,
-            category=category
+            requested_pages=pages,
+            max_results=max_results,
+            output=output,
+            format=fmt,
+            status="failed",
+            failure_stage="request",
+            error=f"{type(e).__name__}: {e}",
         )
-    
-    if "error" in results:
-        console.print(f"[red]Error: {results['error']}[/red]")
-        return
-    
+        _command_error(str(e))
+
     videos = results.get("result", [])
     total = results.get("totalresultcount", len(videos))
     pages_fetched = results.get("pages_fetched", 1)
-    
-    console.print(Panel(
-        f"[bold]Fetched {len(videos)} of {total:,} total results ({pages_fetched} pages)[/bold]"
-    ))
-    
+
+    exported_path = None
     if output:
         try:
             if fmt == "json":
-                path = export_json(results, output)
+                exported_path = export_json(results, output)
             else:
-                path = export_csv(results, output)
-            console.print(f"[green]✓ Exported to: {path}[/green]")
+                exported_path = export_csv(results, output)
         except Exception as e:
-            console.print(f"[red]Export failed: {e}[/red]")
+            log_event(
+                "search_all",
+                query=query,
+                lang=lang,
+                category=category,
+                min_views=min_views,
+                requested_pages=pages,
+                pages_fetched=pages_fetched,
+                max_results=max_results,
+                api_total=total,
+                results=len(videos),
+                partial=results.get("partial", False),
+                page_error=results.get("page_error"),
+                output=output,
+                format=fmt,
+                status="failed",
+                failure_stage="export",
+                error=f"{type(e).__name__}: {e}",
+            )
+            _command_error(f"Export failed: {e}")
+
+    log_event(
+        "search_all",
+        query=query,
+        lang=lang,
+        category=category,
+        min_views=min_views,
+        requested_pages=pages,
+        pages_fetched=pages_fetched,
+        max_results=max_results,
+        api_total=total,
+        results=len(videos),
+        partial=results.get("partial", False),
+        page_error=results.get("page_error"),
+        output=output,
+        exported_path=str(exported_path) if exported_path else None,
+        format=fmt,
+        status="partial" if results.get("partial") else "completed",
+    )
+
+    console.print(Panel(
+        f"[bold]Fetched {len(videos)} of {total:,} total results ({pages_fetched} pages)[/bold]"
+    ))
+    if results.get("partial"):
+        console.print(
+            "[yellow]Partial result set:[/yellow] pagination stopped early"
+            + (
+                f" ({_whole_word_summary(results['page_error'])})"
+                if results.get("page_error")
+                else ""
+            )
+            + "."
+        )
+
+    if output:
+        console.print(f"[green]✓ Exported to: {exported_path}[/green]")
     else:
         # Display summary
         _display_subtitle_results(results, query)
@@ -1313,7 +2257,7 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
 @click.argument("video_id", nargs=1)
 @click.option("--lang", "-l", default=None, help="Preferred language code (e.g., en, es, de)")
 @click.option("--timestamps", "-t", is_flag=True, help="Include timestamps for each segment")
-@click.option("--chunk", "-c", default=None, type=float, help="Chunk transcript into N-minute segments")
+@click.option("--chunk", "-c", default=None, type=click.FloatRange(min=0, min_open=True), help="Chunk transcript into N-minute segments")
 @click.option("--raw", is_flag=True, help="Output raw JSON response")
 @click.option("--output", "-o", default=None, help="Save transcript to file")
 @click.option("--full", is_flag=True, help="Output complete transcript text (for AI processing)")
@@ -1373,55 +2317,127 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         
         filmot transcript VIDEO_ID --fallback  # AWS fallback if no captions
     """
-    from .transcript import get_transcript, get_transcript_with_timestamps, format_timestamp, configure_proxy, is_proxy_configured, disable_proxy, get_transcript_with_fallback
+    from .transcript import (
+        configure_proxy,
+        describe_routing_plan,
+        disable_proxy,
+        format_timestamp,
+        get_transcript,
+        get_transcript_with_fallback,
+        get_transcript_with_timestamps,
+        routing_plan,
+    )
+
+    if proxy and no_proxy:
+        raise click.UsageError("--proxy and --no-proxy are mutually exclusive")
+    if raw and grep:
+        raise click.UsageError("--raw and --grep cannot be combined")
+    if raw and output:
+        raise click.UsageError("--raw and --output cannot be combined")
+    if chunk is not None and fallback:
+        raise click.UsageError("--chunk and --fallback cannot be combined")
+    if grep and any((save_to, output, full, timestamps, chunk is not None, fallback)):
+        raise click.UsageError(
+            "--grep cannot be combined with --save-to, --output, --full, "
+            "--timestamps, --chunk, or --fallback"
+        )
 
     # Handle proxy configuration (status messages go to stderr to avoid polluting --raw)
     if no_proxy:
         disable_proxy()
-        stderr_console.print(f"[dim]Proxy disabled, using direct connection[/dim]")
     elif proxy:
         try:
-            configure_proxy(http_proxy=proxy)
-            stderr_console.print(f"[dim]Using proxy: {proxy.split('@')[-1] if '@' in proxy else proxy}[/dim]")
+            configure_proxy(http_proxy=proxy, exclusive=True)
         except Exception as e:
-            console.print(f"[red]Proxy error: {e}[/red]")
-            return
-    else:
-        try:
-            from .proxy_pool import get_pool
-            _pool = get_pool()
-            if _pool is not None:
-                kind = "file-backed" if getattr(_pool, "_file_backed", False) else "API"
-                stderr_console.print(f"[dim]Webshare pool active ({_pool.healthy_count()} healthy sessions, {kind}) + direct fallback[/dim]")
-            elif is_proxy_configured():
-                stderr_console.print(f"[dim]Proxy configured from environment[/dim]")
-        except Exception:
-            pass
+            _command_error(f"Proxy error: {e}", raw=raw)
+
+    try:
+        route_plan = routing_plan()
+    except Exception as error:
+        _command_error(f"Could not prepare transcript routes: {error}", raw=raw)
+    if not raw:
+        click.echo(
+            f"Transcript routes ({route_plan['mode']}): "
+            f"{describe_routing_plan(route_plan)}; "
+            f"connect/read {route_plan['connect_timeout_s']:g}/"
+            f"{route_plan['read_timeout_s']:g}s; "
+            f"route deadline {route_plan['route_timeout_s']:g}s",
+            err=True,
+        )
+    route_progress = None if raw else _route_progress_for(video_id)
 
     # Progress callback for AWS fallback
     def aws_progress(stage: str, msg: str):
-        stderr_console.print(f"[cyan][AWS][/cyan] {msg}")
+        if not raw:
+            click.echo(f"AWS:{stage} {msg}", err=True)
     
-    with console.status(f"[bold green]Fetching transcript..."):
-        languages = [lang] if lang else None
-        
-        if chunk:
-            # Chunked mode doesn't support fallback (needs timestamps)
-            result = get_transcript_with_timestamps(video_id, languages, chunk_minutes=chunk)
-        elif fallback:
-            # Use fallback-enabled fetch
-            result = get_transcript_with_fallback(
-                video_id, 
-                languages, 
-                use_aws_fallback=True,
-                aws_progress_callback=aws_progress
-            )
-        else:
-            result = get_transcript(video_id, languages)
+    try:
+        with _search_status("[bold green]Fetching transcript...", raw=raw):
+            languages = [lang] if lang else None
+
+            if chunk:
+                # Chunked mode doesn't support fallback (needs timestamps)
+                result = get_transcript_with_timestamps(
+                    video_id,
+                    languages,
+                    chunk_minutes=chunk,
+                    progress_callback=route_progress,
+                )
+            elif fallback:
+                # Use fallback-enabled fetch
+                result = get_transcript_with_fallback(
+                    video_id,
+                    languages,
+                    use_aws_fallback=True,
+                    aws_progress_callback=aws_progress,
+                    progress_callback=route_progress,
+                )
+            else:
+                result = get_transcript(
+                    video_id,
+                    languages,
+                    progress_callback=route_progress,
+                )
+    except Exception as error:
+        from .ledger import log_event
+        detail = f"{type(error).__name__}: {error}"
+        log_event(
+            "transcript",
+            topic=save_to,
+            video_id=video_id,
+            grep=grep,
+            save_to=save_to,
+            status="failed",
+            error=detail,
+        )
+        _command_error(detail, raw=raw)
     
     if "error" in result:
         err_str = str(result.get('error', ''))
         err_low = err_str.lower()
+        from .ledger import log_event
+        log_event(
+            "transcript",
+            topic=save_to,
+            video_id=result.get("video_id", video_id),
+            grep=grep,
+            save_to=save_to,
+            status="failed",
+            error=_whole_word_summary(err_str, 500),
+            error_type=result.get("error_type"),
+            route=result.get("route"),
+            routes_tried=result.get("routes_tried"),
+            route_errors=result.get("route_errors"),
+            routing_plan=route_plan,
+        )
+
+        if raw:
+            _command_error(
+                err_str,
+                raw=True,
+                payload=result,
+            )
+
         console.print(f"[red]Error: {result['error']}[/red]")
         console.print(f"[dim]Video ID: {result.get('video_id', video_id)}[/dim]")
         if result.get("routes_tried"):
@@ -1444,59 +2460,141 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             console.print("\n[yellow]Tip: No captions found. Use --fallback to try AWS Transcribe.[/yellow]")
         elif not fallback:
             console.print("\n[dim]Tip: --fallback tries AWS Transcribe; --no-proxy bypasses the proxy.[/dim]")
-        return
-    
+        raise click.exceptions.Exit(1)
+
     # Show source if using fallback
     source = result.get('source', 'youtube')
     if source == 'aws_transcribe':
-        console.print(f"[cyan]Transcribed via AWS Transcribe (language: {result.get('language', 'unknown')})[/cyan]")
+        _diagnostic(
+            f"[cyan]Transcribed via AWS Transcribe "
+            f"(language: {result.get('language', 'unknown')})[/cyan]",
+            raw=raw,
+        )
+        if timestamps:
+            _diagnostic(
+                "[yellow]AWS fallback does not provide segment timestamps; "
+                "showing transcript text instead.[/yellow]",
+                raw=raw,
+            )
+            timestamps = False
+
+    from .ledger import log_event
+    log_event(
+        "transcript",
+        topic=save_to,
+        video_id=result.get("video_id", video_id),
+        grep=grep,
+        save_to=save_to,
+        output=output,
+        raw=raw,
+        full=full,
+        timestamps=timestamps,
+        chunk=chunk,
+        fallback=fallback,
+        status="fetched",
+        source=source,
+        language=result.get("language"),
+        chars=len(result.get("full_text", "")),
+        route=result.get("route"),
+        routes_tried=result.get("routes_tried"),
+        routing_plan=route_plan,
+    )
 
     # Grep mode: search within the transcript and print timestamped matches, then stop
     if grep:
-        _grep_transcript(result, grep)
-        from .ledger import log_event
-        log_event("transcript", video_id=result.get("video_id", video_id), grep=grep)
+        if not _grep_transcript(result, grep):
+            raise click.exceptions.Exit(2)
         return
 
     # Save to library if --save-to specified
     if save_to:
-        from .library import get_library
-        library = get_library()
+        try:
+            from .library import get_library
+            library = get_library()
 
-        # Check if already cached
-        if library.exists(result['video_id'], save_to):
-            console.print(f"[yellow]Already in library: {save_to}/{result['video_id']}[/yellow]")
-        else:
-            # Fetch video metadata so library entries have title/channel
-            video_title = "Unknown"
-            video_channel = "Unknown"
-            try:
-                client = FilmotClient()
-                video_info = client.get_videos(result['video_id'])
-                if isinstance(video_info, list) and video_info:
-                    video_title = video_info[0].get("title", "Unknown")
-                    video_channel = video_info[0].get("channelname", "Unknown")
-                elif isinstance(video_info, dict) and "error" not in video_info:
-                    video_title = video_info.get("title", "Unknown")
-                    video_channel = video_info.get("channelname", "Unknown")
-            except Exception:
-                pass  # Metadata fetch is best-effort
+            # Check if already cached
+            if library.exists(result['video_id'], save_to):
+                _diagnostic(
+                    f"[yellow]Already in library: "
+                    f"{save_to}/{result['video_id']}[/yellow]",
+                    raw=raw,
+                )
+                log_event(
+                    "transcript_save",
+                    topic=save_to,
+                    video_id=result["video_id"],
+                    status="skipped",
+                    reason="already_exists",
+                )
+            else:
+                # Fetch video metadata so library entries have title/channel
+                video_title = "Unknown"
+                video_channel = "Unknown"
+                try:
+                    client = FilmotClient()
+                    video_info = client.get_videos(result['video_id'])
+                    if isinstance(video_info, list) and video_info:
+                        video_title = video_info[0].get("title", "Unknown")
+                        video_channel = video_info[0].get(
+                            "channelname", "Unknown"
+                        )
+                    elif (
+                        isinstance(video_info, dict)
+                        and "error" not in video_info
+                    ):
+                        video_title = video_info.get("title", "Unknown")
+                        video_channel = video_info.get(
+                            "channelname", "Unknown"
+                        )
+                except Exception:
+                    pass  # Metadata fetch is best-effort
 
-            metadata = {
-                "title": video_title,
-                "channel": video_channel,
-                "language": result.get("language"),
-                "is_generated": result.get("is_generated"),
-                "duration_seconds": result.get("duration_seconds"),
-                "segment_count": result.get("segment_count"),
-            }
-            saved_path = library.save(
-                video_id=result['video_id'],
+                metadata = {
+                    "title": video_title,
+                    "channel": video_channel,
+                    "language": result.get("language"),
+                    "is_generated": result.get("is_generated"),
+                    "duration_seconds": result.get("duration_seconds"),
+                    "segment_count": result.get("segment_count"),
+                    "route": result.get("route"),
+                    "routes_tried": result.get("routes_tried"),
+                }
+                saved_path = library.save(
+                    video_id=result['video_id'],
+                    topic=save_to,
+                    transcript_text=result.get('full_text', ''),
+                    metadata=metadata,
+                )
+                log_event(
+                    "transcript_save",
+                    topic=save_to,
+                    video_id=result["video_id"],
+                    status="saved",
+                    path=str(saved_path),
+                    chars=len(result.get("full_text", "")),
+                    source=source,
+                    route=result.get("route"),
+                    routes_tried=result.get("routes_tried"),
+                )
+                _diagnostic(
+                    f"[green]✓ Saved to library: "
+                    f"{save_to}/{result['video_id']}[/green]",
+                    raw=raw,
+                )
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"
+            log_event(
+                "transcript_save",
                 topic=save_to,
-                transcript_text=result.get('full_text', ''),
-                metadata=metadata,
+                video_id=result["video_id"],
+                status="failed",
+                error=detail,
+                route=result.get("route"),
             )
-            console.print(f"[green]✓ Saved to library: {save_to}/{result['video_id']}[/green]")
+            _command_error(
+                f"Could not save transcript to library: {detail}",
+                raw=raw,
+            )
     
     # Raw JSON output
     if raw:
@@ -1520,8 +2618,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             console.print(f"[green]✓ Saved transcript to: {output}[/green]")
             return
         except Exception as e:
-            console.print(f"[red]Error saving file: {e}[/red]")
-            return
+            _command_error(f"Error saving file: {e}", raw=raw)
     
     # Full text output (for AI agents)
     if full:
@@ -1585,7 +2682,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 @cli.command()
 @click.argument("video_id")
 @click.argument("query")
-@click.option("--context", "-c", default=2, type=int, help="Number of segments for context (default: 2)")
+@click.option("--context", "-c", default=2, type=click.IntRange(0), help="Number of segments for context (default: 2)")
 @click.option("--lang", "-l", default=None, help="Preferred language code")
 def transcript_search(video_id: str, query: str, context: int, lang: str):
     """Search within a video's transcript.
@@ -1607,8 +2704,20 @@ def transcript_search(video_id: str, query: str, context: int, lang: str):
         result = search_in_transcript(video_id, query, context, languages)
     
     if "error" in result:
-        console.print(f"[red]Error: {result['error']}[/red]")
-        return
+        from .ledger import log_event
+        log_event(
+            "transcript_search", video_id=video_id, query=query,
+            lang=lang, context=context, status="failed",
+            error=str(result["error"]),
+        )
+        _command_error(str(result["error"]))
+
+    from .ledger import log_event
+    log_event(
+        "transcript_search", video_id=video_id, query=query,
+        lang=lang, context=context, status="completed",
+        matches=result.get("match_count", 0),
+    )
     
     console.print(Panel(
         f"[bold]Video ID:[/bold] {result['video_id']}\n"
@@ -1640,8 +2749,8 @@ def transcript_search(video_id: str, query: str, context: int, lang: str):
 
 @cli.command("yt-search")
 @click.argument("query")
-@click.option("--days", "-d", default=7, type=int, help="Search videos from last N days (default: 7)")
-@click.option("--max-results", "-n", default=25, type=int, help="Maximum results (default: 25, max: 50)")
+@click.option("--days", "-d", default=7, type=click.IntRange(1), help="Search videos from last N days (default: 7)")
+@click.option("--max-results", "-n", default=25, type=click.IntRange(1, 50), help="Maximum results (default: 25, max: 50)")
 @click.option("--order", "-o", default="date", 
               type=click.Choice(["date", "relevance", "viewCount", "rating", "title"]), 
               help="Sort order")
@@ -1759,6 +2868,15 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         log_event(
             "yt-search", query=query, days=days, order=order,
             lang=lang, region=region, results=len(results) if results else 0,
+            max_results=max_results, published_after=published_after,
+            published_before=published_before, channel_id=channel_id,
+            safe_search=safe_search, caption=caption, category=category,
+            definition=definition, dimension=dimension, duration=duration,
+            embeddable=embeddable, license=video_license,
+            syndicated=syndicated, video_type=video_type,
+            event_type=event_type, location=location,
+            location_radius=location_radius, topic_id=topic_id,
+            transcript=transcript, transcript_query=transcript_query,
         )
 
         if not results:
@@ -1797,7 +2915,10 @@ def yt_search(query: str, days: int, max_results: int, order: str,
             console.print(f"\n[bold cyan]{i}. {video['title']}[/bold cyan]")
             console.print(f"   Channel: [green]{video['channel_title']}[/green]")
             console.print(f"   Views: {views} | Duration: {duration_str} | Published: {published}")
-            console.print(f"   [link={video['url']}]{video['url']}[/link]")
+            video_url = video.get("url") or (
+                f"https://youtube.com/watch?v={video.get('video_id', '')}"
+            )
+            console.print(f"   [link={video_url}]{video_url}[/link]")
             
             if show_description and video.get('description'):
                 desc = video['description'][:200]
@@ -1823,10 +2944,11 @@ def yt_search(query: str, days: int, max_results: int, order: str,
                         console.print(f"   [dim]Transcript unavailable[/dim]")
                         
     except ValueError as e:
-        console.print(f"[red]Configuration Error: {e}[/red]")
-        console.print("[yellow]Add YOUTUBE_API_KEY to your .env file[/yellow]")
+        _command_error(
+            f"Configuration error: {e}. Add YOUTUBE_API_KEY to your .env file."
+        )
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        _command_error(str(e))
 
 
 # ========== TRANSCRIPT LIBRARY ==========
@@ -1859,11 +2981,16 @@ def library_list(topic: str):
     With a topic name, lists all transcripts in that topic.
     """
     from .library import get_library
+    from .ledger import log_event
     lib = get_library()
     
     if topic:
         # List transcripts in topic
         transcripts = lib.list_transcripts(topic)
+        log_event(
+            "library_list", topic=topic, scope="topic",
+            transcripts=len(transcripts),
+        )
         if not transcripts:
             console.print(f"[yellow]No transcripts in topic: {topic}[/yellow]")
             return
@@ -1888,6 +3015,7 @@ def library_list(topic: str):
     else:
         # List all topics
         topics = lib.list_topics()
+        log_event("library_list", scope="all", topics=len(topics))
         if not topics:
             console.print("[yellow]Library is empty. Use 'filmot transcript VIDEO_ID --save-to TOPIC' to add.[/yellow]")
             return
@@ -1915,6 +3043,7 @@ def library_search(query: str, topic: str, substring: bool):
     Use --substring for the old behavior.
     """
     from .library import get_library
+    from .ledger import log_event
     lib = get_library()
 
     with console.status(f"Searching library for '{query}'..."):
@@ -1922,18 +3051,28 @@ def library_search(query: str, topic: str, substring: bool):
 
     # Auto-fallback: if word-boundary found nothing, retry with substring
     # Catches plurals/inflections (e.g., "laser" misses "lasers")
+    used_substring = substring
     if not results and not substring:
         results = lib.search(query, topic=topic, substring=True)
         if results:
+            used_substring = True
             console.print(f"[dim]No exact word matches. Showing substring matches (plurals/inflections):[/dim]")
 
     if not results:
+        log_event(
+            "library_search", topic=topic, query=query,
+            substring=used_substring, sources=0, matches=0,
+        )
         console.print(f"[yellow]No matches for '{query}'[/yellow]")
         if not topic:
             console.print("[dim]Try searching within a specific topic: --topic NAME[/dim]")
         return
     
     total_matches = sum(r['match_count'] for r in results)
+    log_event(
+        "library_search", topic=topic, query=query,
+        substring=used_substring, sources=len(results), matches=total_matches,
+    )
     console.print(f"\n[bold]Found {total_matches} matches across {len(results)} transcripts[/bold]\n")
     
     for r in results[:10]:  # Show top 10 transcripts
@@ -1948,7 +3087,7 @@ def library_search(query: str, topic: str, substring: bool):
 
 @library.command("context")
 @click.argument("topic")
-@click.option("--max-chars", "-m", default=None, type=int, help="Maximum total characters")
+@click.option("--max-chars", "-m", default=None, type=click.IntRange(1), help="Maximum total characters")
 @click.option("--output", "-o", default=None, help="Save to file instead of printing")
 @click.option("--format", "-f", "fmt", type=click.Choice(["text", "structured"]), default="text", help="Output format: text (plain) or structured (markdown with metadata)")
 def library_context(topic: str, max_chars: int, output: str, fmt: str):
@@ -1960,6 +3099,7 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
     Use --format structured for markdown with full metadata headers.
     """
     from .library import get_library
+    from .ledger import log_event
     lib = get_library()
 
     with console.status(f"Building context from '{topic}'..."):
@@ -1969,6 +3109,10 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
             context = lib.get_context(topic, max_chars=max_chars)
 
     if not context:
+        log_event(
+            "library_context", topic=topic, format=fmt,
+            max_chars=max_chars, chars=0, status="empty",
+        )
         console.print(f"[yellow]No transcripts in topic: {topic}[/yellow]")
         return
 
@@ -1982,9 +3126,23 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
                 f.write(context)
             console.print(f"[green]✓ Saved context to: {output}[/green]")
             console.print(f"[dim]Size: {len(context):,} characters[/dim]")
+            log_event(
+                "library_context", topic=topic, format=fmt,
+                max_chars=max_chars, chars=len(context), output=output,
+                status="saved",
+            )
         except Exception as e:
-            console.print(f"[red]Error saving file: {e}[/red]")
+            log_event(
+                "library_context", topic=topic, format=fmt,
+                max_chars=max_chars, output=output, status="failed",
+                error=str(e),
+            )
+            _command_error(f"Error saving file: {e}")
     else:
+        log_event(
+            "library_context", topic=topic, format=fmt,
+            max_chars=max_chars, chars=len(context), status="rendered",
+        )
         console.print(context)
 
 
@@ -2037,9 +3195,16 @@ def _build_structured_context(lib, topic: str, max_chars=None) -> str:
 def library_stats():
     """Show library statistics."""
     from .library import get_library
+    from .ledger import log_event
     lib = get_library()
     
     stats = lib.stats()
+    log_event(
+        "library_stats",
+        topics=stats["total_topics"],
+        transcripts=stats["total_transcripts"],
+        size_bytes=stats["total_size_bytes"],
+    )
     
     console.print(Panel(
         f"[bold]Topics:[/bold] {stats['total_topics']}\n"
@@ -2072,11 +3237,16 @@ def library_delete(target: str, topic: str, delete_all: bool):
         filmot library delete TOPIC --all          # Delete entire topic
     """
     from .library import get_library
+    from .ledger import log_event
     lib = get_library()
     
     if delete_all:
         # Delete entire topic
         count = lib.delete_topic(target)
+        log_event(
+            "library_delete", topic=target, target=target,
+            scope="topic", deleted=count,
+        )
         if count > 0:
             console.print(f"[green]✓ Deleted topic '{target}' ({count} transcripts)[/green]")
         else:
@@ -2084,6 +3254,10 @@ def library_delete(target: str, topic: str, delete_all: bool):
     else:
         # Delete single transcript
         deleted = lib.delete(target, topic=topic)
+        log_event(
+            "library_delete", topic=topic, target=target,
+            scope="transcript", deleted=bool(deleted),
+        )
         if deleted:
             scope = f"from {topic}" if topic else "from all topics"
             console.print(f"[green]✓ Deleted transcript {target} {scope}[/green]")
@@ -2091,16 +3265,103 @@ def library_delete(target: str, topic: str, delete_all: bool):
             console.print(f"[yellow]Transcript not found: {target}[/yellow]")
 
 
+@library.command("migrate-topic")
+@click.argument("topic")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Confirm that the entire ambiguous legacy directory belongs to TOPIC",
+)
+def library_migrate_topic(topic: str, yes: bool):
+    """Explicitly assign a pre-Unicode topic directory to TOPIC.
+
+    Old Filmot versions discarded Unicode, so unrelated names could share a
+    directory such as ``uncategorized`` or ``ai``. This command moves the
+    entire derived legacy directory; it cannot infer or partition ownership.
+    Review both paths and confirm only when every source file belongs to TOPIC.
+    """
+    from .ledger import log_event
+    from .library import _legacy_normalize_topic, get_library
+
+    lib = get_library()
+    canonical_slug = lib._normalize_topic(topic)
+    legacy_slug = _legacy_normalize_topic(topic)
+    if canonical_slug == legacy_slug:
+        console.print(
+            f"[dim]No migration is needed: '{topic}' already uses "
+            f"'{canonical_slug}'.[/dim]"
+        )
+        return
+
+    source = lib.transcripts_dir / legacy_slug
+    destination = lib.transcripts_dir / canonical_slug
+    source_files = sorted(source.glob("*.json")) if source.exists() else []
+    if not source_files:
+        console.print(
+            f"[dim]No legacy transcript files found at {source}.[/dim]"
+        )
+        return
+
+    console.print(
+        Panel(
+            f"[bold yellow]Legacy source:[/bold yellow] {source}\n"
+            f"[bold green]Destination:[/bold green] {destination}\n"
+            f"[bold]Transcript files:[/bold] {len(source_files)}\n\n"
+            "Old slugs can represent more than one original topic. This "
+            "operation assigns the entire source directory to the destination; "
+            "existing destination files are never overwritten.",
+            title="Explicit legacy-topic migration",
+            border_style="yellow",
+        )
+    )
+    console.print(
+        "[yellow]Warning: this assigns the entire source directory.[/yellow]"
+    )
+    if not yes:
+        click.confirm(
+            f"Assign all {len(source_files)} legacy files to '{canonical_slug}'?",
+            abort=True,
+        )
+
+    migrated = lib.migrate_legacy_topic(topic)
+    remaining = (
+        len(list(source.glob("*.json")))
+        if source.exists()
+        else 0
+    )
+    log_event(
+        "library_migrate_topic",
+        topic=canonical_slug,
+        requested_topic=topic,
+        legacy_slug=legacy_slug,
+        canonical_slug=canonical_slug,
+        source_files=len(source_files),
+        migrated=migrated,
+        remaining=remaining,
+    )
+    console.print(
+        f"[green]Migrated {migrated} transcript file(s) to "
+        f"'{canonical_slug}'.[/green]"
+    )
+    if remaining:
+        console.print(
+            f"[yellow]{remaining} file(s) remain in '{legacy_slug}', usually "
+            "because the destination already exists or a source file is invalid."
+            "[/yellow]"
+        )
+        raise click.exceptions.Exit(2)
+
+
 @library.command("compare")
 @click.argument("query")
 @click.option("--topic", "-t", default=None, help="Limit to specific topic")
-@click.option("--context", "-c", "context_chars", default=300, type=int, help="Characters of context around matches (default: 300)")
+@click.option("--context", "-c", "context_chars", default=300, type=click.IntRange(0), help="Characters of context around matches (default: 300)")
 @click.option("--sort", "sort_by", default="mentions", type=click.Choice(["mentions", "density"]), help="Sort by mention count (default) or density (mentions/min)")
 def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
-    """Compare how different sources discuss a claim or term.
+    """Build a lexical concordance across sources for a term or phrase.
 
-    Searches across library transcripts and presents a structured
-    comparison showing each source's treatment of the topic.
+    This counts text matches and shows excerpts. It does not determine source
+    independence, stance, agreement, contradiction, credibility, or truth.
 
     Examples:
 
@@ -2115,12 +3376,18 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
         results = lib.search(query, topic=topic)
 
     # Auto-fallback: if word-boundary found nothing, retry with substring
+    used_substring = False
     if not results:
         results = lib.search(query, topic=topic, substring=True)
         if results:
-            console.print(f"[dim]No exact word matches. Showing substring matches (plurals/inflections):[/dim]")
+            used_substring = True
 
     if not results:
+        from .ledger import log_event
+        log_event(
+            "library_compare", topic=topic, query=query, sort=sort_by,
+            context=context_chars, sources=0, matches=0,
+        )
         console.print(f"[yellow]No sources mention '{query}'[/yellow]")
         return
 
@@ -2134,9 +3401,25 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
 
     total_mentions = sum(r['match_count'] for r in results)
     sort_label = "density (mentions/min)" if sort_by == "density" else "mention count"
+    from .ledger import log_event
+    log_event(
+        "library_compare",
+        topic=topic,
+        query=query,
+        sort=sort_by,
+        context=context_chars,
+        match_mode="substring" if used_substring else "word_boundary",
+        sources=len(results),
+        matches=total_mentions,
+    )
+    if used_substring:
+        console.print(
+            "[dim]No exact word matches. Showing substring matches "
+            "(plurals/inflections):[/dim]"
+        )
     console.print(Panel(
         f"[bold]'{query}' mentioned {total_mentions} times across {len(results)} sources[/bold]",
-        title="Cross-Source Comparison"
+        title="Cross-Source Concordance"
     ))
 
     for r in results:
@@ -2156,7 +3439,11 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
         if data:
             transcript = data.get("transcript", "")
             import re as _re
-            pattern = _re.compile(r'\b' + _re.escape(query.lower()) + r'\b')
+            pattern = (
+                _re.compile(_re.escape(query.lower()))
+                if used_substring
+                else _re.compile(r'(?<!\w)' + _re.escape(query.lower()) + r'(?!\w)')
+            )
             matches = lib._find_matches(transcript, query.lower(), context_chars=context_chars, pattern=pattern, min_gap=context_chars)
             for match in matches[:3]:
                 # Highlight the query term
@@ -2166,7 +3453,8 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
                 console.print(f"  [dim]{highlighted}[/dim]")
 
     # Summary
-    console.print(f"\n[dim]Sources sorted by {sort_label} (most relevant first)[/dim]")
+    console.print(f"\n[dim]Sources sorted by {sort_label} (highest lexical occurrence first)[/dim]")
+
 
 
 # ========== PROBE HELPERS ==========
@@ -2210,21 +3498,81 @@ _PROBE_STOPWORDS = frozenset({
 })
 
 
+def _probe_words(text: str) -> list[str]:
+    """Tokenize Latin and common non-Latin transcript scripts conservatively."""
+    import unicodedata
+
+    def script(character: str) -> str:
+        codepoint = ord(character)
+        if 0x4E00 <= codepoint <= 0x9FFF:
+            return "han"
+        if (
+            0x3040 <= codepoint <= 0x30FF
+            or 0x31F0 <= codepoint <= 0x31FF
+        ):
+            return "kana"
+        if 0xAC00 <= codepoint <= 0xD7AF:
+            return "hangul"
+        return "other"
+
+    words = []
+    for raw in re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE):
+        if raw.isascii():
+            if len(raw) >= 3:
+                words.append(raw)
+            continue
+
+        # Split unspaced mixed-script Japanese into useful lexical runs.
+        runs = []
+        current = ""
+        current_script = None
+        for character in raw:
+            if not unicodedata.category(character).startswith(("L", "N")):
+                continue
+            character_script = script(character)
+            if current and character_script != current_script:
+                runs.append((current_script, current))
+                current = ""
+            current_script = character_script
+            current += character
+        if current:
+            runs.append((current_script, current))
+
+        for run_script, run in runs:
+            if run_script == "han" and len(run) > 6:
+                # Chinese commonly has no word separators. Repeated 2–3
+                # character units provide a bounded, transparent fallback.
+                words.extend(run[index:index + 3] for index in range(len(run) - 2))
+            elif len(run) >= 2:
+                words.append(run)
+    return words
+
+
 def _extract_probe_terms(texts, topic, top_n=12):
     """Extract significant terms from transcript texts for NEAR/N probing.
 
-    Uses frequency-based extraction: finds frequent bigrams and single words
-    that aren't stopwords or the topic itself. No NLP libraries needed.
-    Thresholds adapt to corpus size so it works with 3 or 30 transcripts.
+    Preserve transcript and sentence boundaries, then prefer terms supported by
+    multiple distinct sources.  This prevents a repeated caption glitch in one
+    video—or a bigram accidentally formed at a transcript boundary—from
+    consuming the probe budget.
     """
     import re
-    from collections import Counter
+    from collections import Counter, defaultdict
+    from difflib import SequenceMatcher
 
-    combined = " ".join(texts).lower()
-    topic_words = set(re.findall(r'[a-z]{3,}', topic.lower()))
-
-    words = re.findall(r'[a-z]{3,}', combined)
-    total_words = len(words)
+    topic_words = set(_probe_words(topic))
+    source_sentences = []
+    total_words = 0
+    for text in texts:
+        sentences = []
+        # Newlines are meaningful for timestamped/manual transcripts; terminal
+        # punctuation provides the best available boundary for continuous ASR.
+        for sentence in re.split(r"(?:[.!?]+|\r?\n+)", text.lower()):
+            words = _probe_words(sentence)
+            if words:
+                sentences.append(words)
+                total_words += len(words)
+        source_sentences.append(sentences)
 
     # Adaptive thresholds: scale with corpus size
     # ~100 words -> min 2, ~1000 -> min 3, ~5000+ -> min 5
@@ -2233,35 +3581,77 @@ def _extract_probe_terms(texts, topic, top_n=12):
 
     # Bigrams: two consecutive non-stopwords
     bigrams = Counter()
-    for i in range(len(words) - 1):
-        w1, w2 = words[i], words[i + 1]
-        if w1 not in _PROBE_STOPWORDS and w2 not in _PROBE_STOPWORDS:
-            if w1 in topic_words and w2 in topic_words:
-                continue
-            bigrams[f"{w1} {w2}"] += 1
-
-    # Significant single words
+    bigram_sources = defaultdict(set)
     singles = Counter()
-    for w in words:
-        if w not in _PROBE_STOPWORDS and w not in topic_words and len(w) > 3:
-            singles[w] += 1
+    single_sources = defaultdict(set)
+    for source_index, sentences in enumerate(source_sentences):
+        for words in sentences:
+            for i in range(len(words) - 1):
+                w1, w2 = words[i], words[i + 1]
+                if w1 in _PROBE_STOPWORDS or w2 in _PROBE_STOPWORDS:
+                    continue
+                if w1 in topic_words and w2 in topic_words:
+                    continue
+                # Artificial whitespace can change CJK query semantics. Use
+                # repeated non-Latin terms as singles and pair them later.
+                if not (w1.isascii() and w2.isascii()):
+                    continue
+                term = f"{w1} {w2}"
+                bigrams[term] += 1
+                bigram_sources[term].add(source_index)
+            for word in words:
+                if (
+                    word not in _PROBE_STOPWORDS
+                    and word not in topic_words
+                    and len(word) >= (4 if word.isascii() else 2)
+                ):
+                    singles[word] += 1
+                    single_sources[word].add(source_index)
 
-    # Prefer bigrams (more specific), supplement with singles
+    # Rank by source support before raw repetition.  Bigrams remain preferable
+    # at equal support/count because they are usually more discriminating.
+    candidates = []
+    for term, count in bigrams.items():
+        if count >= bigram_min:
+            candidates.append((len(bigram_sources[term]), count, 1, term))
+    for term, count in singles.items():
+        if count >= single_min:
+            candidates.append((len(single_sources[term]), count, 0, term))
+    candidates.sort(key=lambda item: (item[0], item[2], item[1]), reverse=True)
+
+    # If at least two sources exist, first admit cross-source terms; retain a
+    # single-source fallback so small or heterogeneous corpora still probe.
+    if len(texts) >= 2 and any(item[0] >= 2 for item in candidates):
+        candidates = [item for item in candidates if item[0] >= 2] + [
+            item for item in candidates if item[0] < 2
+        ]
+
     terms = []
     seen_words = set()
+    for _, _, is_bigram, term in candidates:
+        if not is_bigram and term in seen_words:
+            continue
 
-    for term, count in bigrams.most_common(40):
-        if count >= bigram_min:
-            terms.append(term)
+        # Cluster likely ASR variants (e.g. "threei atlas" /
+        # "threeey atlas") and retain the higher-ranked canonical form.
+        is_variant = False
+        for existing in terms:
+            same_tail = (
+                len(term.split()) > 1
+                and len(existing.split()) > 1
+                and term.split()[-1] == existing.split()[-1]
+            )
+            if same_tail and SequenceMatcher(None, term, existing).ratio() >= 0.80:
+                is_variant = True
+                break
+        if is_variant:
+            continue
+
+        terms.append(term)
+        if is_bigram:
             seen_words.update(term.split())
-            if len(terms) >= top_n:
-                break
-
-    for term, count in singles.most_common(40):
-        if count >= single_min and term not in seen_words:
-            terms.append(term)
-            if len(terms) >= top_n:
-                break
+        if len(terms) >= top_n:
+            break
 
     return terms
 
@@ -2269,15 +3659,11 @@ def _extract_probe_terms(texts, topic, top_n=12):
 def _find_probe_pairs(texts, terms, window_size=50, max_pairs=5):
     """Find co-occurring term pairs within text windows.
 
-    Slides a window across the combined transcript text and counts
-    how often each pair of terms appears in the same window.
-    Returns top co-occurring pairs as NEAR/N probe candidates.
+    Windows never cross transcript or sentence boundaries. Returns
+    ``(term1, term2, co_window_count, supporting_source_count)``.
     """
     import re
-    from collections import Counter
-
-    combined = " ".join(texts).lower()
-    words = re.findall(r'[a-z]{3,}', combined)
+    from collections import Counter, defaultdict
 
     # Build lookup: word -> set of terms it belongs to
     word_to_terms = {}
@@ -2287,27 +3673,40 @@ def _find_probe_pairs(texts, terms, window_size=50, max_pairs=5):
 
     # Slide through text in overlapping windows (inclusive of the tail)
     pair_counts = Counter()
+    pair_sources = defaultdict(set)
     step = max(window_size // 2, 1)
-    last_start = max(len(words) - window_size, 0)
+    for source_index, text in enumerate(texts):
+        for sentence in re.split(r"(?:[.!?]+|\r?\n+)", text.lower()):
+            words = _probe_words(sentence)
+            if not words:
+                continue
+            starts = list(range(0, max(len(words) - window_size, 0) + 1, step))
+            tail_start = max(len(words) - window_size, 0)
+            if tail_start not in starts:
+                starts.append(tail_start)
+            for start in starts:
+                window = words[start:start + window_size]
+                window_terms = set()
 
-    for start in range(0, last_start + 1, step):
-        window = words[start:start + window_size]
-        window_terms = set()
+                for i, word in enumerate(window):
+                    if word in word_to_terms:
+                        for term in word_to_terms[word]:
+                            parts = term.split()
+                            if len(parts) == 1:
+                                window_terms.add(term)
+                            elif (
+                                word == parts[0]
+                                and i + len(parts) <= len(window)
+                                and window[i:i + len(parts)] == parts
+                            ):
+                                window_terms.add(term)
 
-        for i, w in enumerate(window):
-            if w in word_to_terms:
-                for term in word_to_terms[w]:
-                    parts = term.split()
-                    if len(parts) == 1:
-                        window_terms.add(term)
-                    elif w == parts[0] and i + 1 < len(window) and window[i + 1] == parts[1]:
-                        window_terms.add(term)
-
-        # Count all pairs in this window
-        window_list = sorted(window_terms)
-        for i in range(len(window_list)):
-            for j in range(i + 1, len(window_list)):
-                pair_counts[(window_list[i], window_list[j])] += 1
+                window_list = sorted(window_terms)
+                for i in range(len(window_list)):
+                    for j in range(i + 1, len(window_list)):
+                        pair = (window_list[i], window_list[j])
+                        pair_counts[pair] += 1
+                        pair_sources[pair].add(source_index)
 
     # Filter: skip pairs where terms share any word (e.g., "president vladimir" + "vladimir putin")
     # Rank by specificity first (multi-word terms beat frequent generic singles), then count
@@ -2315,21 +3714,36 @@ def _find_probe_pairs(texts, terms, window_size=50, max_pairs=5):
     for (t1, t2), count in pair_counts.items():
         if count < 2:
             continue
+        if len(texts) >= 2 and len(pair_sources[(t1, t2)]) < 2:
+            continue
         words_t1 = set(t1.split())
         words_t2 = set(t2.split())
         if words_t1 & words_t2:
             continue  # overlapping terms, skip
         specificity = (len(words_t1) > 1) + (len(words_t2) > 1)
-        candidates.append((specificity, count, t1, t2))
+        candidates.append((
+            len(pair_sources[(t1, t2)]),
+            specificity,
+            count,
+            t1,
+            t2,
+        ))
 
-    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
-    return [(t1, t2, count) for _, count, t1, t2 in candidates[:max_pairs]]
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [
+        (t1, t2, count, source_count)
+        for source_count, _, count, t1, t2 in candidates[:max_pairs]
+    ]
 
 
 def _probe_topic_words(topic: str) -> list[str]:
     """Significant topic words used to relevance-check probe results."""
-    import re
-    return [w for w in re.findall(r'[a-z0-9]{4,}', topic.lower()) if w not in _PROBE_STOPWORDS]
+    return [
+        word
+        for word in _probe_words(topic)
+        if word not in _PROBE_STOPWORDS
+        and len(word) >= (4 if word.isascii() else 2)
+    ]
 
 
 def _probe_hit_is_relevant(video: dict, topic_words: list[str]) -> bool:
@@ -2343,256 +3757,944 @@ def _probe_hit_is_relevant(video: dict, topic_words: list[str]) -> bool:
         parts.append(hit.get("ctx_after", ""))
         for line in hit.get("lines", [])[:3]:
             parts.append(line if isinstance(line, str) else str(line.get("text", "")))
-    text = " ".join(parts).lower()
-    return any(w in text for w in topic_words)
+    text = " ".join(parts).casefold()
+    return any(_topic_token_present(text, word) for word in topic_words)
+
+
+def _research_topic_tokens(topic: str) -> list[str]:
+    """Meaningful Unicode topic tokens used for transparent relevance scoring."""
+    tokens = re.findall(r"[^\W_]{2,}", topic.casefold(), flags=re.UNICODE)
+    return [token for token in tokens if token not in _PROBE_STOPWORDS]
+
+
+def _topic_token_present(text: str, token: str) -> bool:
+    """Match ASCII tokens as words and non-ASCII tokens as script substrings."""
+    if token.isascii():
+        return bool(
+            re.search(
+                rf"(?<!\w){re.escape(token)}(?!\w)",
+                text,
+                flags=re.UNICODE,
+            )
+        )
+    return token in text
+
+
+def _research_query_ladder(topic: str) -> list[tuple[str, str]]:
+    """Relationship-preserving transcript-only fallbacks, narrow to broad."""
+    escaped = topic.replace('"', " ").strip()
+    tokens = _research_topic_tokens(escaped)
+    ladder = []
+    if escaped:
+        ladder.append(("exact_phrase", f'"{escaped}"'))
+    proximity_tokens = tokens
+    if len(tokens) >= 4 and len(tokens[0]) <= 2:
+        # A leading acronym is often a modifier ("AI data center ..."); the
+        # adjacent multi-word concepts carry the relationship being tested.
+        proximity_tokens = tokens[1:]
+    if len(proximity_tokens) >= 2:
+        midpoints = [max(1, (len(proximity_tokens) + 1) // 2)]
+        alternate = max(1, len(proximity_tokens) // 2)
+        if alternate not in midpoints:
+            midpoints.append(alternate)
+        for split_index, midpoint in enumerate(midpoints):
+            left = " ".join(proximity_tokens[:midpoint])
+            right = " ".join(proximity_tokens[midpoint:])
+            if left and right:
+                stage = "proximity" if split_index == 0 else "proximity_alt"
+                ladder.append((stage, f'"{left}" NEAR/25 "{right}"'))
+    # De-duplicate degenerate forms while retaining stage names.
+    seen = set()
+    return [
+        (stage, query)
+        for stage, query in ladder
+        if not (query in seen or seen.add(query))
+    ]
+
+
+def _research_hit_text(hit: dict) -> str:
+    parts = [
+        hit.get("ctx_before", ""),
+        hit.get("token", ""),
+        hit.get("ctx_after", ""),
+    ]
+    for line in hit.get("lines", []):
+        parts.append(line if isinstance(line, str) else str(line.get("text", "")))
+    return " ".join(parts).casefold()
+
+
+def _candidate_assessment(video: dict, topic: str, echo_cluster=None) -> dict:
+    """Return separate, explainable relevance and source-quality signals."""
+    tokens = _research_topic_tokens(topic)
+    title = str(video.get("title", "")).casefold()
+    passages = []
+    description = str(video.get("description", "")).casefold()
+    if description:
+        passages.append(description)
+    passages.extend(
+        _research_hit_text(hit)
+        for hit in video.get("hits", [])[:25]
+    )
+    combined = " ".join([title] + passages)
+
+    if tokens:
+        token_coverage = (
+            sum(_topic_token_present(combined, token) for token in tokens)
+            / len(tokens)
+        )
+        passage_coverage = max(
+            (
+                sum(
+                    _topic_token_present(passage, token)
+                    for token in tokens
+                ) / len(tokens)
+                for passage in [title] + passages
+            ),
+            default=0.0,
+        )
+        title_coverage = (
+            sum(_topic_token_present(title, token) for token in tokens)
+            / len(tokens)
+        )
+    else:
+        # Non-Latin topics still get relationship safety from the exact/proximity
+        # fallback stage; do not pretend an ASCII tokenizer scored them.
+        token_coverage = passage_coverage = title_coverage = 0.0
+
+    views = max(int(video.get("viewcount", 0) or 0), 0)
+    likes = max(int(video.get("likecount", 0) or 0), 0)
+    subscribers = max(int(video.get("channelsubcount", 0) or 0), 0)
+    engagement = likes / views if views else 0.0
+
+    # A prior, not a verdict: independent visible signals remain inspectable.
+    audience_signal = min(math.log10(subscribers + 1) / 6.0, 1.0)
+    reach_signal = min(math.log10(views + 1) / 7.0, 1.0)
+    engagement_signal = min(engagement / 0.05, 1.0)
+    source_signal = (
+        0.50 * audience_signal
+        + 0.30 * reach_signal
+        + 0.20 * engagement_signal
+    )
+    echo_penalty = 0.25 if echo_cluster is not None else 0.0
+    density = _density(video)
+    density_signal = min(math.log1p(density) / math.log(6), 1.0)
+    relevance_signal = (
+        0.50 * passage_coverage
+        + 0.30 * title_coverage
+        + 0.20 * token_coverage
+    )
+    balanced = (
+        0.55 * relevance_signal
+        + 0.25 * source_signal
+        + 0.20 * density_signal
+        - echo_penalty
+    )
+    return {
+        "token_coverage": round(token_coverage, 3),
+        "passage_coverage": round(passage_coverage, 3),
+        "title_coverage": round(title_coverage, 3),
+        "density": round(density, 3),
+        "source_signal": round(source_signal, 3),
+        "echo_cluster": echo_cluster,
+        "balanced_score": round(balanced, 3),
+        "views": views,
+        "subscribers": subscribers,
+        "engagement": round(engagement, 4),
+    }
+
+
+def _rank_research_candidates(videos: list, topic: str, sort_by: str) -> list:
+    """Attach evidence and rank without conflating density/source authority."""
+    echo_clusters = _detect_echo_clusters(videos)
+    for index, video in enumerate(videos):
+        video["_selection"] = _candidate_assessment(
+            video, topic, echo_clusters.get(index)
+        )
+
+    if sort_by == "viewcount":
+        key = lambda video: int(video.get("viewcount", 0) or 0)
+    elif sort_by == "density":
+        key = _density
+    elif sort_by == "source-prior":
+        key = lambda video: video["_selection"]["source_signal"]
+    else:
+        key = lambda video: video["_selection"]["balanced_score"]
+    return sorted(videos, key=key, reverse=True)
+
+
+def _research_candidate_preview(videos: list, count: int = 8) -> None:
+    """Show why automatic research selected each candidate."""
+    if not videos:
+        return
+    console.print("\n[bold]Candidate preview (relevance and source signals are separate):[/bold]")
+    for index, video in enumerate(videos[:count], 1):
+        selection = video.get("_selection", {})
+        origin = "scout" if video.get("_from_scout") else video.get("_fallback_stage", "filmot")
+        console.print(
+            f"  {index}. {str(video.get('title', 'Unknown'))[:66]} "
+            f"[dim]({video.get('channelname', 'Unknown')})[/dim]\n"
+            f"     [dim]stage={origin}; relevance={selection.get('passage_coverage', 0):.2f}; "
+            f"source-prior={selection.get('source_signal', 0):.2f}; "
+            f"density={selection.get('density', 0):.2f}/min"
+            f"{'; echo=' + str(selection['echo_cluster']) if selection.get('echo_cluster') else ''}[/dim]"
+        )
 
 
 # ========== RESEARCH COMMAND ==========
 
-@cli.command()
+@cli.command("research")
 @click.argument("topic")
-@click.option("--depth", "-n", default=10, type=int, help="Number of transcripts to download (default: 10)")
-@click.option("--min-views", default=None, type=int, help="Minimum view count filter")
+@click.option("--depth", "-n", default=10, type=click.IntRange(0), show_default=True,
+              help="Number of transcripts to download")
+@click.option("--min-views", default=None, type=click.IntRange(0), help="Minimum view count filter")
 @click.option("--lang", "-l", default=None, help="Language code (default: en)")
-@click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback when captions unavailable")
+@click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback when captions are unavailable")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts")
-@click.option("--min-matches", default=2, type=int, help="Only download videos with at least N subtitle matches (default: 2, 0 to disable)")
-@click.option("--sort", "sort_by", default="density", type=click.Choice(["viewcount", "density"]), help="Sort by density (default, matches/min) or viewcount")
-@click.option("--scout/--no-scout", default=True, help="Run YouTube API scout for latest content (default: on, requires YOUTUBE_API_KEY)")
-@click.option("--scout-days", default=7, type=int, help="Scout window in days (default: 7)")
-@click.option("--probe", is_flag=True, help="Auto-probe: extract entities from transcripts and run NEAR/N searches to discover related content")
-@click.option("--no-proxy", is_flag=True, help="Bypass proxy for transcript downloads, connect directly")
-def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, dedupe: bool, min_matches: int, sort_by: str, scout: bool, scout_days: int, probe: bool, no_proxy: bool):
-    """Research a topic: scout, search, probe, and build knowledge base.
+@click.option("--min-matches", default=2, type=click.IntRange(0), show_default=True,
+              help="Minimum subtitle hits per Filmot candidate (0 disables)")
+@click.option(
+    "--sort", "sort_by", default="balanced", show_default=True,
+    type=click.Choice(["balanced", "density", "source-prior", "viewcount"]),
+    help="Candidate ranking; source-prior is an unverified audience/engagement heuristic",
+)
+@click.option("--candidate-pages", default=3, type=click.IntRange(1, 20), show_default=True,
+              help="Filmot pages to fetch before client-side ranking")
+@click.option("--candidate-pool", default=150, type=click.IntRange(1), show_default=True,
+              help="Maximum Filmot candidates to score")
+@click.option("--accept-broad", is_flag=True,
+              help="Allow a high-cardinality loose fallback after relationship-preserving stages fail")
+@click.option("--broad-threshold", default=1000, type=click.IntRange(1), show_default=True,
+              help="Require --accept-broad above this loose-fallback result count")
+@click.option("--channel-id", default=None, help="Limit Filmot candidates to exact channel ID(s)")
+@click.option("--channel", default=None, help="Resolve channel text explicitly, then fail closed")
+@click.option("--channel-count", default=None, type=click.IntRange(1),
+              help="Maximum fuzzy-channel resolutions (default: 10)")
+@click.option("--scout/--no-scout", default=True,
+              help="Run the YouTube freshness scout (requires YOUTUBE_API_KEY)")
+@click.option("--scout-days", default=7, type=click.IntRange(1), show_default=True)
+@click.option("--probe", is_flag=True,
+              help="Extract cross-source entities and run transparent NEAR/N probes")
+@click.option("--no-proxy", is_flag=True, help="Bypass proxy for transcript downloads")
+@click.option("--verbose", is_flag=True, help="Show full transcript failure details")
+def research(
+    topic: str,
+    depth: int,
+    min_views: int,
+    lang: str,
+    fallback: bool,
+    dedupe: bool,
+    min_matches: int,
+    sort_by: str,
+    candidate_pages: int,
+    candidate_pool: int,
+    accept_broad: bool,
+    broad_threshold: int,
+    channel_id: str,
+    channel: str,
+    channel_count: int,
+    scout: bool,
+    scout_days: int,
+    probe: bool,
+    no_proxy: bool,
+    verbose: bool,
+):
+    """Research TOPIC with staged search, visible selection, and checkpoints.
 
-    Multi-phase research pipeline:
-    1. Scout — YouTube API probe for latest uploads (freshness check)
-    2. Search — Filmot deep transcript search with density filtering
-    3. Synthesize — merge both, download transcripts, build library
-    4. Probe (--probe) — extract key entities, auto-generate NEAR/N queries,
-       discover related content the original search missed
-
-    The scout phase catches breaking news that Filmot hasn't indexed yet.
-    The probe phase compounds your results by mining downloaded transcripts
-    for entity relationships, then running targeted NEAR/N searches.
-
-    Examples:
+    The search ladder tries title+transcript, an exact phrase, and NEAR/N
+    before a loose transcript-wide query. A loose result set above
+    ``--broad-threshold`` is never downloaded unless ``--accept-broad`` is
+    explicit. Density is topical concentration, not source credibility.
 
     \b
-        filmot research "deep sea mining"
-        filmot research "quantum computing" --depth 20 --min-views 50000
-        filmot research "fusion energy" --dedupe --sort viewcount
-        filmot research "OpenClaw" --scout-days 3
-        filmot research "Russia Ukraine ceasefire" --probe --depth 8
+      filmot research "deep sea mining"
+      filmot research "AI data center electricity demand" --candidate-pages 5
+      filmot research "niche topic" --accept-broad --probe
+      filmot research "fusion" --channel "International Energy Agency"
     """
     import hashlib
-    from .library import get_library
-    from .transcript import get_transcript, get_transcript_with_fallback, disable_proxy, is_proxy_configured
+    import uuid
 
-    if no_proxy:
-        disable_proxy()
-        console.print("[dim]Proxy disabled, using direct connection[/dim]")
-    elif is_proxy_configured():
-        console.print("[dim]Using proxy from environment[/dim]")
+    from .ledger import log_event
+    from .library import get_library
+    from .transcript import (
+        describe_routing_plan,
+        disable_proxy,
+        get_transcript,
+        get_transcript_with_fallback,
+        routing_plan,
+    )
 
     library = get_library()
     normalized_topic = library._normalize_topic(topic)
+    run_id = uuid.uuid4().hex[:12]
+    run_status = "failed"
+    run_error = None
+    phase = "initializing"
+
+    scout_videos = []
+    total = 0
+    fallback_stage = None
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    dedupe_count = 0
+    probe_success = 0
+    probe_fail_count = 0
+    probe_query_fail_count = 0
+    total_chars = 0
+    probe_chars = 0
+    selected_count = 0
+    resolved_channels = []
+    effective_channel_ids = channel_id
+    route_plan = None
+    search_partial = False
+
+    start_fields = {
+        "run_id": run_id,
+        "query": topic,
+        "depth": depth,
+        "lang": lang or "en",
+        "min_views": min_views,
+        "min_matches": min_matches,
+        "sort": sort_by,
+        "candidate_pages": candidate_pages,
+        "candidate_pool": candidate_pool,
+        "accept_broad": accept_broad,
+        "broad_threshold": broad_threshold,
+        "channel": channel,
+        "channel_id": channel_id,
+        "channel_count": channel_count,
+        "scout": scout,
+        "scout_days": scout_days,
+        "probe": probe,
+        "dedupe": dedupe,
+        "fallback": fallback,
+    }
+    log_event("research_start", topic=normalized_topic, **start_fields)
+
+    def checkpoint(current_phase: str, **fields) -> None:
+        nonlocal phase
+        phase = current_phase
+        log_event(
+            "research_checkpoint",
+            topic=normalized_topic,
+            run_id=run_id,
+            phase=current_phase,
+            **fields,
+        )
+
+    def fetch_transcript(video_id: str):
+        route_progress = _route_progress_for(video_id)
+        languages = [lang] if lang else None
+        if fallback:
+            return get_transcript_with_fallback(
+                video_id,
+                languages=languages,
+                use_aws_fallback=True,
+                aws_progress_callback=lambda stage, message: click.echo(
+                    f"{video_id} AWS:{stage} {message}",
+                    err=True,
+                ),
+                progress_callback=route_progress,
+                fresh_primary=True,
+            )
+        return get_transcript(
+            video_id,
+            languages=languages,
+            progress_callback=route_progress,
+            fresh_primary=True,
+        )
 
     try:
-        client = FilmotClient()
-        console.print(f"[bold]Researching: {topic}[/bold]\n")
+        if no_proxy:
+            disable_proxy()
+        route_plan = routing_plan()
+        click.echo(
+            f"Transcript routes ({route_plan['mode']}): "
+            f"{describe_routing_plan(route_plan)}; "
+            f"route deadline {route_plan['route_timeout_s']:g}s",
+            err=True,
+        )
+        checkpoint("routing", status="ready", routing_plan=route_plan)
 
-        # ── Phase 1: Scout (YouTube API freshness probe) ──
-        scout_videos = []
+        client = FilmotClient()
+        if channel:
+            resolved_ids, resolved_channels = _resolve_channel_filter(
+                client, channel, channel_count
+            )
+            effective_channel_ids = _merge_channel_ids(channel_id, resolved_ids)
+            console.print(
+                "[cyan]Resolved --channel:[/cyan] "
+                + ", ".join(
+                    f'{item["name"]} ({item["id"]})'
+                    for item in resolved_channels
+                )
+            )
+
+        console.print(f"[bold]Researching: {topic}[/bold]")
+        console.print(f"[dim]Run ID: {run_id}[/dim]\n")
+
+        # Phase 1: freshness scout. A scout failure is non-fatal but explicit.
         if scout:
+            checkpoint(
+                "scout",
+                status="started",
+                query=topic,
+                days=scout_days,
+                channel_id=effective_channel_ids,
+            )
             try:
                 from .youtube_search import search_recent, validate_youtube_api
+
                 validate_youtube_api()
-                with console.status(f"[bold cyan]Scouting YouTube for latest '{topic}' uploads (last {scout_days} days)...[/bold cyan]"):
-                    scout_results = search_recent(
+                scout_allowed_ids = set(
+                    (effective_channel_ids or "").split(",")
+                ) - {""}
+                scout_channel_id = (
+                    next(iter(scout_allowed_ids))
+                    if len(scout_allowed_ids) == 1
+                    else None
+                )
+                with console.status(
+                    f"[bold cyan]Scouting YouTube for '{topic}' "
+                    f"(last {scout_days} days)...[/bold cyan]"
+                ):
+                    scout_videos = search_recent(
                         query=topic,
                         days_back=scout_days,
                         max_results=10,
                         order="relevance",
+                        channel_id=scout_channel_id,
+                    ) or []
+                if scout_allowed_ids:
+                    scout_videos = [
+                        video
+                        for video in scout_videos
+                        if str(video.get("channel_id") or "")
+                        in scout_allowed_ids
+                    ]
+                checkpoint(
+                    "scout",
+                    status="completed",
+                    results=len(scout_videos),
+                    channel_id=effective_channel_ids,
+                )
+                console.print(
+                    f"[cyan]Scout:[/cyan] Found {len(scout_videos)} recent upload(s)"
+                )
+                for index, video in enumerate(scout_videos[:5], 1):
+                    console.print(
+                        f"  {index}. {str(video.get('title', 'Unknown'))[:70]} "
+                        f"[dim]({str(video.get('published_at', ''))[:10]}, "
+                        f"{int(video.get('views', 0) or 0):,} views)[/dim]"
                     )
-                if scout_results:
-                    scout_videos = scout_results
-                    console.print(f"[cyan]Scout:[/cyan] Found {len(scout_videos)} recent YouTube uploads")
-                    for i, sv in enumerate(scout_videos[:5], 1):
-                        published = sv.get("published_at", "")[:10]
-                        views = sv.get("views", 0)
-                        console.print(f"  [cyan]{i}.[/cyan] {sv['title'][:70]} [dim]({published}, {views:,} views)[/dim]")
-                    if len(scout_videos) > 5:
-                        console.print(f"  [dim]... and {len(scout_videos) - 5} more[/dim]")
-                    console.print()
-                else:
-                    console.print(f"[dim]Scout: No recent YouTube uploads found for '{topic}'[/dim]\n")
-            except (ValueError, ImportError):
-                # No YOUTUBE_API_KEY or youtube_search not available — skip silently
-                console.print(f"[dim]Scout: Skipped (YOUTUBE_API_KEY not configured)[/dim]\n")
-            except Exception as e:
-                console.print(f"[dim]Scout: Skipped ({e})[/dim]\n")
+            except (ValueError, ImportError) as error:
+                checkpoint("scout", status="skipped", error=str(error))
+                console.print("[dim]Scout: Skipped (YOUTUBE_API_KEY not configured)[/dim]")
+            except Exception as error:
+                detail = f"{type(error).__name__}: {_whole_word_summary(error)}"
+                checkpoint(
+                    "scout",
+                    status="failed",
+                    error=detail,
+                )
+                console.print(
+                    f"[yellow]Scout: Failed ({detail})[/yellow]"
+                )
+        else:
+            checkpoint("scout", status="disabled", results=0)
 
-        # ── Phase 2: Search (Filmot deep transcript search) ──
-        api_sort = "viewcount" if sort_by != "density" else None
-        with console.status(f"[bold green]Searching Filmot transcripts for '{topic}'..."):
-            results = client.search_subtitles(
-                query=topic,
-                title=topic,
+        api_kwargs = {
+            "lang": lang or "en",
+            "min_views": min_views,
+            "channel_id": effective_channel_ids,
+        }
+
+        def run_search(
+            stage: str,
+            query: str,
+            *,
+            title_filter: Optional[str] = None,
+        ) -> dict:
+            nonlocal search_partial
+            checkpoint(
+                "search",
+                status="started",
+                stage=stage,
+                query=query,
+                title=title_filter,
+                channel_id=effective_channel_ids,
                 lang=lang or "en",
-                min_views=min_views,
-                sort_field=api_sort,
-                sort_order="desc" if api_sort else None,
+                candidate_pages=candidate_pages,
+                candidate_pool=candidate_pool,
             )
+            with console.status(
+                f"[bold green]Filmot {stage}: {query}[/bold green]"
+            ):
+                response = client.search_subtitles_all(
+                    query=query,
+                    title=title_filter,
+                    max_pages=candidate_pages,
+                    max_results=candidate_pool,
+                    **api_kwargs,
+                )
+            if "error" in response:
+                checkpoint(
+                    "search",
+                    status="failed",
+                    stage=stage,
+                    query=query,
+                    title=title_filter,
+                    error=response["error"],
+                )
+                _command_error(
+                    f"Filmot {stage} search failed: {response['error']}"
+                )
+            stage_videos = _result_videos(response)
+            if effective_channel_ids:
+                allowed_ids = set(effective_channel_ids.split(","))
+                outside = [
+                    video for video in stage_videos
+                    if str(
+                        video.get("channelid")
+                        or video.get("channel_id")
+                        or ""
+                    ) not in allowed_ids
+                ]
+                if outside:
+                    checkpoint(
+                        "search",
+                        status="failed_closed",
+                        stage=stage,
+                        query=query,
+                        channel_id=effective_channel_ids,
+                        outside_results=len(outside),
+                    )
+                    _command_error(
+                        "Filmot returned candidates outside, or without an ID "
+                        "in, the requested channel set; refusing an "
+                        "unrestricted fallback."
+                    )
+            checkpoint(
+                "search",
+                status="completed",
+                stage=stage,
+                query=query,
+                title=title_filter,
+                api_total=response.get("totalresultcount", len(stage_videos)),
+                candidates=len(stage_videos),
+                pages=response.get("pages_fetched", 1),
+                partial=response.get("partial", False),
+                page_error=response.get("page_error"),
+            )
+            if response.get("partial"):
+                search_partial = True
+                console.print(
+                    f"[yellow]Search scope is partial:[/yellow] "
+                    f"{response.get('page_error', 'later page failed')}"
+                )
+            return response
 
-        if "error" in results:
-            console.print(f"[red]Error: {results['error']}[/red]")
-            return
+        def eligible_stage_candidates(response: dict, stage: str) -> list:
+            candidates = _result_videos(response)
+            if min_matches <= 0:
+                return candidates
+            eligible = [
+                video
+                for video in candidates
+                if len(video.get("hits", [])) >= min_matches
+            ]
+            if len(eligible) != len(candidates):
+                console.print(
+                    f"[dim]{stage} hit filter: {len(candidates)} -> "
+                    f"{len(eligible)} candidates (minimum {min_matches})[/dim]"
+                )
+                checkpoint(
+                    "search_filter",
+                    status="completed",
+                    stage=stage,
+                    candidates=len(candidates),
+                    eligible=len(eligible),
+                    min_matches=min_matches,
+                )
+            return eligible
 
-        videos = results.get("result", [])
-        total = results.get("totalresultcount", len(videos))
-        title_filter_works = bool(videos)
+        def relationship_evidence_gate(candidates: list, stage: str) -> list:
+            """Require visible topic coherence before trusting fallback syntax."""
+            if stage not in {"exact_phrase", "proximity", "proximity_alt"}:
+                return candidates
+            before = len(candidates)
+            kept = []
+            for video in candidates:
+                assessment = _candidate_assessment(video, topic)
+                video["_selection"] = assessment
+                if (
+                    assessment["passage_coverage"] >= 0.75
+                    and assessment["token_coverage"] >= 0.75
+                ):
+                    kept.append(video)
+            if len(kept) != before:
+                checkpoint(
+                    "relationship_gate",
+                    status="completed",
+                    stage=stage,
+                    candidates_before=before,
+                    candidates_after=len(kept),
+                    threshold={
+                        "passage_coverage": 0.75,
+                        "token_coverage": 0.75,
+                    },
+                )
+                console.print(
+                    f"[dim]{stage} relationship-evidence gate: {before} -> "
+                    f"{len(kept)} candidates (at least 75% topic coverage "
+                    "within one visible passage)[/dim]"
+                )
+            return kept
+
+        # Phase 2: relationship-preserving search ladder. A stage only stops
+        # the ladder when it contains candidates that pass the download gate.
+        results = run_search("title+transcript", topic, title_filter=topic)
+        title_filter_works = bool(_result_videos(results))
+        videos = eligible_stage_candidates(results, "title+transcript")
+        fallback_stage = "title_transcript"
 
         if not videos:
-            # Fallback: search transcript only (no title filter)
-            console.print(f"[dim]No title+transcript matches. Broadening to transcript-only...[/dim]")
-            with console.status(f"[bold green]Searching transcripts for '{topic}'..."):
-                results = client.search_subtitles(
-                    query=topic,
-                    lang=lang or "en",
-                    min_views=min_views,
-                    sort_field=api_sort,
-                    sort_order="desc" if api_sort else None,
+            for stage, query in _research_query_ladder(topic):
+                console.print(
+                    f"[dim]No title+transcript candidates; trying {stage}: {query}[/dim]"
                 )
-            if "error" in results:
-                console.print(f"[red]Error: {results['error']}[/red]")
-                return
-            videos = results.get("result", [])
-            total = results.get("totalresultcount", len(videos))
-            if videos:
-                console.print(f"[green]Filmot:[/green] Found {total:,} videos mentioning '{topic}' in transcript")
-            elif scout_videos:
-                console.print(f"[yellow]Filmot: No indexed results yet — scout found {len(scout_videos)} recent uploads to work with[/yellow]")
-            else:
-                console.print("[yellow]No videos found in Filmot or YouTube. Try a different topic.[/yellow]")
-                return
-        else:
-            console.print(f"[green]Filmot:[/green] Found {total:,} dedicated videos about '{topic}'")
+                results = run_search(stage, query)
+                videos = eligible_stage_candidates(results, stage)
+                videos = relationship_evidence_gate(videos, stage)
+                fallback_stage = stage
+                if videos:
+                    break
 
-        # ── Phase 3: Synthesize (merge scout + Filmot results) ──
-        # Add scout videos that aren't already in Filmot results
-        filmot_video_ids = {(v.get("id") or v.get("videoid")) for v in videos}
-        new_from_scout = [sv for sv in scout_videos if sv["video_id"] not in filmot_video_ids]
-        if new_from_scout:
-            console.print(f"[cyan]Synthesize:[/cyan] Adding {len(new_from_scout)} videos from scout (not yet in Filmot index)")
-            # Convert scout format to Filmot-compatible format for download
-            for sv in new_from_scout:
-                videos.append({
-                    "id": sv["video_id"],
-                    "videoid": sv["video_id"],
-                    "title": sv.get("title", ""),
-                    "channelname": sv.get("channel_title", ""),
-                    "viewcount": sv.get("views", 0),
-                    "duration": 0,  # unknown until transcript is fetched
-                    "hits": [],  # no transcript hits (not indexed yet)
-                    "_from_scout": True,
-                })
+        broad_blocked = False
+        if not videos:
+            console.print(
+                "[dim]Relationship-preserving stages returned no candidates; "
+                "measuring loose transcript-wide fallback...[/dim]"
+            )
+            results = run_search("broad_loose", topic)
+            videos = eligible_stage_candidates(results, "broad_loose")
+            fallback_stage = "broad_loose"
+            broad_total = int(results.get("totalresultcount", len(videos)) or 0)
+            if broad_total > broad_threshold and not accept_broad:
+                broad_blocked = True
+                videos = []
+                console.print(
+                    f"[yellow]Safety gate:[/yellow] loose fallback has "
+                    f"{broad_total:,} results (threshold {broad_threshold:,}). "
+                    "It will not be downloaded automatically. Refine the topic "
+                    "or rerun with --accept-broad after reviewing the scope."
+                )
+                checkpoint(
+                    "broad_gate",
+                    status="blocked",
+                    stage=fallback_stage,
+                    api_total=broad_total,
+                    threshold=broad_threshold,
+                )
 
-        # Client-side density sort
-        if sort_by == "density":
-            def _density_key(v):
-                dur = v.get("duration", 0)
-                hits = len(v.get("hits", []))
-                return hits / (dur / 60) if dur > 0 else 0
-            videos.sort(key=_density_key, reverse=True)
-            console.print(f"[dim]Sorted by density (matches/min)[/dim]")
+        total = int(results.get("totalresultcount", len(videos)) or 0)
+        for video in videos:
+            video["_fallback_stage"] = fallback_stage
 
-        # Apply --min-matches filter (0 to disable); preserve scout videos (no hits yet)
-        if min_matches and min_matches > 0:
+        videos = _rank_research_candidates(videos, topic, sort_by)
+
+        # Even with explicit acceptance, a loose pool needs a relationship
+        # threshold. Repeated isolated terms are not enough to auto-download.
+        if fallback_stage == "broad_loose" and not broad_blocked:
             before = len(videos)
-            videos = [v for v in videos if v.get("_from_scout") or len(v.get("hits", [])) >= min_matches]
-            if before != len(videos):
-                console.print(f"[dim]Filtered: {before} -> {len(videos)} videos (min {min_matches} matches)[/dim]")
+            topic_tokens = _research_topic_tokens(topic)
+            if topic_tokens:
+                videos = [
+                    video for video in videos
+                    if video["_selection"]["passage_coverage"] >= 0.60
+                    and video["_selection"]["token_coverage"] >= 0.75
+                ]
+            console.print(
+                f"[dim]Broad relevance gate: {before} -> {len(videos)} candidates "
+                "(terms must cohere in a title/hit passage)[/dim]"
+            )
+            checkpoint(
+                "broad_gate",
+                status="accepted_explicit" if accept_broad else "accepted_bounded",
+                api_total=total,
+                candidates_before=before,
+                candidates_after=len(videos),
+                threshold={"passage_coverage": 0.60, "token_coverage": 0.75},
+            )
 
-        # Step 2: Download transcripts — reserve slots for scout videos, which
-        # sort to the bottom (density 0, not yet indexed by Filmot) and would
-        # otherwise always be sliced off by the depth cut
-        scout_vids = [v for v in videos if v.get("_from_scout")]
-        if scout_vids:
-            scout_slots = min(len(scout_vids), max(1, depth // 3))
-            non_scout = [v for v in videos if not v.get("_from_scout")]
-            videos_to_download = non_scout[:max(depth - scout_slots, 0)] + scout_vids[:scout_slots]
+        # Merge fresh scout videos and score them transparently. They remain
+        # clearly tagged because Filmot hit evidence is unavailable.
+        filmot_ids = {
+            video.get("id") or video.get("videoid")
+            for video in videos
+        }
+        for scout_video in scout_videos:
+            if scout_video.get("video_id") in filmot_ids:
+                continue
+            videos.append({
+                "id": scout_video.get("video_id"),
+                "videoid": scout_video.get("video_id"),
+                "title": scout_video.get("title", ""),
+                "description": scout_video.get("description", ""),
+                "channelname": scout_video.get("channel_title", ""),
+                "viewcount": scout_video.get("views", 0),
+                "duration": 0,
+                "hits": [],
+                "_from_scout": True,
+                "_fallback_stage": "scout",
+            })
+
+        videos = _rank_research_candidates(videos, topic, sort_by)
+        scout_before = sum(
+            bool(video.get("_from_scout"))
+            for video in videos
+        )
+        if scout_before:
+            videos = [
+                video
+                for video in videos
+                if not video.get("_from_scout")
+                or (
+                    video["_selection"]["passage_coverage"] >= 0.50
+                    and video["_selection"]["token_coverage"] >= 0.60
+                )
+            ]
+            scout_after = sum(
+                bool(video.get("_from_scout"))
+                for video in videos
+            )
+            console.print(
+                f"[dim]Scout relevance gate: {scout_before} -> "
+                f"{scout_after} candidates (topic terms must occur together "
+                "in the title or description)[/dim]"
+            )
+            checkpoint(
+                "scout_gate",
+                status="completed",
+                candidates_before=scout_before,
+                candidates_after=scout_after,
+                threshold={
+                    "passage_coverage": 0.50,
+                    "token_coverage": 0.60,
+                },
+            )
+        accepted_scouts = any(
+            video.get("_from_scout")
+            for video in videos
+        )
+        if broad_blocked and not accepted_scouts:
+            _command_error(
+                f"Broad fallback blocked at {total:,} results. Refine TOPIC or "
+                "rerun with --accept-broad after reviewing the risk."
+            )
+        if not videos:
+            run_status = "complete_empty"
+            console.print(
+                "[yellow]No candidates passed the search and relevance gates.[/yellow]"
+            )
+            checkpoint(
+                "selection",
+                status="empty",
+                fallback_stage=fallback_stage,
+                filmot_total=total,
+            )
+            return
+
+        _research_candidate_preview(videos)
+        previewed = videos[: min(depth or 8, 8)]
+        if previewed and all(
+            video.get("_selection", {}).get("source_signal", 0) < 0.20
+            for video in previewed
+        ):
+            console.print(
+                "[yellow]Source-quality warning:[/yellow] every leading candidate "
+                "has a weak visible source prior. Treat the corpus as discovery "
+                "material and add authoritative channels/primary sources."
+            )
+        echoed = sum(
+            bool(video.get("_selection", {}).get("echo_cluster"))
+            for video in previewed
+        )
+        if echoed:
+            console.print(
+                f"[yellow]Echo warning:[/yellow] {echoed} leading candidate(s) "
+                "share near-identical hit phrasing; the balanced rank penalized them."
+            )
+
+        scout_candidates = [video for video in videos if video.get("_from_scout")]
+        if scout_candidates:
+            scout_slots = min(len(scout_candidates), max(1, depth // 3)) if depth else 0
+            filmot_candidates = [video for video in videos if not video.get("_from_scout")]
+            videos_to_download = (
+                filmot_candidates[: max(depth - scout_slots, 0)]
+                + scout_candidates[:scout_slots]
+            )
             if len(videos_to_download) < depth:
-                videos_to_download += scout_vids[scout_slots:depth - len(videos_to_download) + scout_slots]
+                selected_ids = {
+                    video.get("id") or video.get("videoid")
+                    for video in videos_to_download
+                }
+                videos_to_download.extend(
+                    video for video in videos
+                    if (video.get("id") or video.get("videoid")) not in selected_ids
+                )
+                videos_to_download = videos_to_download[:depth]
         else:
             videos_to_download = videos[:depth]
-        success_count = 0
-        skip_count = 0
-        fail_count = 0
-        dedupe_count = 0
-        total_chars = 0
-        proxy_errors = False
+        selected_count = len(videos_to_download)
+        checkpoint(
+            "selection",
+            status="completed",
+            fallback_stage=fallback_stage,
+            filmot_total=total,
+            candidates=len(videos),
+            selected=selected_count,
+            candidate_pages=candidate_pages,
+            candidate_pool=candidate_pool,
+            ranking=sort_by,
+            selections=[
+                {
+                    "video_id": video.get("id") or video.get("videoid"),
+                    "title": video.get("title"),
+                    "channel": video.get("channelname"),
+                    "stage": video.get("_fallback_stage"),
+                    "signals": video.get("_selection"),
+                }
+                for video in videos_to_download
+            ],
+        )
 
         seen_hashes = set()
         if dedupe:
-            for t in library.list_transcripts(normalized_topic):
-                data = library.get(t["video_id"], normalized_topic)
+            for item in library.list_transcripts(normalized_topic):
+                data = library.get(item["video_id"], normalized_topic)
                 if data:
-                    text = data.get("transcript", "")[:500]
-                    seen_hashes.add(hashlib.md5(text.encode()).hexdigest())
+                    seen_hashes.add(
+                        hashlib.md5(
+                            data.get("transcript", "")[:500].encode()
+                        ).hexdigest()
+                    )
 
-        console.print(f"\n[bold]Downloading {len(videos_to_download)} transcripts...[/bold]\n")
-
-        for i, video in enumerate(videos_to_download, 1):
+        console.print(
+            f"\n[bold]Downloading {len(videos_to_download)} transcript(s)...[/bold]"
+        )
+        proxy_errors = False
+        for index, video in enumerate(videos_to_download, 1):
             video_id = video.get("id") or video.get("videoid")
-            title_str = video.get("title", "Unknown")
-            channel = video.get("channelname", video.get("channeltitle", video.get("channel", "Unknown")))
-            source_tag = " [cyan](scout)[/cyan]" if video.get("_from_scout") else ""
-
-            # Backfill missing metadata from Filmot video API
-            title_str, channel = _backfill_metadata(video_id, title_str, channel)
+            title_text = str(video.get("title", "Unknown"))
+            channel_name = (
+                video.get("channelname")
+                or video.get("channeltitle")
+                or video.get("channel")
+                or "Unknown"
+            )
+            source = "scout" if video.get("_from_scout") else fallback_stage
+            selection = video.get("_selection", {})
+            checkpoint(
+                "download_item",
+                status="started",
+                index=index,
+                total=selected_count,
+                video_id=video_id,
+                title=title_text,
+                stage=source,
+                signals=selection,
+            )
+            title_text, channel_name = _backfill_metadata(
+                video_id, title_text, channel_name
+            )
 
             if library.exists(video_id, normalized_topic):
-                console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {title_str[:60]}{source_tag}")
                 skip_count += 1
-                # Count existing chars
                 data = library.get(video_id, normalized_topic)
                 if data:
                     total_chars += len(data.get("transcript", ""))
+                checkpoint(
+                    "download_item",
+                    status="skipped",
+                    video_id=video_id,
+                    reason="already_exists",
+                    stage=source,
+                    signals=selection,
+                )
+                console.print(
+                    f"  [{index}/{selected_count}] [yellow]Skip[/yellow] "
+                    f"{title_text[:60]} (already saved)"
+                )
                 continue
 
+            console.print(
+                f"  [{index}/{selected_count}] [dim]Fetching {title_text[:60]} "
+                "(route ladder in progress)...[/dim]"
+            )
             try:
-                if fallback:
-                    result = get_transcript_with_fallback(video_id, use_aws_fallback=True)
-                else:
-                    result = get_transcript(video_id)
-
-                if "error" in result:
-                    err = str(result["error"])
-                    console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {title_str[:60]}{source_tag} [dim]- {err[:100]}[/dim]")
-                    if "proxy" in err.lower():
-                        proxy_errors = True
+                transcript_result = fetch_transcript(video_id)
+                if "error" in transcript_result:
+                    error_text = str(transcript_result["error"])
+                    error_display = _transcript_failure_detail(
+                        transcript_result,
+                        verbose=verbose,
+                    )
                     fail_count += 1
+                    if "proxy" in error_text.casefold():
+                        proxy_errors = True
+                    checkpoint(
+                        "download_item",
+                        status="failed",
+                        video_id=video_id,
+                        title=title_text,
+                        stage=source,
+                        signals=selection,
+                        error=_whole_word_summary(error_text, 500),
+                        error_type=transcript_result.get("error_type"),
+                        route=transcript_result.get("route"),
+                        routes_tried=transcript_result.get("routes_tried"),
+                        route_errors=transcript_result.get("route_errors"),
+                    )
+                    console.print(
+                        f"  [{index}/{selected_count}] [red]Fail[/red] "
+                        f"{title_text[:60]} [dim]- {error_display}[/dim]"
+                    )
                     continue
 
-                full_text = result.get('full_text', '')
-
+                full_text = transcript_result.get("full_text", "")
                 if dedupe and full_text:
-                    text_hash = hashlib.md5(full_text[:500].encode()).hexdigest()
-                    if text_hash in seen_hashes:
-                        console.print(f"  [{i}/{len(videos_to_download)}] [magenta]Dedupe[/magenta] {title_str[:60]}")
+                    digest = hashlib.md5(full_text[:500].encode()).hexdigest()
+                    if digest in seen_hashes:
                         dedupe_count += 1
+                        checkpoint(
+                            "download_item",
+                            status="skipped",
+                            video_id=video_id,
+                            reason="duplicate",
+                            stage=source,
+                            signals=selection,
+                        )
+                        console.print(
+                            f"  [{index}/{selected_count}] [magenta]Dedupe[/magenta] "
+                            f"{title_text[:60]}"
+                        )
                         continue
-                    seen_hashes.add(text_hash)
+                    seen_hashes.add(digest)
 
                 metadata = {
-                    "title": title_str,
-                    "channel": channel,
-                    "language": result.get("language"),
-                    "is_generated": result.get("is_generated"),
-                    "duration_seconds": result.get("duration_seconds"),
-                    "segment_count": result.get("segment_count"),
+                    "title": title_text,
+                    "channel": channel_name,
+                    "language": transcript_result.get("language"),
+                    "is_generated": transcript_result.get("is_generated"),
+                    "duration_seconds": transcript_result.get("duration_seconds"),
+                    "segment_count": transcript_result.get("segment_count"),
                     "views": video.get("viewcount"),
+                    "research_run_id": run_id,
+                    "selection_stage": source,
+                    "selection_signals": selection,
+                    "route": transcript_result.get("route"),
                 }
                 library.save(
                     video_id=video_id,
@@ -2600,208 +4702,499 @@ def research(topic: str, depth: int, min_views: int, lang: str, fallback: bool, 
                     transcript_text=full_text,
                     metadata=metadata,
                 )
-                total_chars += len(full_text)
-                console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {title_str[:60]}{source_tag}")
                 success_count += 1
-
-            except Exception as e:
-                console.print(f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] {video_id} - {e}{source_tag}")
-                if "proxy" in str(e).lower():
-                    proxy_errors = True
+                total_chars += len(full_text)
+                checkpoint(
+                    "download_item",
+                    status="saved",
+                    video_id=video_id,
+                    title=title_text,
+                    channel=channel_name,
+                    stage=source,
+                    signals=selection,
+                    chars=len(full_text),
+                    route=transcript_result.get("route"),
+                    routes_tried=transcript_result.get("routes_tried"),
+                )
+                console.print(
+                    f"  [{index}/{selected_count}] [green]✓[/green] "
+                    f"{title_text[:60]}"
+                )
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
                 fail_count += 1
+                detail = f"{type(error).__name__}: {error}"
+                checkpoint(
+                    "download_item",
+                    status="failed",
+                    video_id=video_id,
+                    title=title_text,
+                    stage=source,
+                    signals=selection,
+                    error=detail,
+                )
+                console.print(
+                    f"  [{index}/{selected_count}] [red]Fail[/red] "
+                    f"{title_text[:60]} [dim]- "
+                    f"{detail if verbose else _whole_word_summary(detail)}[/dim]"
+                )
 
         if proxy_errors:
-            console.print("\n[yellow]Proxy connection failures detected — your proxy may be down. Try --no-proxy to connect directly.[/yellow]")
+            console.print(
+                "[yellow]Proxy failures occurred. Inspect routes_tried in the "
+                "session ledger or retry with --no-proxy.[/yellow]"
+            )
 
-        # ── Phase 4: Probe (auto-generate NEAR/N from extracted entities) ──
-        probe_success = 0
-        probe_chars = 0
+        # Phase 4: probes with every effective constraint and count visible.
         if probe:
-            # Collect transcript texts from library
+            checkpoint("probe", status="started")
             transcript_texts = []
-            for t in library.list_transcripts(normalized_topic):
-                data = library.get(t["video_id"], normalized_topic)
+            for item in library.list_transcripts(normalized_topic):
+                data = library.get(item["video_id"], normalized_topic)
                 if data and data.get("transcript"):
                     transcript_texts.append(data["transcript"])
 
             if len(transcript_texts) < 2:
-                console.print(f"\n[dim]Probe: Need at least 2 transcripts (got {len(transcript_texts)}). Try increasing --depth.[/dim]")
+                checkpoint(
+                    "probe",
+                    status="skipped",
+                    reason="insufficient_transcripts",
+                    transcripts=len(transcript_texts),
+                )
+                console.print(
+                    f"[dim]Probe: Need at least 2 transcripts; got "
+                    f"{len(transcript_texts)}.[/dim]"
+                )
             else:
-                console.print(f"\n[bold]Probing key relationships from {len(transcript_texts)} transcripts...[/bold]")
-
-                # Extract key terms
                 terms = _extract_probe_terms(transcript_texts, topic)
-                if not terms:
-                    console.print(f"  [dim]No significant entities extracted.[/dim]")
-                else:
-                    console.print(f"  Entities: [cyan]{', '.join(terms[:8])}{'...' if len(terms) > 8 else ''}[/cyan]")
+                pairs = _find_probe_pairs(transcript_texts, terms)
+                console.print(
+                    f"\n[bold]Probing relationships from "
+                    f"{len(transcript_texts)} transcript(s)...[/bold]"
+                )
+                console.print(
+                    f"  Entities: [cyan]{', '.join(terms[:8]) or 'none'}[/cyan]"
+                )
+                existing_ids = {
+                    item["video_id"]
+                    for item in library.list_transcripts(normalized_topic)
+                }
+                probe_candidates = []
+                topic_words = _probe_topic_words(topic)
+                probe_title = topic if title_filter_works else None
 
-                    # Find co-occurring pairs
-                    pairs = _find_probe_pairs(transcript_texts, terms)
-
-                    if not pairs:
-                        console.print(f"  [dim]No strong co-occurring pairs found. Try --depth with more transcripts.[/dim]")
-                    else:
-                        console.print()
-                        existing_ids = {t["video_id"] for t in library.list_transcripts(normalized_topic)}
-                        probe_new_videos = []
-                        probe_topic_words = _probe_topic_words(topic)
-
-                        for idx, (t1, t2, co_count) in enumerate(pairs, 1):
-                            query = f'"{t1}" NEAR/15 "{t2}"'
-                            try:
-                                with console.status(f"  Probing: {query}"):
-                                    # Only constrain by title if the main search proved
-                                    # the title filter matches videos for this topic —
-                                    # otherwise every probe is guaranteed 0 results.
-                                    probe_results = client.search_subtitles(
-                                        query=query,
-                                        title=topic if title_filter_works else None,
-                                        lang=lang or "en",
-                                    )
-                            except Exception:
-                                console.print(f"  Probe {idx}: {query} [dim]→ error[/dim]")
-                                continue
-
-                            if "error" in probe_results:
-                                console.print(f"  Probe {idx}: {query} [dim]→ error[/dim]")
-                                continue
-
-                            probe_hits = probe_results.get("result", [])
-                            total_probe = probe_results.get("totalresultcount", len(probe_hits))
-
-                            if not probe_hits:
-                                console.print(f"  Probe {idx}: {query} → [dim]0 results[/dim]")
-                                continue
-
-                            # Find peak density
-                            peak_density = 0
-                            for pv in probe_hits:
-                                dur = pv.get("duration", 0)
-                                nhits = len(pv.get("hits", []))
-                                if dur > 0:
-                                    peak_density = max(peak_density, nhits / (dur / 60))
-
-                            # Count new videos not already in library
-                            new_vids = [
-                                pv for pv in probe_hits
-                                if (pv.get("id") or pv.get("videoid")) not in existing_ids
-                            ]
-
-                            # Without a working title filter, probe results are
-                            # unconstrained — only download videos that mention
-                            # the research topic in their title or hit context
-                            if not title_filter_works:
-                                new_vids = [
-                                    pv for pv in new_vids
-                                    if _probe_hit_is_relevant(pv, probe_topic_words)
-                                ]
-
-                            new_tag = f" | [cyan]{len(new_vids)} new[/cyan]" if new_vids else ""
-                            console.print(
-                                f"  Probe {idx}: {query} [dim](co:{co_count})[/dim] → "
-                                f"[green]{total_probe:,} results[/green] "
-                                f"(peak: [bold]{peak_density:.1f}/min[/bold]){new_tag}"
+                for index, (term1, term2, co_windows, source_support) in enumerate(
+                    pairs, 1
+                ):
+                    probe_query = f'"{term1}" NEAR/15 "{term2}"'
+                    effective_scope = {
+                        "title": probe_title,
+                        "channel_id": effective_channel_ids,
+                        "lang": lang or "en",
+                    }
+                    checkpoint(
+                        "probe_search",
+                        status="started",
+                        index=index,
+                        query=probe_query,
+                        constraints=effective_scope,
+                        co_windows=co_windows,
+                        source_support=source_support,
+                    )
+                    try:
+                        with console.status(f"Probing: {probe_query}"):
+                            probe_result = client.search_subtitles(
+                                query=probe_query,
+                                title=probe_title,
+                                lang=lang or "en",
+                                channel_id=effective_channel_ids,
                             )
+                    except Exception as error:
+                        detail = f"{type(error).__name__}: {error}"
+                        probe_query_fail_count += 1
+                        log_event(
+                            "research_probe",
+                            topic=normalized_topic,
+                            run_id=run_id,
+                            query=probe_query,
+                            constraints=effective_scope,
+                            co_windows=co_windows,
+                            source_support=source_support,
+                            status="failed",
+                            error=detail,
+                        )
+                        checkpoint(
+                            "probe_search",
+                            status="failed",
+                            index=index,
+                            query=probe_query,
+                            constraints=effective_scope,
+                            error=detail,
+                        )
+                        console.print(
+                            f"  Probe {index}: {probe_query} → "
+                            f"[red]error[/red] ({_whole_word_summary(detail)})"
+                        )
+                        continue
 
-                            # Collect top 2 new videos per probe (sorted by density)
-                            for pv in sorted(new_vids, key=lambda v: len(v.get("hits", [])) / (v.get("duration", 0) / 60) if v.get("duration", 0) > 0 else 0, reverse=True)[:2]:
-                                vid = pv.get("id") or pv.get("videoid")
-                                if vid not in existing_ids:
-                                    probe_new_videos.append(pv)
-                                    existing_ids.add(vid)
+                    if "error" in probe_result:
+                        detail = str(probe_result["error"])
+                        probe_query_fail_count += 1
+                        log_event(
+                            "research_probe",
+                            topic=normalized_topic,
+                            run_id=run_id,
+                            query=probe_query,
+                            constraints=effective_scope,
+                            co_windows=co_windows,
+                            source_support=source_support,
+                            status="failed",
+                            error=detail,
+                        )
+                        checkpoint(
+                            "probe_search",
+                            status="failed",
+                            index=index,
+                            query=probe_query,
+                            constraints=effective_scope,
+                            error=detail,
+                        )
+                        console.print(
+                            f"  Probe {index}: {probe_query} → "
+                            f"[red]error[/red] ({_whole_word_summary(detail)})"
+                        )
+                        continue
 
-                        # Download probe discoveries
-                        if probe_new_videos:
-                            dl_count = min(len(probe_new_videos), 3)
-                            console.print(f"\n  [cyan]Downloading {dl_count} probe discoveries...[/cyan]")
-                            for pv in probe_new_videos[:dl_count]:
-                                vid = pv.get("id") or pv.get("videoid")
-                                ptitle = pv.get("title", "Unknown")
-                                pchannel = pv.get("channelname", pv.get("channeltitle", "Unknown"))
-                                ptitle, pchannel = _backfill_metadata(vid, ptitle, pchannel)
-                                try:
-                                    if fallback:
-                                        result = get_transcript_with_fallback(vid, use_aws_fallback=True)
-                                    else:
-                                        result = get_transcript(vid)
-                                    if "error" not in result:
-                                        full_text = result.get("full_text", "")
-                                        metadata = {
-                                            "title": ptitle,
-                                            "channel": pchannel,
-                                            "language": result.get("language"),
-                                            "is_generated": result.get("is_generated"),
-                                            "duration_seconds": result.get("duration_seconds"),
-                                            "segment_count": result.get("segment_count"),
-                                            "views": pv.get("viewcount"),
-                                        }
-                                        library.save(video_id=vid, topic=normalized_topic, transcript_text=full_text, metadata=metadata)
-                                        probe_chars += len(full_text)
-                                        probe_success += 1
-                                        console.print(f"    [green]✓[/green] {ptitle[:60]} [dim magenta](probe)[/dim magenta]")
-                                    else:
-                                        console.print(f"    [red]Fail[/red] {ptitle[:60]} [dim]- {str(result['error'])[:100]}[/dim]")
-                                except Exception as e:
-                                    console.print(f"    [red]Fail[/red] {vid} - {e}")
+                    raw_hits = _result_videos(probe_result)
+                    if effective_channel_ids:
+                        allowed_ids = set(effective_channel_ids.split(","))
+                        outside = [
+                            video
+                            for video in raw_hits
+                            if str(
+                                video.get("channelid")
+                                or video.get("channel_id")
+                                or ""
+                            ) not in allowed_ids
+                        ]
+                        if outside:
+                            checkpoint(
+                                "probe_search",
+                                status="failed_closed",
+                                index=index,
+                                query=probe_query,
+                                constraints=effective_scope,
+                                outside_results=len(outside),
+                            )
+                            log_event(
+                                "research_probe",
+                                topic=normalized_topic,
+                                run_id=run_id,
+                                query=probe_query,
+                                constraints=effective_scope,
+                                status="failed_closed",
+                                outside_results=len(outside),
+                            )
+                            _command_error(
+                                "Filmot returned probe candidates outside, or "
+                                "without an ID in, the requested channel set; "
+                                "refusing an unrestricted probe."
+                            )
+                    scoped_hits = [
+                        video for video in raw_hits
+                        if (video.get("id") or video.get("videoid")) not in existing_ids
+                    ]
+                    if not probe_title:
+                        scoped_hits = [
+                            video for video in scoped_hits
+                            if _probe_hit_is_relevant(video, topic_words)
+                        ]
+                    api_total = int(
+                        probe_result.get("totalresultcount", len(raw_hits)) or 0
+                    )
+                    peak_density = max(
+                        (_density(video) for video in raw_hits),
+                        default=0.0,
+                    )
+                    scope_label = (
+                        f'title="{probe_title}"'
+                        if probe_title else "topic relevance post-filter"
+                    )
+                    log_event(
+                        "research_probe",
+                        topic=normalized_topic,
+                        run_id=run_id,
+                        query=probe_query,
+                        constraints=effective_scope,
+                        co_windows=co_windows,
+                        source_support=source_support,
+                        status="completed",
+                        api_total=api_total,
+                        returned=len(raw_hits),
+                        scoped=len(scoped_hits),
+                        peak_density=round(peak_density, 3),
+                    )
+                    checkpoint(
+                        "probe_search",
+                        status="completed",
+                        index=index,
+                        query=probe_query,
+                        constraints=effective_scope,
+                        api_total=api_total,
+                        returned=len(raw_hits),
+                        scoped=len(scoped_hits),
+                    )
+                    console.print(
+                        f"  Probe {index}: {probe_query} "
+                        f"[dim](co-windows:{co_windows}; sources:{source_support}; "
+                        f"scope:{scope_label})[/dim] → "
+                        f"[green]{api_total:,} API results[/green]; "
+                        f"{len(raw_hits)} returned; {len(scoped_hits)} new+scoped; "
+                        f"peak {peak_density:.1f}/min"
+                    )
+                    ranked_probe = _rank_research_candidates(
+                        scoped_hits, topic, "balanced"
+                    )
+                    for video in ranked_probe[:2]:
+                        video_id = video.get("id") or video.get("videoid")
+                        if video_id not in existing_ids:
+                            probe_candidates.append(video)
+                            existing_ids.add(video_id)
 
-        # Summary
-        console.print(f"\n{'='*60}")
-        console.print(f"[bold]Research complete: {normalized_topic}[/bold]")
-        stats = f"  Saved: {success_count} | Skipped: {skip_count} | Failed: {fail_count}"
-        if dedupe_count:
-            stats += f" | Deduped: {dedupe_count}"
-        if probe_success:
-            stats += f" | Probe: {probe_success}"
-        console.print(stats)
+                for video in probe_candidates[:3]:
+                    video_id = video.get("id") or video.get("videoid")
+                    title_text = str(video.get("title", "Unknown"))
+                    channel_name = (
+                        video.get("channelname")
+                        or video.get("channeltitle")
+                        or "Unknown"
+                    )
+                    checkpoint(
+                        "probe_download",
+                        status="started",
+                        video_id=video_id,
+                        title=title_text,
+                    )
+                    title_text, channel_name = _backfill_metadata(
+                        video_id, title_text, channel_name
+                    )
+                    console.print(
+                        f"  [dim]Fetching probe discovery {title_text[:60]}...[/dim]"
+                    )
+                    try:
+                        transcript_result = fetch_transcript(video_id)
+                        if "error" in transcript_result:
+                            detail = str(transcript_result["error"])
+                            probe_fail_count += 1
+                            checkpoint(
+                                "probe_download",
+                                status="failed",
+                                video_id=video_id,
+                                error=_whole_word_summary(detail, 500),
+                                error_type=transcript_result.get("error_type"),
+                                route=transcript_result.get("route"),
+                                routes_tried=transcript_result.get("routes_tried"),
+                                route_errors=transcript_result.get("route_errors"),
+                            )
+                            console.print(
+                                f"  [red]Fail[/red] {title_text[:60]} "
+                                f"[dim]- {_transcript_failure_detail(transcript_result, verbose=verbose)}[/dim]"
+                            )
+                            continue
+                        full_text = transcript_result.get("full_text", "")
+                        library.save(
+                            video_id=video_id,
+                            topic=normalized_topic,
+                            transcript_text=full_text,
+                            metadata={
+                                "title": title_text,
+                                "channel": channel_name,
+                                "language": transcript_result.get("language"),
+                                "is_generated": transcript_result.get("is_generated"),
+                                "duration_seconds": transcript_result.get("duration_seconds"),
+                                "segment_count": transcript_result.get("segment_count"),
+                                "views": video.get("viewcount"),
+                                "research_run_id": run_id,
+                                "selection_stage": "probe",
+                                "selection_signals": video.get("_selection"),
+                                "route": transcript_result.get("route"),
+                            },
+                        )
+                        probe_success += 1
+                        probe_chars += len(full_text)
+                        checkpoint(
+                            "probe_download",
+                            status="saved",
+                            video_id=video_id,
+                            chars=len(full_text),
+                            route=transcript_result.get("route"),
+                            routes_tried=transcript_result.get("routes_tried"),
+                        )
+                        console.print(
+                            f"  [green]✓[/green] {title_text[:60]} "
+                            "[dim](probe)[/dim]"
+                        )
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as error:
+                        probe_fail_count += 1
+                        detail = f"{type(error).__name__}: {error}"
+                        checkpoint(
+                            "probe_download",
+                            status="failed",
+                            video_id=video_id,
+                            error=detail,
+                        )
+                        console.print(
+                            f"  [red]Fail[/red] {title_text[:60]} "
+                            f"[dim]- "
+                            f"{detail if verbose else _whole_word_summary(detail)}[/dim]"
+                        )
+                checkpoint(
+                    "probe",
+                    status=(
+                        "completed_with_failures"
+                        if probe_fail_count or probe_query_fail_count
+                        else "completed"
+                    ),
+                    transcripts=len(transcript_texts),
+                    terms=len(terms),
+                    queries=len(pairs),
+                    query_failed=probe_query_fail_count,
+                    candidates=len(probe_candidates),
+                    saved=probe_success,
+                    download_failed=probe_fail_count,
+                )
+        else:
+            checkpoint("probe", status="disabled")
+
+        total_item_failure = (
+            selected_count > 0
+            and fail_count >= selected_count
+            and success_count + skip_count + dedupe_count + probe_success == 0
+        )
+        run_status = (
+            "failed"
+            if total_item_failure
+            else "completed_with_failures"
+            if fail_count or probe_fail_count or probe_query_fail_count
+            else "completed_partial"
+            if search_partial
+            else "completed"
+        )
         all_chars = total_chars + probe_chars
-        console.print(f"  Total content: {all_chars:,} characters ({all_chars / 1024:.0f} KB)")
-
-        from .ledger import log_event
+        # Keep the aggregate event for existing session readers while the
+        # start/checkpoint/end events make partial runs resumable.
         log_event(
-            "research", topic=normalized_topic, query=topic,
-            scout=len(scout_videos), filmot_total=total,
-            saved=success_count, skipped=skip_count, failed=fail_count,
-            deduped=dedupe_count, probe=probe_success, depth=depth,
+            "research",
+            topic=normalized_topic,
+            run_id=run_id,
+            query=topic,
+            scout=len(scout_videos),
+            filmot_total=total,
+            fallback_stage=fallback_stage,
+            selected=selected_count,
+            saved=success_count,
+            skipped=skip_count,
+            failed=fail_count,
+            deduped=dedupe_count,
+            probe=probe_success,
+            probe_failed=probe_fail_count,
+            probe_query_failed=probe_query_fail_count,
+            depth=depth,
+            ranking=sort_by,
+            status=run_status,
+            routing_plan=route_plan,
+        )
+        console.print(f"\n{'=' * 60}")
+        console.print(f"[bold]Research complete: {normalized_topic}[/bold]")
+        console.print(
+            f"  Saved: {success_count} | Skipped: {skip_count} | "
+            f"Failed: {fail_count} | Deduped: {dedupe_count} | "
+            f"Probe: {probe_success} saved / {probe_fail_count} download failed "
+            f"/ {probe_query_fail_count} query failed"
+        )
+        console.print(
+            f"  Total content: {all_chars:,} characters "
+            f"({all_chars / 1024:.0f} KB)"
         )
 
-        # List sources
         transcripts = library.list_transcripts(normalized_topic)
         if transcripts:
             console.print(f"\n[bold]Sources ({len(transcripts)}):[/bold]")
-            for t in transcripts:
-                console.print(f"  - {t.get('title', 'Unknown')} ({t.get('channel', 'Unknown')})")
+            for item in transcripts:
+                console.print(
+                    f"  - {item.get('title', 'Unknown')} "
+                    f"({item.get('channel', 'Unknown')})"
+                )
+        console.print("\n[dim]Next steps:[/dim]")
+        console.print(
+            f'  filmot library search "your query" --topic {normalized_topic}'
+        )
+        console.print(
+            f'  filmot library compare "claim" --topic {normalized_topic}'
+        )
+        console.print(
+            f"  filmot library context {normalized_topic} -o context.txt"
+        )
+        if total_item_failure:
+            _command_error(
+                f"All {fail_count} selected transcript downloads failed."
+            )
 
-        # Hint: suggest yt-search if results were sparse and scout wasn't used
-        if not scout and success_count < 3:
-            console.print(f"\n[yellow]Tip: Few results found. Try adding --scout to also check YouTube for very recent uploads.[/yellow]")
-            console.print(f"  [dim]filmot research \"{topic}\" --scout[/dim]")
-        elif not scout_videos and success_count < 3:
-            console.print(f"\n[yellow]Tip: Few results. Try 'filmot yt-search \"{topic}\"' to find very recent videos not yet in Filmot's index.[/yellow]")
-
-        # Suggest --probe if not used and enough content was saved
-        if not probe and success_count >= 3:
-            console.print(f"\n[dim]Tip: Add --probe to auto-discover related content via NEAR/N entity extraction.[/dim]")
-
-        console.print(f"\n[dim]Next steps:[/dim]")
-        console.print(f"  filmot library search \"your query\" --topic {normalized_topic}")
-        console.print(f"  filmot library compare \"claim\" --topic {normalized_topic}")
-        console.print(f"  filmot library context {normalized_topic} -o context.txt")
-
-    except ValueError as e:
-        console.print(f"[red]Configuration Error: {e}[/red]")
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+    except KeyboardInterrupt:
+        run_status = "interrupted"
+        run_error = f"Interrupted during {phase}"
+        checkpoint(
+            phase,
+            status="interrupted",
+            saved=success_count,
+            failed=fail_count,
+            selected=selected_count,
+        )
+        raise click.Abort()
+    except click.ClickException as error:
+        run_error = str(error)
+        raise
+    except ValueError as error:
+        run_error = f"Configuration error: {error}"
+        _command_error(run_error)
+    except Exception as error:
+        run_error = f"{type(error).__name__}: {error}"
+        _command_error(run_error)
+    finally:
+        log_event(
+            "research_end",
+            topic=normalized_topic,
+            run_id=run_id,
+            status=run_status,
+            phase=phase,
+            error=run_error,
+            fallback_stage=fallback_stage,
+            scout=len(scout_videos),
+            filmot_total=total,
+            selected=selected_count,
+            saved=success_count,
+            skipped=skip_count,
+            failed=fail_count,
+            deduped=dedupe_count,
+            probe=probe_success,
+            probe_failed=probe_fail_count,
+            probe_query_failed=probe_query_fail_count,
+            chars=total_chars + probe_chars,
+            routing_plan=route_plan,
+        )
 
 
 # ========== CHANNEL DOWNLOAD ==========
 
 @cli.command("channel-download")
 @click.argument("channel_id")
-@click.option("--delay", "-d", default=1.0, type=float, help="Seconds between downloads (rate limiting, default: 1.0)")
+@click.option("--delay", "-d", default=1.0, type=click.FloatRange(min=0), help="Seconds between downloads (rate limiting, default: 1.0)")
 @click.option("--lang", "-l", default="en", help="Preferred language code (default: en)")
-@click.option("--limit", default=None, type=int, help="Limit number of transcripts to download (for testing)")
-@click.option("--workers", "-w", default=1, type=int, help="Parallel download workers (default: 1, try 4 for speed)")
+@click.option("--limit", default=None, type=click.IntRange(1), help="Limit number of transcripts to download (for testing)")
+@click.option("--workers", "-w", default=1, type=click.IntRange(1), help="Parallel download workers (default: 1, try 4 for speed)")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy, connect directly with your IP")
 @click.option("--fresh", is_flag=True, help="Ignore existing manifest, start fresh")
 def channel_download(channel_id: str, delay: float, lang: str, limit: int, workers: int, no_proxy: bool, fresh: bool):
@@ -2822,9 +5215,20 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     """
     from rich.progress import Progress, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
     from .channel_dl import ChannelDownloader, get_channel_info
+    from .ledger import log_event
     import shutil
 
     downloader = ChannelDownloader()
+    log_event(
+        "channel_download_start",
+        channel_id=channel_id,
+        lang=lang,
+        limit=limit,
+        workers=workers,
+        delay=delay,
+        fresh=fresh,
+        no_proxy=no_proxy,
+    )
 
     # If --fresh, remove existing channel dir
     if fresh:
@@ -2834,16 +5238,28 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
             if (channel_dir / "manifest.json").exists():
                 stderr_console.print(f"[yellow]Removing existing data for {info['name']}...[/yellow]")
                 shutil.rmtree(channel_dir)
-        except Exception:
-            pass  # Will be handled below
+        except Exception as error:
+            detail = f"{type(error).__name__}: {_whole_word_summary(error, 500)}"
+            log_event(
+                "channel_download_end",
+                channel_id=channel_id,
+                status="failed",
+                phase="fresh_reset",
+                error=detail,
+            )
+            _command_error(f"Could not reset channel data for --fresh: {detail}")
 
     # Phase 1: Channel info
     with console.status("[bold blue]Fetching channel info..."):
         try:
             info = get_channel_info(channel_id)
         except Exception as e:
-            console.print(f"[red]Error fetching channel: {e}[/red]")
-            return
+            log_event(
+                "channel_download_end", channel_id=channel_id,
+                status="failed", phase="channel_info",
+                error=f"{type(e).__name__}: {e}",
+            )
+            _command_error(f"Error fetching channel: {e}")
 
     console.print(Panel(
         f"[bold]{info['name']}[/bold]\n"
@@ -2867,8 +5283,12 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
             ),
         )
     except Exception as e:
-        console.print(f"[red]Error listing videos: {e}[/red]")
-        return
+        log_event(
+            "channel_download_end", channel_id=channel_id,
+            status="failed", phase="enumerate",
+            error=f"{type(e).__name__}: {e}",
+        )
+        _command_error(f"Error listing videos: {e}")
 
     stderr_console.print(f"[green]Found {len(all_videos)} videos[/green]")
 
@@ -2881,10 +5301,15 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
 
     to_download = [v for v in all_videos if v['video_id'] not in already_done]
 
-    if limit:
+    if limit is not None:
         to_download = to_download[:limit]
 
     if not to_download:
+        log_event(
+            "channel_download_end", channel_id=channel_id, slug=slug,
+            status="completed", enumerated=len(all_videos),
+            downloaded=0, failed=0, already_done=len(already_done),
+        )
         console.print("[green]✓ Channel is fully synced! Nothing new to download.[/green]")
         console.print(f"[dim]Total transcripts: {len(already_done)}[/dim]")
         return
@@ -2898,7 +5323,11 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         stderr_console.print(f"[blue]Using {workers} parallel workers[/blue]")
 
     # Phase 4: Download with progress bar
-    from .transcript import get_transcript
+    from .transcript import (
+        describe_routing_plan,
+        get_transcript,
+        routing_plan,
+    )
     import time as _time
     from datetime import datetime as _dt
 
@@ -2906,7 +5335,13 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     if no_proxy:
         from .transcript import disable_proxy
         disable_proxy()
-        stderr_console.print("[yellow]Proxy disabled — using direct IP[/yellow]")
+    route_plan = routing_plan()
+    click.echo(
+        f"Transcript routes ({route_plan['mode']}): "
+        f"{describe_routing_plan(route_plan)}; "
+        f"route deadline {route_plan['route_timeout_s']:g}s",
+        err=True,
+    )
     import threading
 
     languages = [lang, f'{lang}-US', f'{lang}-GB'] if lang == 'en' else [lang, 'en']
@@ -2938,7 +5373,12 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         vid_id = v_item['video_id']
 
         try:
-            result = get_transcript(vid_id, languages=languages)
+            result = get_transcript(
+                vid_id,
+                languages=languages,
+                progress_callback=_route_progress_for(vid_id),
+                fresh_primary=True,
+            )
 
             with _lock:
                 if 'error' in result:
@@ -2948,6 +5388,12 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                         'last_attempt': _dt.now().isoformat(),
                     })
                     failed += 1
+                    log_event(
+                        "channel_download_item", channel_id=channel_id,
+                        slug=slug, video_id=vid_id, status="failed",
+                        error=str(result["error"]),
+                        routes_tried=result.get("routes_tried"),
+                    )
                 else:
                     transcript_data = {
                         'video_id': vid_id,
@@ -2962,6 +5408,7 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                         'word_count': len(result.get('full_text', '').split()),
                         'full_text': result.get('full_text', ''),
                         'segments': result.get('segments', []),
+                        'route': result.get('route'),
                         'downloaded_at': _dt.now().isoformat(),
                     }
                     downloader._save_transcript(channel_dir, vid_id, transcript_data)
@@ -2974,9 +5421,15 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                         'is_generated': result.get('is_generated', True),
                         'duration_seconds': result.get('duration_seconds', 0),
                         'word_count': wc,
+                        'route': result.get('route'),
                         'downloaded_at': _dt.now().isoformat(),
                     })
                     downloaded += 1
+                    log_event(
+                        "channel_download_item", channel_id=channel_id,
+                        slug=slug, video_id=vid_id, status="saved",
+                        words=wc, route=result.get("route"),
+                    )
 
                 # Save manifest (crash-safe)
                 done_total = sum(1 for vv in manifest['videos'].values() if vv.get('status') == 'done')
@@ -2997,6 +5450,11 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                     'last_attempt': _dt.now().isoformat(),
                 })
                 failed += 1
+                log_event(
+                    "channel_download_item", channel_id=channel_id,
+                    slug=slug, video_id=vid_id, status="failed",
+                    error=f"{type(e).__name__}: {e}",
+                )
                 downloader._save_manifest(channel_dir, manifest)
 
     with Progress(
@@ -3068,6 +5526,25 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         title="Summary",
         border_style="green",
     ))
+    log_event(
+        "channel_download_end",
+        channel_id=channel_id,
+        slug=slug,
+        status="interrupted" if _interrupted.is_set() else (
+            "completed_with_failures" if failed else "completed"
+        ),
+        enumerated=len(all_videos),
+        selected=len(to_download),
+        downloaded=downloaded,
+        failed=failed,
+        corpus_done=done_total,
+        words=total_words,
+        routing_plan=route_plan,
+    )
+    if _interrupted.is_set():
+        raise click.Abort()
+    if to_download and failed == len(to_download) and downloaded == 0:
+        _command_error(f"All {failed} selected channel transcripts failed.")
 
 
 @cli.command("channel-status")
@@ -3084,12 +5561,18 @@ def channel_status(channel_slug: str):
         filmot channel-status chat-with-traders
     """
     from .channel_dl import ChannelDownloader
+    from .ledger import log_event
 
     downloader = ChannelDownloader()
 
     if channel_slug is None:
         # List all channels
         channels = downloader.get_downloaded_channels()
+        log_event(
+            "channel_status",
+            scope="all",
+            channels=len(channels),
+        )
         if not channels:
             console.print("[dim]No channels downloaded yet.[/dim]")
             console.print("[dim]Use: filmot channel-download <channel_id>[/dim]")
@@ -3117,11 +5600,27 @@ def channel_status(channel_slug: str):
         # Show detailed stats
         stats = downloader.get_channel_stats(channel_slug)
         if not stats:
+            log_event(
+                "channel_status",
+                scope="channel",
+                slug=channel_slug,
+                status="not_found",
+            )
             console.print(f"[red]Channel '{channel_slug}' not found.[/red]")
             console.print("[dim]Run 'filmot channel-status' to see available channels.[/dim]")
             return
 
         ch = stats.get('channel', {})
+        log_event(
+            "channel_status",
+            scope="channel",
+            slug=channel_slug,
+            status="found",
+            downloaded=stats["downloaded"],
+            failed=stats["failed"],
+            pending=stats["pending"],
+            total=stats["total_videos"],
+        )
         console.print(Panel(
             f"[bold]{ch.get('name', channel_slug)}[/bold]\n"
             f"Channel ID: {ch.get('channel_id', 'N/A')}\n\n"
@@ -3140,7 +5639,7 @@ def channel_status(channel_slug: str):
 @cli.command("channel-search")
 @click.argument("channel_slug")
 @click.argument("query")
-@click.option("--limit", "-n", default=20, type=int, help="Max results (default: 20)")
+@click.option("--limit", "-n", default=20, type=click.IntRange(1), help="Max results (default: 20)")
 def channel_search(channel_slug: str, query: str, limit: int):
     """Search across all transcripts in a downloaded channel corpus.
 
@@ -3179,19 +5678,26 @@ def channel_search(channel_slug: str, query: str, limit: int):
         with console.status(f"[blue]Searching '{qlabel}' across {channel_slug}..."):
             results = downloader.search_corpus(channel_slug, query)
     except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        return
+        _command_error(str(e))
 
     if not results:
+        from .ledger import log_event
+        log_event(
+            "channel-search", slug=channel_slug, query=query,
+            videos=0, hits=0, limit=limit,
+        )
         console.print(f"[dim]No matches for '{qlabel}' in {channel_slug}.[/dim]")
         return
 
     total_matches = sum(r['match_count'] for r in results)
     results = results[:limit]
-    console.print(f"\n[bold]Found {len(results)} videos matching '{qlabel}' ({total_matches} total hits)[/bold]\n")
 
     from .ledger import log_event
-    log_event("channel-search", slug=channel_slug, query=query, videos=len(results), hits=total_matches)
+    log_event(
+        "channel-search", slug=channel_slug, query=query,
+        videos=len(results), hits=total_matches, limit=limit,
+    )
+    console.print(f"\n[bold]Found {len(results)} videos matching '{qlabel}' ({total_matches} total hits)[/bold]\n")
 
     for r in results:
         console.print(f"[bold cyan]{r['title']}[/bold cyan]")
@@ -3234,7 +5740,7 @@ def channel_search(channel_slug: str, query: str, limit: int):
 
 @cli.command("sessions")
 @click.argument("name", required=False, default=None)
-@click.option("--raw", is_flag=True, help="Output raw JSONL events")
+@click.option("--raw", is_flag=True, help="Output one JSON array")
 def sessions(name: str, raw: bool):
     """Show the research session ledger so you can resume prior investigations.
 
@@ -3247,12 +5753,15 @@ def sessions(name: str, raw: bool):
         filmot sessions                       # list all sessions
         filmot sessions fable-5-mythos        # replay a topic session
         filmot sessions 2026-06-10            # replay a day's ad-hoc queries
-        filmot sessions 2026-06-10 --raw      # raw JSONL for piping
+        filmot sessions 2026-06-10 --raw      # one JSON array for piping
     """
     from .ledger import list_sessions, read_events
 
     if not name:
         rows = list_sessions()
+        if raw:
+            click.echo(json_mod.dumps(rows, ensure_ascii=False))
+            return
         if not rows:
             console.print("[dim]No sessions logged yet. Run a search or research command first.[/dim]")
             return
@@ -3267,13 +5776,11 @@ def sessions(name: str, raw: bool):
         return
 
     events = read_events(name)
+    if raw:
+        click.echo(json_mod.dumps(events, ensure_ascii=False))
+        return
     if not events:
         console.print(f"[yellow]No session found for '{name}'.[/yellow]")
-        return
-
-    if raw:
-        for e in events:
-            click.echo(json_mod.dumps(e, ensure_ascii=False))
         return
 
     console.print(f"[bold]Session: {name}[/bold] ({len(events)} events)\n")
@@ -3299,11 +5806,19 @@ def sessions(name: str, raw: bool):
 
 @cli.command("download")
 @click.option("--topic", "-t", required=True, help="Library topic to save transcripts under")
-@click.option("--count", "-n", default=50, type=int, help="Maximum transcripts to download (default: 50)")
+@click.option("--count", "-n", default=50, type=click.IntRange(1), help="Maximum transcripts to download (default: 50)")
+@click.option("--lang", "-l", default=None, help="Preferred transcript language code")
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy, connect directly with your IP")
-def download(topic: str, count: int, fallback: bool, dedupe: bool, no_proxy: bool):
+def download(
+    topic: str,
+    count: int,
+    lang: str,
+    fallback: bool,
+    dedupe: bool,
+    no_proxy: bool,
+):
     """Download transcripts from piped search results.
 
     Reads JSON search results from stdin and downloads transcripts
@@ -3313,7 +5828,7 @@ def download(topic: str, count: int, fallback: bool, dedupe: bool, no_proxy: boo
 
     \b
         filmot search "deep sea mining" --title "deep sea mining" --raw | filmot download -t deep-sea
-        filmot search-all "AI safety" --pages 5 --raw > results.json
+        filmot search "AI safety" --pages 5 --raw > results.json
         type results.json | filmot download -t ai-safety --dedupe
     """
     import sys
@@ -3322,9 +5837,9 @@ def download(topic: str, count: int, fallback: bool, dedupe: bool, no_proxy: boo
         raw_input = sys.stdin.read()
         results = json_mod.loads(raw_input)
     except (json_mod.JSONDecodeError, ValueError) as e:
-        console.print(f"[red]Invalid JSON from stdin: {e}[/red]")
-        console.print("[dim]Pipe search results with --raw: filmot search \"query\" --raw | filmot download -t TOPIC[/dim]")
-        return
+        _command_error(
+            f"Invalid JSON from stdin: {e}. Pipe search results with --raw."
+        )
 
     # Wrap in expected format if needed
     if isinstance(results, list):
@@ -3335,18 +5850,24 @@ def download(topic: str, count: int, fallback: bool, dedupe: bool, no_proxy: boo
         disable_proxy()
         console.print("[dim]Proxy disabled, using direct connection[/dim]")
 
-    _bulk_download_transcripts(results, f"{topic}:{count}", console, fallback=fallback, dedupe=dedupe)
+    _bulk_download_transcripts(
+        results,
+        f"{topic}:{count}",
+        console,
+        fallback=fallback,
+        dedupe=dedupe,
+        lang=lang,
+    )
 
 
 # ========== PROXY POOL ==========
 
 @cli.group()
 def proxy():
-    """Manage the dynamic Webshare proxy pool used for transcript fetches.
+    """Manage the file/API proxy pool used for transcript fetches.
 
-    Requires WEBSHARE_API_TOKEN in your environment. The pool replaces the
-    legacy single rotating endpoint with a list of session-pinned residential
-    IPs that can be individually cooled-down or retired when they go bad.
+    Configure WEBSHARE_API_TOKEN or a WEBSHARE_SESSION_FILE. Availability means
+    eligible now; "recently healthy" requires a successful bounded live fetch.
     """
 
 
@@ -3354,20 +5875,18 @@ def _require_pool():
     from .proxy_pool import get_pool
     pool = get_pool()
     if pool is None:
-        console.print("[red]No Webshare pool available.[/red]")
-        console.print("[dim]Either set WEBSHARE_API_TOKEN in .env (https://dashboard.webshare.io/userapi/keys),[/dim]")
-        console.print("[dim]or place a session list at .filmot_data/webshare_info.txt (host:port:user:pass per line).[/dim]")
-        return None
+        raise click.ClickException(
+            "No transcript proxy pool is configured. Set WEBSHARE_API_TOKEN "
+            "or WEBSHARE_SESSION_FILE."
+        )
     return pool
 
 
 @proxy.command("status")
 @click.option("--full", is_flag=True, help="Show every session, not just a summary")
 def proxy_status(full: bool):
-    """Show pool size, healthy count, and per-session health."""
+    """Show availability, recent live health, and per-session state."""
     pool = _require_pool()
-    if pool is None:
-        return
     snap = pool.status_snapshot()
 
     from datetime import datetime
@@ -3377,133 +5896,373 @@ def proxy_status(full: bool):
         else "never"
     )
 
-    console.print(Panel(
-        f"[bold]Gateway:[/bold]  {snap['gateway']}\n"
-        f"[bold]Countries:[/bold] {', '.join(snap['countries']) if snap['countries'] else 'all'}\n"
-        f"[bold]Sessions:[/bold] {snap['healthy']} healthy / {snap['total']} total\n"
-        f"[bold]Last refresh:[/bold] {last_refresh}{' [yellow](stale)[/yellow]' if snap['stale'] else ''}",
-        title="Webshare Proxy Pool",
-        border_style="cyan",
-    ))
+    source_detail = snap["source"]
+    if snap.get("session_file"):
+        source_detail += f" ({snap['session_file']})"
+    from .ledger import log_event
+    log_event(
+        "proxy_status",
+        source=snap["source"],
+        total=snap["total"],
+        available=snap["available"],
+        recently_healthy=snap["recently_healthy"],
+        in_flight=snap["in_flight"],
+        untested=snap["untested"],
+        cooling=snap["cooling"],
+        failing=snap["failing"],
+        retired=snap["retired"],
+        invalid=snap["invalid"],
+    )
+    console.print(
+        Panel(
+            f"[bold]Source:[/bold] {source_detail}\n"
+            f"[bold]Gateway:[/bold] {snap['gateway']}\n"
+            f"[bold]Countries:[/bold] "
+            f"{', '.join(snap['countries']) if snap['countries'] else 'all'}\n"
+            f"[bold]Sessions:[/bold] {snap['total']} total | "
+            f"{snap['available']} available now | "
+            f"{snap['recently_healthy']} recently healthy | "
+            f"{snap['untested']} untested | {snap['in_flight']} in flight\n"
+            f"[bold]Problems:[/bold] {snap['cooling']} cooling | "
+            f"{snap['failing']} failing | {snap['retired']} retired | "
+            f"{snap['invalid']} invalid\n"
+            f"[bold]Last refresh/reload:[/bold] {last_refresh}"
+            f"{' [yellow](stale)[/yellow]' if snap['stale'] else ''}",
+            title="Transcript Proxy Pool",
+            border_style="cyan",
+        )
+    )
 
     if not snap["sessions"]:
         console.print("[yellow]Pool is empty. Run `filmot proxy refresh` to populate it.[/yellow]")
         return
 
-    rows = snap["sessions"] if full else [
-        s for s in snap["sessions"] if not s["available"] or s["success"] + s["fail_429"] + s["fail_blocked"] + s["fail_other"] > 0
-    ]
+    rows = (
+        snap["sessions"]
+        if full
+        else [
+            session
+            for session in snap["sessions"]
+            if session["state"] != "ready-untested"
+        ]
+    )
     if not rows and not full:
-        console.print(f"[green]All {snap['total']} sessions healthy and unused. Use --full to list every session.[/green]")
+        console.print(
+            f"[dim]All {snap['total']} sessions are available but untested. "
+            "Use --full to list them or `filmot proxy test` to probe them.[/dim]"
+        )
         return
 
-    from rich.table import Table
-    t = Table(show_lines=False)
-    t.add_column("Session")
-    t.add_column("Country")
-    t.add_column("State")
-    t.add_column("OK", justify="right")
-    t.add_column("429", justify="right")
-    t.add_column("Blocked", justify="right")
-    t.add_column("Other", justify="right")
-    t.add_column("Cooldown", justify="right")
-    t.add_column("Last error")
+    # Keep the identity and state readable at Click/Rich's normal 80-column
+    # width. The previous 11-column table truncated both into indistinguishable
+    # ``ses…`` / ``rea…`` labels.
+    t = Table(show_lines=True)
+    t.add_column("Session", no_wrap=True)
+    t.add_column("Country", no_wrap=True)
+    t.add_column("State", no_wrap=True)
+    t.add_column("Health history")
 
+    def _short_time(timestamp):
+        if not timestamp:
+            return "-"
+        return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+
+    state_styles = {
+        "ready-tested": "[green]ready-tested[/green]",
+        "ready-untested": "[cyan]ready-untested[/cyan]",
+        "ready-stale": "[blue]ready-stale[/blue]",
+        "ready-failing": "[yellow]ready-failing[/yellow]",
+        "in-flight": "[magenta]in-flight[/magenta]",
+        "cooldown": "[yellow]cooldown[/yellow]",
+        "retired": "[red]retired[/red]",
+        "invalid": "[red]invalid[/red]",
+    }
+    session_by_id = {session.id: session for session in pool._sessions}
     for s in rows:
-        if s["retired"]:
-            state = "[red]retired[/red]"
-        elif not s["available"]:
-            state = "[yellow]cooldown[/yellow]"
-        else:
-            state = "[green]ready[/green]"
-        cooldown = f"{s['cooldown_remaining_s']}s" if s["cooldown_remaining_s"] else "-"
-        err = (s["last_error"] or "")[:50]
+        state = state_styles.get(s["state"], s["state"])
+        history = (
+            f"OK {s['success']} | 429 {s['fail_429']} | "
+            f"blocked {s['fail_blocked']} | other {s['fail_other']}"
+        )
+        if s["cooldown_remaining_s"]:
+            history += f"\ncooldown: {s['cooldown_remaining_s']}s"
+        if s["last_success_at"]:
+            history += f"\nlast OK: {_short_time(s['last_success_at'])}"
+        if s["last_failure_at"]:
+            history += f"\nlast fail: {_short_time(s['last_failure_at'])}"
+        if s["last_error"]:
+            history += f"\n{_whole_word_summary(s['last_error'], 80)}"
+        session = session_by_id.get(s["id"])
+        display_id = (
+            pool.redacted_session_id(session)
+            if session is not None
+            else "session-unknown"
+        )
         t.add_row(
-            s["id"], s["country"] or "-", state,
-            str(s["success"]), str(s["fail_429"]), str(s["fail_blocked"]), str(s["fail_other"]),
-            cooldown, err,
+            display_id,
+            s["country"] or "-",
+            state,
+            history,
         )
     console.print(t)
 
 
 @proxy.command("refresh")
-@click.option("--full", is_flag=True, help="Also POST /proxy/list/refresh/ (rotates the underlying IPs at Webshare)")
+@click.option(
+    "--full",
+    is_flag=True,
+    help="For API-backed pools, also request remote IP rotation",
+)
 def proxy_refresh(full: bool):
-    """Re-pull the session list from Webshare. With --full, also rotate IPs."""
+    """Refresh an API pool or reload a file-backed session list."""
     pool = _require_pool()
-    if pool is None:
-        return
-    if full:
+    rotation_error = None
+    if full and pool.source == "session-file":
+        console.print(
+            "[dim]File-backed pool: remote IP rotation is not applicable; "
+            "reloading the local session file instead.[/dim]"
+        )
+    elif full:
         try:
             with console.status("[bold blue]Asking Webshare to rotate the underlying proxy list..."):
                 pool.request_full_refresh()
             console.print("[green]POST /proxy/list/refresh/ accepted (204).[/green]")
         except Exception as e:
-            console.print(f"[red]Refresh request failed: {e}[/red]")
-            console.print("[dim]This typically means you have no on-demand refreshes available on your plan.[/dim]")
+            rotation_error = e
+            console.print(
+                f"[red]Remote IP rotation failed: "
+                f"{_whole_word_summary(e)}[/red]"
+            )
     try:
-        with console.status("[bold blue]Pulling current proxy list..."):
+        action = (
+            "Reloading local session file..."
+            if pool.source == "session-file"
+            else "Pulling current Webshare session list..."
+        )
+        with console.status(f"[bold blue]{action}"):
             n = pool.refresh(force=True)
-        console.print(f"[green]Pool now has {n} sessions ({pool.healthy_count()} healthy).[/green]")
+        console.print(
+            f"[green]Pool now has {n} sessions: "
+            f"{pool.available_count()} available, "
+            f"{pool.recently_healthy_count()} recently healthy.[/green]"
+        )
     except Exception as e:
-        console.print(f"[red]List refresh failed: {e}[/red]")
+        _command_error(f"Pool refresh/reload failed: {e}")
+
+    from .ledger import log_event
+    log_event(
+        "proxy_refresh",
+        source=pool.source,
+        total=n,
+        available=pool.available_count(),
+        recently_healthy=pool.recently_healthy_count(),
+        remote_rotation_requested=full,
+        remote_rotation_error=(
+            _whole_word_summary(rotation_error, 500)
+            if rotation_error is not None else None
+        ),
+    )
+    if rotation_error is not None:
+        _command_error(
+            "The session list refreshed, but the requested remote IP rotation failed."
+        )
 
 
 @proxy.command("test")
 @click.option("--video-id", default="dQw4w9WgXcQ", help="Video to probe (default: a known short video)")
-@click.option("--count", "-n", default=3, type=int, help="Number of sessions to test (default: 3)")
-def proxy_test(video_id: str, count: int):
-    """Probe N pool sessions by fetching a known YouTube transcript through each."""
-    from .proxy_pool import classify_transport_error
-    from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api.proxies import GenericProxyConfig
+@click.option(
+    "--count",
+    "-n",
+    default=3,
+    type=click.IntRange(1),
+    show_default=True,
+    help="Number of sessions to test",
+)
+@click.option(
+    "--route-timeout",
+    type=click.FloatRange(min=0.01),
+    default=None,
+    help="Per-session deadline (defaults to FILMOT_TRANSCRIPT_ROUTE_TIMEOUT)",
+)
+@click.option(
+    "--total-timeout",
+    type=click.FloatRange(min=0.01),
+    default=90.0,
+    show_default=True,
+    help="Total command deadline in seconds",
+)
+def proxy_test(
+    video_id: str,
+    count: int,
+    route_timeout: float,
+    total_timeout: float,
+):
+    """Stream bounded, redacted live probes through N pool sessions."""
+    from .ledger import log_event
+    from .transcript import probe_pool_session, routing_plan
     import time
 
     pool = _require_pool()
-    if pool is None:
-        return
-    if pool.healthy_count() == 0:
-        console.print("[yellow]No healthy sessions. Trying refresh...[/yellow]")
-        try:
-            pool.refresh(force=True)
-        except Exception as e:
-            console.print(f"[red]Refresh failed: {e}[/red]")
-            return
+    deadline = time.monotonic() + total_timeout
+    if pool.available_count() == 0:
+        _command_error(
+            "No loaded proxy sessions are available to test. "
+            "Run `filmot proxy refresh` first."
+        )
 
-    from rich.table import Table
-    t = Table(title=f"Probing {count} pool sessions against {video_id}")
-    t.add_column("Session")
-    t.add_column("Country")
-    t.add_column("Result")
-    t.add_column("Latency", justify="right")
-    t.add_column("Detail")
+    configured_route_timeout = (
+        route_timeout
+        if route_timeout is not None
+        else routing_plan()["route_timeout_s"]
+    )
+    attempted = 0
+    passed = 0
+    failed = 0
+    budget_exhausted = False
+    attempted_session_ids: set[str] = set()
 
-    for _ in range(count):
-        sess = pool.pick()
-        if sess is None:
-            console.print("[yellow]Pool exhausted before probe completed.[/yellow]")
+    console.print(
+        f"[bold]Probing up to {count} sessions against {video_id} "
+        f"(route {configured_route_timeout:g}s; total {total_timeout:g}s)[/bold]"
+    )
+    for index in range(1, count + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            budget_exhausted = True
             break
-        url = pool.proxy_url(sess)
-        api = YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=url, https_url=url))
-        started = time.monotonic()
-        try:
-            segs = list(api.fetch(video_id, languages=["en"]))
-            latency = f"{(time.monotonic() - started) * 1000:.0f}ms"
-            pool.report_success(sess)
-            t.add_row(sess.id, sess.country_code or "-", "[green]ok[/green]", latency, f"{len(segs)} segments")
-        except Exception as e:
-            latency = f"{(time.monotonic() - started) * 1000:.0f}ms"
-            kind = classify_transport_error(e) or "other"
-            pool.report_failure(sess, kind, summary=str(e))
-            t.add_row(sess.id, sess.country_code or "-", f"[red]{kind}[/red]", latency, str(e)[:60])
-
-    console.print(t)
+        sess = pool.pick(
+            refresh=False,
+            exclude_ids=attempted_session_ids,
+        )
+        if sess is None:
+            console.print(
+                "[yellow]No additional distinct session is available.[/yellow]"
+            )
+            break
+        attempted_session_ids.add(sess.id)
+        attempted += 1
+        display_id = pool.redacted_session_id(sess)
+        log_event(
+            "proxy_test_item",
+            source=pool.source,
+            session=display_id,
+            video_id=video_id,
+            status="started",
+            index=index,
+            requested=count,
+        )
+        console.print(
+            f"[dim][{index}/{count}] testing {display_id} "
+            f"({sess.country_code or 'unknown country'})...[/dim]"
+        )
+        result = probe_pool_session(
+            pool,
+            sess,
+            video_id,
+            route_timeout=min(configured_route_timeout, remaining),
+            progress_callback=_route_progress_for(display_id),
+        )
+        elapsed = float(result.get("route_elapsed_seconds") or 0)
+        transport_ok = bool(result.get("transport_ok"))
+        log_event(
+            "proxy_test_item",
+            source=pool.source,
+            session=display_id,
+            video_id=video_id,
+            status="passed" if transport_ok else "failed",
+            elapsed_seconds=round(elapsed, 3),
+            error_type=result.get("error_type"),
+            failure_kind=result.get("failure_kind"),
+        )
+        if transport_ok:
+            passed += 1
+            detail = (
+                f"{result.get('segment_count', 0)} segments"
+                if "error" not in result
+                else result.get("error_type", "video has no usable transcript")
+            )
+            console.print(
+                f"[green][{index}/{count}] {display_id}: transport OK[/green] "
+                f"({elapsed:.2f}s; {detail})"
+            )
+        else:
+            failed += 1
+            detail = (
+                result.get("failure_kind")
+                or result.get("error_type")
+                or "transport failure"
+            )
+            console.print(
+                f"[red][{index}/{count}] {display_id}: {detail}[/red] "
+                f"({elapsed:.2f}s)"
+            )
+    unattempted = count - attempted
+    if deadline - time.monotonic() <= 0 and unattempted:
+        budget_exhausted = True
+    log_event(
+        "proxy_test",
+        source=pool.source,
+        video_id=video_id,
+        requested=count,
+        attempted=attempted,
+        passed=passed,
+        failed=failed,
+        unattempted=unattempted,
+        budget_exhausted=budget_exhausted,
+        route_timeout=configured_route_timeout,
+        total_timeout=total_timeout,
+    )
+    console.print(
+        f"[bold]Proxy probe summary:[/bold] {passed} passed, {failed} failed, "
+        f"{unattempted} unattempted"
+    )
+    if budget_exhausted:
+        console.print("[yellow]The total proxy-test budget was exhausted.[/yellow]")
+    if passed == 0:
+        _command_error("No proxy session passed the bounded live probe.")
+    if failed or unattempted:
+        raise click.exceptions.Exit(2)
 
 
 def main():
-    """Entry point for the CLI."""
-    cli()
+    """Run Click with Unix-friendly broken-pipe handling, including flush."""
+    try:
+        try:
+            result = cli(standalone_mode=False)
+            exit_code = result if isinstance(result, int) else 0
+        except click.ClickException as error:
+            error.show()
+            exit_code = error.exit_code
+        except click.Abort:
+            click.echo("Aborted!", err=True)
+            exit_code = 1
+
+        # Buffered output may not observe a closed downstream reader until
+        # interpreter shutdown, which CPython reports as exit 120. Flush while
+        # still inside the EPIPE boundary so normal `... | head` pipelines
+        # finish successfully.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return exit_code
+    except SystemExit as error:
+        # Click catches an EPIPE inside Command.main even when
+        # ``standalone_mode=False``, swaps in its pacifying stream wrapper,
+        # then raises SystemExit(1). Recognize that exact path without
+        # converting unrelated SystemExit failures into success.
+        pacify_type = click.utils.PacifyFlushWrapper
+        if error.code == 1 and (
+            isinstance(sys.stdout, pacify_type)
+            or isinstance(sys.stderr, pacify_type)
+        ):
+            _silence_broken_pipe_streams()
+            return 0
+        raise
+    except OSError as error:
+        if error.errno not in (errno.EPIPE, errno.EINVAL):
+            raise
+        _silence_broken_pipe_streams()
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

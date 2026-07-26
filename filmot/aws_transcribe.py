@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import tempfile
+import requests
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Tuple, Optional
@@ -13,7 +14,6 @@ import json
 
 try:
     import boto3
-    import requests
     HAS_BOTO3 = True
 except ImportError:
     HAS_BOTO3 = False

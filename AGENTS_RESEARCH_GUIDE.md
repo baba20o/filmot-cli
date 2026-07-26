@@ -14,9 +14,12 @@ This guide teaches you how.
 
 ---
 
-## 1. Source Credibility Scoring
+## 1. Source Assessment
 
-Not all sources are equal. Before citing anything, mentally score it:
+Not all sources are equally useful for every claim. Treat the tiers below as
+inspection priorities, not verdicts: audience size and engagement are
+heuristics, and authority is claim-specific. Before citing anything, inspect
+the passage and verify the source's relationship to the claim.
 
 ### Tier 1: Primary Sources (Trust, but verify)
 - **Official channels**: Nobel Prize, university channels, government agencies, C-SPAN
@@ -40,11 +43,11 @@ Not all sources are equal. Before citing anything, mentally score it:
 
 **Signals**: Check if they cite the original paper/source. If they do, go find the primary source instead.
 
-### Tier 4: Noise (Avoid or flag explicitly)
+### Tier 4: High-risk material (Verify before using)
 - **AI-generated content farms** (see Section 2)
 - **Hype channels** with clickbait titles and no citations
 - **Conspiracy aggregators** mixing real and fabricated claims
-- **Channels with <100 views** on "breakthrough" claims (if it were real, someone would care)
+- **Very low-view "breakthrough" claims with no traceable primary source** — the combination is a warning, but low views alone can also mean niche expertise or very recent publication
 
 ---
 
@@ -52,12 +55,12 @@ Not all sources are equal. Before citing anything, mentally score it:
 
 This is the most important skill. AI-slop videos are flooding YouTube and they look increasingly convincing. Here are the red flags we've confirmed in the field:
 
-### Hard Red Flags (any one = reject)
+### Strong Red Flags (any one requires primary-source verification)
 - **Misspelled technical terms**: "germanmanium" instead of germanium, repeated consistently (AI doesn't know it's wrong)
 - **Fabricated institutional reports**: "Goldman Sachs published a 180-page report titled..." — verify these exist before citing
 - **Impossible specificity without sources**: "measured resistance of 0.001 ohms over 12 meters at 10,000 amperes" — real papers hedge; fake ones give exact numbers to sound credible
 - **Timelines that don't exist**: "commercial versions will appear by late 2025, first in military submarines" — verifiable claims that no one else is reporting
-- **View count under 100 on "world-changing" claims**: Real breakthroughs get attention. A video claiming unlimited energy with 43 views is not suppressed — it's fabricated.
+- **Tiny audience plus a world-changing claim and no traceable evidence**: Treat it as unverified. View count alone never proves fabrication, especially for niche or launch-day material.
 
 ### Soft Red Flags (multiple = suspect)
 - **No named researchers or institutions** — real breakthroughs have authors
@@ -75,7 +78,8 @@ When you find a "breakthrough" claim, run this 30-second test:
 1. Search for the claimed institution + finding in Filmot or YouTube
 2. Check if ANY credible channel (Tier 1-2) is also reporting it
 3. Look for the actual paper (researcher name + topic + "paper" or "arxiv")
-4. If NOBODY else is talking about it, it's almost certainly fake
+4. If nobody else is discussing it, classify it as uncorroborated and check
+   timing, niche context, and the primary document before judging it
 ```
 
 **Real example from our research**: The "DARPA 2026 Room Temp Superconductor Breakthrough" video claimed germanium was made superconducting at room temperature via a DARPA-funded lab. Red flags: "germanmanium" (misspelled), fabricated Goldman Sachs report, impossible claims (18 months stable at room temp), 43 views on a channel called "Sci Factor." Meanwhile, the Caltech Cooper Pair Density Modulation discovery (real) was covered by German Science Guy (75K subs, 40K views), cited the actual paper, named the professors, and included appropriate caveats ("only one paper so far, needs replication").
@@ -85,6 +89,11 @@ When you find a "breakthrough" claim, run this 30-second test:
 ## 3. The Cross-Reference Method
 
 Never trust a single source. The power of this tool is **cross-referencing across multiple independent sources**.
+
+`filmot library compare` helps locate passages that use the same term or
+phrase. It is a lexical concordance: it does not establish source
+independence, stance, agreement, contradiction, credibility, or truth. Make
+those judgments only after reading the passages and checking primary sources.
 
 ### The Triangle Test
 
@@ -151,7 +160,10 @@ Searching in other languages is a superpower for breaking echo chambers.
 filmot search '"초전도체"' --lang ko --sort density
 
 # NEAR/N works across languages
-filmot search '"초전도" NEAR/15 "상온"' --sort density
+filmot search '"초전도" NEAR/15 "상온"' --lang ko --sort density
+
+# Keep the research corpus language-scoped too
+filmot research "상온 초전도체" --lang ko --depth 10 --dedupe
 
 # Use yt-search for non-Latin scripts too
 filmot yt-search "상온 초전도체 2025" --days 180
@@ -163,7 +175,7 @@ filmot yt-search "상온 초전도체 2025" --days 180
 
 ## 5. The Research Pipeline: How to Approach Any Topic
 
-### Phase 1: Broad Scan (5 minutes)
+### Phase 1: Staged Scan (5 minutes)
 
 Start wide. Get the lay of the land.
 
@@ -173,9 +185,24 @@ filmot research "your topic" --depth 10 --dedupe --scout-days 14
 ```
 
 This gives you:
+
 - **Scout results**: What's happening RIGHT NOW (last 7-14 days)
-- **Filmot results**: Historical depth and established coverage
+- **Filmot candidates**: Historical depth from title+transcript, exact-phrase,
+  and `NEAR/N` stages before loose matching
 - **Downloaded transcripts**: Raw material for analysis
+
+Treat the automatic corpus as candidate material, not verified evidence.
+Balanced ranking keeps passage relevance, lexical density, echo risk, and an
+audience/engagement source prior visible as separate signals. The source prior
+is not a credibility score. A loose fallback above the configured threshold is
+blocked unless `--accept-broad` is explicit, and accepted candidates still
+pass a passage-level relevance gate. Widen client-side ranking deliberately
+with `--candidate-pages` and `--candidate-pool`; inspect the preview, effective
+query, candidate scope, and source mix before citing or synthesizing anything.
+
+Use `--channel` when you want a named source. The name is resolved to displayed
+channel IDs and the command fails closed when resolution is empty or Filmot
+returns candidates outside the selected IDs.
 
 ### Phase 2: NEAR/N Surgical Probes (5-10 minutes)
 
@@ -225,7 +252,15 @@ If you have enough transcript material, use `--probe` to discover connections yo
 filmot research "your topic" --depth 12 --dedupe --probe
 ```
 
-The probe extracts entities from downloaded transcripts, finds co-occurring pairs, and auto-generates NEAR/N queries to surface related content you might have missed.
+The probe preserves source and sentence boundaries, prefers terms supported by
+multiple transcripts, clusters likely ASR variants, and reports both
+`co-windows:N` (overlapping 50-word windows, 25-word stride) and distinct
+supporting-source counts. A relationship must occur in at least two transcripts
+before it consumes a probe query. It logs the exact query, effective title/channel
+scope, raw API count, returned candidates, post-scope count, and errors before
+downloading a small set of related discoveries. A probe keeps the title
+constraint only when the initial title stage proved usable; otherwise the
+reported scope uses a passage-level topic relevance filter.
 
 ---
 

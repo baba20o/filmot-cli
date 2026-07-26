@@ -15,7 +15,7 @@ Filmot CLI searches **YouTube transcripts** (not titles, not descriptions—the 
 1. You can find discussions that aren't in video titles
 2. You get the exact context of what was said
 3. You can download full transcripts for deep analysis
-4. You can build curated knowledge bases and cross-reference claims across sources
+4. You can build curated knowledge bases and locate claim-bearing passages across sources
 5. Date filtering lets you research current events in near-real-time
 
 **Think of it as:** Google for what people *say* in YouTube videos.
@@ -60,20 +60,23 @@ The fastest way to research any topic:
 filmot research "nuclear fusion energy" --depth 12 --dedupe
 ```
 
-This runs the **Scout → Search → Synthesize** pipeline:
+This runs the **Scout → Staged Search → Preview → Download** pipeline:
+
 1. **Scout** — Quick YouTube API probe for the latest uploads about your topic (last 7 days). Catches breaking news that Filmot hasn't indexed yet.
-2. **Search** — Deep Filmot transcript search with title+transcript matching (auto-falls back to transcript-only if no title matches)
-3. **Synthesize** — Merges both result sets, filters to 2+ subtitle matches (default), sorts by density (matches/min)
-4. Download top 12 transcripts, skipping duplicates
-5. Save everything to your local library under the topic name
-6. Print a summary with source tags showing which came from scout vs Filmot
+2. **Staged search** — Tries title+transcript, an exact phrase, and `NEAR/N` before considering loose transcript-wide matching.
+3. **Safety gate** — Exact/`NEAR/N` fallbacks require at least 75% topic-token coverage in one visible passage; a high-cardinality loose fallback is blocked unless `--accept-broad` is explicit.
+4. **Preview and rank** — Shows relevance, density, echo risk, and a separate audience/engagement `source-prior`; balanced ranking is the default.
+5. **Download and checkpoint** — Saves selected transcripts and per-item outcomes under the Unicode-safe topic name.
+6. **Probe (optional)** — Extracts cross-source entities, reports co-occurrence-window and source support, and runs transparent `NEAR/N` follow-ups.
 
 **Why this matters:** Filmot indexes transcripts ~24-48 hours after upload. For breaking news, the scout phase finds videos that Filmot can't see yet. Without it, you'd miss same-day developments entirely.
+
+The source prior is an unverified popularity/engagement heuristic, not a credibility or truth score. Treat every automatically selected transcript as candidate material until you inspect the passage and verify important claims.
 
 Then cross-reference what your sources say:
 
 ```bash
-# Compare how different sources discuss a specific claim
+# Locate passages that use the same claim term or phrase
 filmot library compare "tritium" --sort density
 
 # Search for specific terms across all saved transcripts
@@ -101,15 +104,21 @@ filmot research "your topic" [OPTIONS]
 | `--fallback` | Use AWS Transcribe when captions unavailable | Off |
 | `--dedupe` | Skip duplicate/near-duplicate transcripts | Off |
 | `--min-matches N` | Only download videos with N+ subtitle matches (0 to disable) | 2 |
-| `--sort [viewcount\|density]` | Sort by views or matches-per-minute | density |
+| `--sort [balanced\|density\|source-prior\|viewcount]` | Rank fetched candidates; source-prior is an unverified audience/engagement heuristic | balanced |
+| `--candidate-pages N` | Filmot pages fetched before client-side ranking | 3 |
+| `--candidate-pool N` | Maximum Filmot candidates scored | 150 |
+| `--accept-broad` | Permit a high-cardinality loose fallback after preview/gating | Off |
+| `--broad-threshold N` | Loose-result cardinality requiring explicit acceptance | 1000 |
+| `--channel` / `--channel-id` | Restrict candidates to resolved or exact channel IDs; fail closed on resolution errors | None |
 | `--scout / --no-scout` | YouTube API freshness probe for latest uploads | On (if API key set) |
 | `--scout-days N` | How far back the scout looks | 7 |
 | `--probe` | Auto-extract entities from transcripts and run NEAR/N probes to discover related content | Off |
+| `--verbose` | Show full transcript failure details | Off |
 
 ### Recommended Settings
 
 ```bash
-# For most research topics — scout + density sort + min-matches 2 are defaults
+# For most research topics — scout + balanced rank + min-matches 2 are defaults
 filmot research "your topic" --depth 12 --dedupe
 
 # Full pipeline: scout + search + probe (discovers content your initial search missed)
@@ -124,6 +133,12 @@ filmot research "artificial intelligence" --depth 15 --dedupe --min-matches 3 --
 # For niche topics — cast a wider net, disable min-matches filter
 filmot research "polymetallic nodules" --depth 20 --fallback --min-matches 0
 
+# Review and explicitly permit a large loose fallback
+filmot research "broad topic" --accept-broad --candidate-pages 5
+
+# Restrict research to an explicitly resolved source
+filmot research "grid demand" --channel "Lawrence Berkeley National Laboratory"
+
 # Skip scout if you only want indexed transcripts (faster, no YouTube API needed)
 filmot research "your topic" --no-scout --sort viewcount
 ```
@@ -132,9 +147,9 @@ filmot research "your topic" --no-scout --sort viewcount
 
 The `--probe` flag activates Phase 4: automatic NEAR/N discovery. After downloading transcripts, it:
 
-1. **Extracts key entities** — mines your downloaded transcripts for frequent bigrams ("abu dhabi", "donald trump") and significant single words ("elections", "territory"), filtering out stopwords and the topic itself
-2. **Finds co-occurring pairs** — scans text in sliding windows to find which entities appear together most often (e.g., "zelensky" + "elections" co-occur 8 times within 50 words)
-3. **Generates NEAR/N probes** — turns the top pairs into `"entity1" NEAR/15 "entity2"` searches, anchored to your topic via title filtering
+1. **Extracts key entities** — preserves source/sentence boundaries, filters stopwords, clusters likely ASR variants, and prefers terms supported by multiple transcripts
+2. **Finds co-occurring pairs** — scans overlapping 50-word windows (25-word stride) without crossing source or sentence boundaries; a pair must occur in at least two transcripts
+3. **Generates NEAR/N probes** — turns the top pairs into `"entity1" NEAR/15 "entity2"` searches; it retains a title constraint when the initial title stage proved usable, otherwise it applies the displayed passage-level topic relevance filter
 4. **Downloads discoveries** — the top 3 new videos (not already in your library) from the probes are downloaded
 
 **Why this is powerful:** Your initial search finds videos explicitly about your topic. The probe phase finds videos that discuss the *relationships within* your topic — angles, connections, and context your original search missed. Each iteration surfaces new entities that could feed further probing.
@@ -143,8 +158,8 @@ The `--probe` flag activates Phase 4: automatic NEAR/N discovery. After download
 # Example output:
 # Probing key relationships from 8 transcripts...
 #   Entities: abu dhabi, donald trump, zelensky, elections, donbass, territory...
-#   Probe 1: "donald trump" NEAR/15 "vladimir putin" (co:8) → 115 results (peak: 3.1/min) | 48 new
-#   Probe 2: "moscow" NEAR/15 "sanctions" (co:6) → 198 results (peak: 7.5/min) | 47 new
+#   Probe 1: "donald trump" NEAR/15 "vladimir putin" (co-windows:8; sources:3; scope:title="...") → 115 API results
+#   Probe 2: "moscow" NEAR/15 "sanctions" (co-windows:6; sources:2; scope:topic relevance post-filter) → 198 API results
 #   Downloading 3 probe discoveries...
 #     ✓ Russia Ukraine Ceasefire Deal | Zelensky and Europe Prepare (probe)
 ```
@@ -159,14 +174,19 @@ The `--probe` flag activates Phase 4: automatic NEAR/N discovery. After download
 filmot search "your query" --full --lang en
 ```
 
-Always use `--full` to see all matches without truncation. Add `--lang en` for English videos.
+Use `--full` when you need all non-duplicate hit snippets returned for
+displayed videos on the candidate pages already fetched. It removes the normal
+per-video hit cap, but repeated duplicate segments may still be collapsed and
+it does not fetch additional pages. Add `--lang en` for English videos.
 
 ### Key Search Options
 
 | Option | Description | Example |
 |--------|-------------|---------|
 | `--min-matches N` | Only show videos with N+ subtitle matches | `--min-matches 3` |
-| `--sort density` | Sort by matches-per-minute (client-side) | `--sort density` |
+| `--sort density` | Sort fetched candidates by matches-per-minute (client-side; not a global credibility score) | `--sort density` |
+| `--pages N` / `--candidate-pool N` | Widen or cap the candidates considered by client-side ranking | `--pages 3 --candidate-pool 120` |
+| `--limit N` / `--max-hits N` | Bound displayed videos and per-video hit details independently | `--limit 20 --max-hits 5` |
 | `--dedupe` | Skip duplicates during bulk download | `--dedupe` |
 | `--title TEXT` | Filter by video title (supports operators) | `--title "fusion energy"` |
 | `--min-views N` | Minimum view count | `--min-views 10000` |
@@ -174,13 +194,14 @@ Always use `--full` to see all matches without truncation. Add `--lang en` for E
 | `--start-date` / `--end-date` | Date range filter (yyyy-mm-dd) | `--start-date 2026-01-01` |
 | `--sort` | Sort: `viewcount`, `likecount`, `uploaddate`, `duration`, `chanrank`, `id`, `density` | `--sort viewcount` |
 | `--context N` | Characters of context per side in snippets (raise for fuller quotes) | `--context 120` |
+| `--channel TEXT` | Resolve and display matching channel IDs; fail closed if none resolve | `--channel "Primary Lab"` |
 
 ### Reading the results (signals built into the display)
 
-Every result now surfaces credibility and navigation signals inline, so you can triage at read speed:
+Every result surfaces navigation and heuristic signals inline, so you can triage at read speed:
 
 - **Timestamped deep links** — the `Video:` URL and every match link jump straight to the moment (`&t=312s`), not 0:00. Click the hit, land on the sentence.
-- **Engagement ratio** — `Engagement: 0.7%` (likes/views) next to the view count. A 10%+ ratio is strong organic interest; <1% on a "breakthrough" video is a yellow flag (per research guide §1).
+- **Engagement ratio** — `Engagement: 0.7%` (likes/views) next to the view count. It can help prioritize inspection, but does not establish expertise, independence, credibility, or truth.
 - **Echo warning** — if results share near-identical phrasing, they're tagged `[echo#N]` and a warning prints up top. That's the convergence-vs-echo test (guide §3) automated: echo = copied script / AI-slop; genuine convergence uses different words and is *not* flagged.
 - **Freshness note** — when your date window reaches the last few days, the tool reminds you Filmot lags ~24-48h and prints the exact `yt-search` command to catch launch-day coverage (guide Trap 5/7).
 
@@ -192,7 +213,7 @@ Search results automatically show **density scoring** — matches per minute of 
 Matches (12): Density: 2.4/min
 ```
 
-A 5-minute video with 12 matches (2.4/min) is more relevant than a 3-hour video with 4 matches (0.02/min). Use `--sort density` to sort by this metric.
+A 5-minute video with 12 matches (2.4/min) is more focused on the query than a 3-hour video with 4 matches (0.02/min). Density says nothing about truth or source authority. Unless you explicitly fetch multiple candidate pages, client-side sorting ranks only the returned page.
 
 ### Search Syntax
 
@@ -212,6 +233,19 @@ filmot search "cobalt" --title "deep sea mining" --min-views 10000
 # Title supports operators too
 filmot search "cobalt" --title 'deep sea (mining | extraction)'
 ```
+
+Unquoted words use loose transcript-wide implicit AND and may be far apart:
+
+```bash
+filmot search "machine learning"                  # loose AND
+filmot search '"machine learning"'                # exact phrase
+filmot search '("OpenAI" | "Anthropic") "safety"' # grouped OR + AND
+filmot search '"AI" NEAR/20 "job loss"'           # proximity
+```
+
+Literal phrase and `NEAR/N` searches can undercount singular/plural,
+inflection, spelling, and auto-caption variants. When a strict query returns
+few results, try those variants before concluding the subject is rare.
 
 ### Get Full Transcript
 
@@ -263,7 +297,7 @@ filmot library list prompt-injection
 # Search across all saved transcripts (word-boundary by default)
 filmot library search "attack vector"
 
-# Cross-source comparison — how different sources discuss a term
+# Cross-source concordance — locate passages that use the same term
 filmot library compare "dark oxygen" --topic deep-sea-mining
 
 # Get combined text for LLM context
@@ -277,6 +311,9 @@ filmot library context prompt-injection --max-chars 50000
 
 # Show library statistics
 filmot library stats
+
+# Assign one ambiguous legacy directory after reviewing its ownership
+filmot library migrate-topic "AI 人工知能"
 
 # Delete a transcript
 filmot library delete VIDEO_ID
@@ -300,9 +337,9 @@ No exact word matches. Showing substring matches (plurals/inflections):
 
 This catches plurals, verb forms, and inflections (e.g., "patent" finds "patents", "laser" finds "lasers"). Use `--substring` flag to force substring matching from the start.
 
-### Library Compare: Cross-Source Verification
+### Library Compare: Cross-Source Concordance
 
-This is the power feature for fact-checking and analysis. Search for a term across all saved transcripts and see how each source discusses it:
+This is a lexical navigation tool: search for a term across saved transcripts and inspect the passages in which each source uses it. It counts text matches; it does not infer stance, agreement, contradiction, source independence, credibility, or truth.
 
 ```bash
 filmot library compare "tritium" --sort density
@@ -322,7 +359,7 @@ filmot library compare "tritium" --sort density
 | `--context, -c N` | Characters of context around matches | 300 |
 | `--sort [mentions\|density]` | Sort by mention count or mentions-per-minute | mentions |
 
-**Tip:** Use `--sort density` to find sources that discuss a term most intensely, not just most frequently. A 10-minute deep dive with 5 mentions is more useful than a 2-hour podcast with 6 passing mentions.
+**Tip:** Prefer specific phrases over generic words that also occur in idioms. Use `--sort density` to find sources that use the text most intensely, then read the passages and verify factual claims against primary sources.
 
 ### Structured Context Export
 
@@ -351,16 +388,28 @@ This auto-saves to `{topic}-context.md` with full metadata headers:
 
 ## Session Ledger (resuming an investigation)
 
-Every `search`, `research`, and `channel-search` is logged to `.filmot_data/sessions/`. This matters for agents: a fresh instance with no memory of yesterday can read the ledger and pick up an investigation instead of re-deriving it from scratch.
+Search, transcript saves, bulk/research downloads, library operations, and other research-facing commands log to `.filmot_data/sessions/`. This matters for agents: a fresh instance with no memory of yesterday can read the ledger and pick up an investigation instead of re-deriving it from scratch.
 
 ```bash
 filmot sessions                    # list all sessions (newest activity first)
 filmot sessions fable-5-mythos     # replay a topic-scoped research session
 filmot sessions 2026-06-10         # replay a day's ad-hoc search queries
-filmot sessions 2026-06-10 --raw   # raw JSONL, for piping into your own tools
+filmot sessions 2026-06-10 --raw   # one JSON array containing all events
 ```
 
-`research <topic>` logs to `<topic>.jsonl` (the whole investigation in one file); ad-hoc `search`/`channel-search` log to the current date. Each event records the query, result counts, downloads, and date filters — enough to reconstruct what was asked and what came back.
+`research <topic>` logs a run ID, `research_start`, phase checkpoints, every selected/downloaded item, and `research_end` with completed, failed, or interrupted status to `<topic>.jsonl`. Ad-hoc commands use the current date unless a topic is explicit. Partial runs therefore retain enough state to inspect completed work and resume deliberately.
+
+Legacy versions collapsed non-Latin names into `uncategorized` and could strip
+Unicode from mixed-script topics. Filmot never assigns those ambiguous
+directories automatically. `filmot library migrate-topic TOPIC` moves the
+entire derived legacy directory and cannot infer or partition ownership.
+Review the displayed source and destination slugs, and confirm only when every
+source file belongs to that topic. Existing destination conflicts remain in
+the legacy directory and are never overwritten.
+
+`sessions NAME --raw` emits one JSON array, so use `jq '.[]'` when you want to
+stream individual events. The `.filmot_data/sessions/*.jsonl` storage files
+remain newline-delimited internally.
 
 ---
 
@@ -372,9 +421,12 @@ For advanced workflows, pipe search results into the download command:
 # Search with raw output, pipe to download
 filmot search "deep sea mining" --title "deep sea mining" --raw | filmot download -t deep-sea --dedupe
 
-# Multi-page search piped to download
-filmot search-all "AI safety" --pages 5 --raw > results.json
-type results.json | filmot download -t ai-safety --dedupe -n 20
+# Export a multi-page search, then feed the JSON file to download
+filmot search-all "AI safety" --pages 5 --output results.json --format json
+# Bash:
+filmot download -t ai-safety --dedupe -n 20 < results.json
+# PowerShell:
+Get-Content -Raw results.json | filmot download -t ai-safety --dedupe -n 20
 ```
 
 ---
@@ -397,9 +449,9 @@ filmot library list solid-state-batteries
 filmot library stats
 ```
 
-### Step 3: Cross-Reference Claims
+### Step 3: Locate Claim-Bearing Passages
 ```bash
-# How do sources discuss specific claims?
+# Find every saved passage using these exact terms, then inspect and verify it
 filmot library compare "energy density" --sort density
 filmot library compare "Toyota" --sort density
 filmot library compare "safety" --sort density
@@ -563,7 +615,7 @@ filmot search "कृत्रिम बुद्धिमत्ता" --lang h
 filmot search "нейросеть" --lang ru --full
 
 # Multilingual research workflow
-filmot research "人工知能" --depth 10 --dedupe --sort density
+filmot research "人工知能" --lang ja --depth 10 --dedupe --sort density
 ```
 
 ---
@@ -579,8 +631,8 @@ Default sort is by views, which biases toward popular channels over focused cont
 ### Tip 3: `--min-matches` Cuts Noise
 A video with 1 passing mention is rarely useful. `--min-matches 2` or `--min-matches 3` ensures videos have substantial coverage of your query.
 
-### Tip 4: Library Compare Is Your Fact-Checker
-After building a library on a topic, use `library compare` to see how different sources treat specific claims. This surfaces agreement, contradiction, and context across sources.
+### Tip 4: Library Compare Is a Concordance
+After building a library on a topic, use `library compare` to navigate every source that uses a term or exact phrase. The command surfaces passages for human or agent review; it does not establish agreement, contradiction, or truth by itself.
 
 ### Tip 5: Auto-Fallback Handles Plurals
 Library search uses word-boundary matching but automatically falls back to substring matching when no exact matches are found. You don't need to worry about searching "patent" vs "patents".
@@ -588,18 +640,21 @@ Library search uses word-boundary matching but automatically falls back to subst
 ### Tip 6: Structured Context for Long Analysis
 `--format structured` creates well-organized markdown with video metadata headers. It auto-saves to a file so you don't dump 100KB+ to stdout.
 
-### Tip 7: Conference Talks Are Gold
+### Tip 7: Disambiguate Colliding Vocabulary
+Generic terminology can cross domains: "circuit tracing" also finds electricians, "induction heads" finds engine parts, and "Vera Rubin" can mean an observatory or Nvidia architecture. Anchor ambiguous phrases with a domain term using `NEAR/N`, then narrow with `--title`, `--category`, or an explicitly resolved channel.
+
+### Tip 8: Conference Talks Are Gold
 ```bash
 filmot search '"CES 2026"|"39C3"|"DEF CON"' --full --lang en
 ```
 
-### Tip 8: Manual vs Auto Subtitles
+### Tip 9: Manual vs Auto Subtitles
 Use `--manual-subs` for manually uploaded subtitles (higher quality, less coverage). Default searches auto-generated subtitles (wider coverage). Cannot search both in the same request.
 
-### Tip 9: Non-English Language Codes
+### Tip 10: Non-English Language Codes
 Most languages use standard ISO codes (`es`, `de`, `ja`, `ko`, `ar`, `hi`, `ru`). Two exceptions: **Hebrew** uses `iw` (not `he`), and **Chinese** requires omitting `--lang` entirely. For Russian, use shorter queries like `нейросеть` instead of `искусственный интеллект` when sorting — long Cyrillic URLs cause 500 errors. When in doubt, drop the `--lang` flag — the API matches query characters in any transcript.
 
-### Tip 10: Pipe to Select-Object for Long Output
+### Tip 11: Pipe to Select-Object for Long Output
 ```powershell
 filmot transcript VIDEO_ID --full 2>&1 | Select-Object -First 200
 ```
@@ -729,6 +784,31 @@ filmot transcript VIDEO_ID --proxy http://user:pass@host:port --full
 filmot transcript VIDEO_ID --no-proxy --full
 ```
 
+Transcript commands print the actual redacted route plan and durable attempt
+progress to stderr. Requests use bounded connect/read/route deadlines.
+`FILMOT_PROXY_MODE=auto` tries the pool and then the initialized primary route;
+`proxy-only` never implies direct fallback; `primary-only` uses only the
+initialized primary route (including an explicit CLI `--proxy`);
+`direct-only` ignores environment proxy variables.
+
+`filmot proxy status` distinguishes available, recently healthy, untested,
+cooling, failing, retired, and invalid sessions. `filmot proxy refresh`
+re-pulls API-backed pools but reloads a file-backed session list locally.
+`filmot proxy test` streams each redacted, bounded probe instead of buffering
+all results.
+
+### Exit and raw-output contracts
+
+- A successful empty search exits 0.
+- Configuration, API, and total transport failures exit nonzero.
+- Commands that permit partial item success print and log the partial counts;
+  total item failure exits nonzero.
+- `--raw` emits exactly one JSON value on stdout. Interactive route progress is
+  suppressed and other diagnostics stay off stdout; JSON error output still
+  carries a nonzero exit. Search JSON reflects client-side filters, ranking,
+  limits, and scope metadata rather than an untouched upstream response;
+  `sessions NAME --raw` emits one JSON array of events.
+
 ### Very long transcripts
 For 2+ hour videos, use `Select-Object -First N` or save to file:
 ```bash
@@ -745,10 +825,12 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Deep discovery research** | `filmot research "topic" --probe --depth 12 --dedupe` |
 | **Breaking news research** | `filmot research "topic" --scout-days 3 --depth 10` |
 | **Search latest YouTube uploads** | `filmot yt-search "topic" --days 7 --order relevance` |
-| **Compare sources on a claim** | `filmot library compare "claim" --sort density` |
+| **Locate a phrase across sources** | `filmot library compare "claim phrase" --sort density` |
 | **Search library** | `filmot library search "term"` |
 | **Structured export** | `filmot library context TOPIC --format structured` |
 | **Basic search** | `filmot search "query" --full --lang en` |
+| **Widen ranked candidates** | `filmot search "query" --pages 3 --candidate-pool 120 --sort density` |
+| **Bound result/hit output** | `filmot search "query" --limit 20 --max-hits 5` |
 | **Phrase search** | `filmot search '"exact phrase"' --full --lang en` |
 | **OR search** | `filmot search 'term1\|term2' --full --lang en` |
 | **Proximity search** | `filmot search '"word1" NEAR/20 "word2"' --full` |
@@ -765,7 +847,7 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Search Chinese (no lang)** | `filmot search "人工智能" --full` |
 | **Search Hindi** | `filmot search "कृत्रिम बुद्धिमत्ता" --lang hi --full` |
 | **Search Russian** | `filmot search "нейросеть" --lang ru --full` |
-| **Limit output** | `filmot transcript VIDEO_ID --full 2>&1 \| Select-Object -First 200` |
+| **Limit search output** | `filmot search "query" --limit 20 --max-hits 5` |
 | **Download channel corpus** | `filmot channel-download "Channel Name" --workers 4` |
 | **Check channel status** | `filmot channel-status` |
 | **Search channel corpus** | `filmot channel-search SLUG "query"` |
