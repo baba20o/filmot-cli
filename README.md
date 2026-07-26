@@ -63,7 +63,7 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - RapidAPI account with Filmot API subscription
 
 ## Installation
