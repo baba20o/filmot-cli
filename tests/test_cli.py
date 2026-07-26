@@ -34,7 +34,47 @@ class TestCLIEntryPoint:
     def test_version(self, runner):
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
-        assert "0.3.0" in result.output
+        assert "0.4.0" in result.output
+
+    def test_config_is_read_only_and_reports_storage_scopes(
+        self, monkeypatch, tmp_path, runner
+    ):
+        import filmot.config as app_config
+        from filmot.paths import (
+            config_file,
+            project_data_dir,
+            proxy_health_db,
+            user_cache_dir,
+            user_config_dir,
+            user_state_dir,
+        )
+
+        project = tmp_path / "project"
+        project.mkdir()
+        monkeypatch.chdir(project)
+        secret = "super-secret-api-key-1234"
+        monkeypatch.setattr(app_config, "API_KEY", secret)
+
+        result = runner.invoke(cli, ["config"])
+
+        assert result.exit_code == 0, result.output
+        assert "API Key: configured" in result.output
+        assert secret not in result.output
+        assert secret[:8] not in result.output
+        assert secret[-4:] not in result.output
+        for path in (
+            project_data_dir(),
+            user_config_dir(),
+            config_file(),
+            user_state_dir(),
+            proxy_health_db(),
+            user_cache_dir(),
+        ):
+            assert str(path) in result.output
+        assert not (project / ".filmot_data").exists()
+        assert not user_config_dir().exists()
+        assert not user_state_dir().exists()
+        assert not user_cache_dir().exists()
 
     def test_search_help(self, runner):
         result = runner.invoke(cli, ["search", "--help"])
@@ -86,8 +126,8 @@ def _mock_client(mock_client_type, response):
 
 
 class TestSearchContracts:
-    @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.ledger.log_result")
+    @patch("filmot.commands.search.FilmotClient")
     def test_raw_stdout_is_one_json_value_with_client_sort(
         self, mock_client_type, mock_log, runner
     ):
@@ -116,13 +156,22 @@ class TestSearchContracts:
         assert payload["result"][0]["id"] == "vid"
         assert len(payload["result"][0]["hits"]) == 1
         assert payload["scope"]["api_total"] == 10
+        assert payload["_filmot"] == {
+            "schema": "filmot.result/v1",
+            "command": "search",
+            "status": "completed",
+            "errors": [],
+            "warnings": [],
+        }
         assert "Sorted by density" not in result.stdout
         assert mock_log.called
+        logged = mock_log.call_args.args[1]
+        assert logged.to_raw_dict() == payload
         client.search_subtitles.assert_called_once()
 
-    @patch("filmot.ledger.log_event")
-    @patch("filmot.cli._display_subtitle_results", side_effect=BrokenPipeError)
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.ledger.log_result")
+    @patch("filmot.commands.search._display_subtitle_results", side_effect=BrokenPipeError)
+    @patch("filmot.commands.search.FilmotClient")
     def test_search_logs_before_pipe_sensitive_render(
         self, mock_client_type, mock_display, mock_log, runner
     ):
@@ -138,7 +187,7 @@ class TestSearchContracts:
         mock_log.assert_called_once()
 
     @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_api_error_is_nonzero(self, mock_client_type, mock_log, runner):
         _mock_client(mock_client_type, {"error": "synthetic failure"})
 
@@ -149,7 +198,7 @@ class TestSearchContracts:
         assert mock_log.call_args.kwargs["status"] == "failed"
 
     @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_pages_use_paginated_candidate_pool(
         self, mock_client_type, mock_log, runner
     ):
@@ -169,7 +218,7 @@ class TestSearchContracts:
         assert client.search_subtitles_all.call_args.kwargs["max_pages"] == 3
         assert client.search_subtitles_all.call_args.kwargs["max_results"] == 120
 
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_explicit_page_cannot_be_silently_ignored_by_candidate_pool(
         self, mock_client_type, runner
     ):
@@ -183,7 +232,7 @@ class TestSearchContracts:
         mock_client_type.return_value.search_subtitles.assert_not_called()
         mock_client_type.return_value.search_subtitles_all.assert_not_called()
 
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_unresolved_fuzzy_channel_fails_closed(
         self, mock_client_type, runner
     ):
@@ -199,7 +248,7 @@ class TestSearchContracts:
         client.search_subtitles.assert_not_called()
 
     @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_fuzzy_channel_is_resolved_to_explicit_id(
         self, mock_client_type, mock_log, runner
     ):
@@ -231,7 +280,7 @@ class TestSearchContracts:
             "name": "Primary Lab",
         }]
 
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_fuzzy_channel_rejects_unverifiable_result_without_channel_id(
         self, mock_client_type, runner
     ):
@@ -252,7 +301,7 @@ class TestSearchContracts:
         assert "without an ID" in result.output
 
     @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_channel_validation_failure_is_logged(
         self, mock_client_type, mock_log, runner
     ):
@@ -277,7 +326,7 @@ class TestSearchContracts:
         assert failure.kwargs["failure_stage"] == "channel_validation"
 
     @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_literal_low_result_search_prints_inflection_hint(
         self, mock_client_type, mock_log, runner
     ):
@@ -294,20 +343,66 @@ class TestSearchContracts:
         assert "singular/plural" in result.output
 
 
+class TestMetadataRawContracts:
+    @patch("filmot.ledger.log_result")
+    @patch("filmot.commands.search.FilmotClient")
+    def test_video_raw_uses_shared_result_contract(
+        self, mock_client_type, mock_log, runner
+    ):
+        client = mock_client_type.return_value
+        client.last_cache_hit = False
+        client.get_videos.return_value = [
+            {"id": "vid", "title": "Typed metadata"}
+        ]
+
+        result = runner.invoke(cli, ["video", "vid", "--raw"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["video_ids"] == "vid"
+        assert payload["videos"][0]["title"] == "Typed metadata"
+        assert payload["_filmot"]["command"] == "video"
+        assert payload["_filmot"]["schema"] == "filmot.result/v1"
+        assert mock_log.call_args.args[1].to_raw_dict() == payload
+
+    @patch("filmot.ledger.log_result")
+    @patch("filmot.commands.search.FilmotClient")
+    def test_channels_raw_uses_shared_result_contract(
+        self, mock_client_type, mock_log, runner
+    ):
+        client = mock_client_type.return_value
+        client.last_cache_hit = False
+        client.search_channels.return_value = [
+            {"value": "channel-id", "label": "Typed channel"}
+        ]
+
+        result = runner.invoke(cli, ["channels", "typed", "--raw"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["query"] == "typed"
+        assert payload["channels"][0]["value"] == "channel-id"
+        assert payload["_filmot"]["command"] == "channels"
+        assert payload["_filmot"]["schema"] == "filmot.result/v1"
+        assert mock_log.call_args.args[1].to_raw_dict() == payload
+
+
 class TestTranscriptRawContract:
     @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch("filmot.ledger.log_result")
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.transcript.get_transcript")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.transcript.FilmotClient")
     def test_raw_save_confirmation_stays_off_stdout(
         self,
         mock_client_type,
         mock_get_transcript,
         mock_proxy_configured,
         mock_get_library,
-        mock_log,
+        mock_log_event,
+        mock_log_result,
         mock_pool,
         runner,
     ):
@@ -334,15 +429,26 @@ class TestTranscriptRawContract:
         )
 
         assert result.exit_code == 0, result.output
-        assert json.loads(result.stdout)["video_id"] == "vid"
+        payload = json.loads(result.stdout)
+        assert payload["video_id"] == "vid"
+        assert payload["_filmot"] == {
+            "schema": "filmot.result/v1",
+            "command": "transcript",
+            "status": "completed",
+            "errors": [],
+            "warnings": [],
+        }
         assert "Saved to library" not in result.stdout
         metadata = library.save.call_args.kwargs["metadata"]
         assert metadata["route"] == "direct"
         assert metadata["routes_tried"] == ["direct"]
         assert any(
             item.kwargs.get("topic") == "topic"
-            for item in mock_log.call_args_list
+            for item in mock_log_event.call_args_list
         )
+        logged = mock_log_result.call_args.args[1]
+        assert logged.to_raw_dict() == payload
+        assert "full_text" not in mock_log_result.call_args.kwargs["data"]
 
     @patch("filmot.proxy_pool.get_pool", return_value=None)
     @patch("filmot.ledger.log_event")
@@ -407,7 +513,7 @@ class TestBulkDownloadContracts:
     @patch("filmot.transcript.get_transcript")
     @patch("filmot.library.get_library")
     @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_search_bulk_propagates_language_and_uses_fresh_primary(
         self,
         mock_client_type,
@@ -456,7 +562,7 @@ class TestBulkDownloadContracts:
 
 class TestSearchAllLedger:
     @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_api_failure_is_logged(
         self, mock_client_type, mock_log, runner
     ):
@@ -470,7 +576,7 @@ class TestSearchAllLedger:
 
     @patch("filmot.export.export_json", side_effect=OSError("disk full"))
     @patch("filmot.ledger.log_event")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.search.FilmotClient")
     def test_export_failure_is_final_failed_event(
         self, mock_client_type, mock_log, mock_export, runner
     ):
@@ -574,12 +680,52 @@ class TestResearchSafetyAndLedger:
         library.exists.return_value = False
         return library
 
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.ledger.log_result")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_empty_partial_scope_keeps_one_partial_status_and_error(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log_result,
+        mock_log,
+        mock_proxy,
+        runner,
+    ):
+        self._library(mock_get_library)
+        mock_client_type.return_value.search_subtitles_all.return_value = {
+            "result": [],
+            "totalresultcount": 0,
+            "partial": True,
+            "page_error": "page 2 timed out",
+        }
+
+        result = runner.invoke(
+            cli,
+            ["research", "alpha beta", "--no-scout", "--depth", "0"],
+        )
+
+        assert result.exit_code == 0, result.output
+        outcome = mock_log_result.call_args.args[1]
+        assert outcome.status_value == "partial"
+        assert outcome.errors[0].type == "PartialSearch"
+        assert "page 2 timed out" in outcome.errors[0].message
+        assert "No candidates passed" in result.output
+        end_events = [
+            call
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_end"
+        ]
+        assert end_events[-1].kwargs["status"] == "partial"
+
     @patch("filmot.youtube_search.search_recent")
     @patch("filmot.youtube_search.validate_youtube_api")
     @patch("filmot.transcript.get_transcript")
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_channel_constraint_also_filters_freshness_scout(
         self,
         mock_client_type,
@@ -623,7 +769,7 @@ class TestResearchSafetyAndLedger:
     @patch("filmot.transcript.get_transcript")
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_unrelated_scout_is_not_forced_into_download_slots(
         self,
         mock_client_type,
@@ -655,12 +801,12 @@ class TestResearchSafetyAndLedger:
         assert "Scout relevance gate: 1 -> 0" in result.output
         mock_transcript.assert_not_called()
 
-    @patch("filmot.cli._backfill_metadata", return_value=("Title", "Channel"))
+    @patch("filmot.commands.research._backfill_metadata", return_value=("Title", "Channel"))
     @patch("filmot.transcript.get_transcript")
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_relationship_fallback_rejects_partial_topic_coverage(
         self,
         mock_client_type,
@@ -721,7 +867,7 @@ class TestResearchSafetyAndLedger:
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_huge_broad_fallback_requires_explicit_acceptance(
         self,
         mock_client_type,
@@ -760,12 +906,12 @@ class TestResearchSafetyAndLedger:
         assert events[-1][0] == "research_end"
         assert events[-1][1]["status"] == "failed"
 
-    @patch("filmot.cli._backfill_metadata", return_value=("Title", "Channel"))
+    @patch("filmot.commands.research._backfill_metadata", return_value=("Title", "Channel"))
     @patch("filmot.transcript.get_transcript", side_effect=KeyboardInterrupt)
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_interrupt_writes_resumable_end_event(
         self,
         mock_client_type,
@@ -826,17 +972,17 @@ class TestResearchSafetyAndLedger:
         )
 
     @patch(
-        "filmot.cli._find_probe_pairs",
+        "filmot.commands.research._find_probe_pairs",
         return_value=[("language models", "neural networks", 6, 2)],
     )
     @patch(
-        "filmot.cli._extract_probe_terms",
+        "filmot.commands.research._extract_probe_terms",
         return_value=["language models", "neural networks"],
     )
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_probe_displays_and_logs_effective_scope_and_raw_counts(
         self,
         mock_client_type,
@@ -898,7 +1044,7 @@ class TestResearchSafetyAndLedger:
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_interrupt_during_search_records_started_search_phase(
         self,
         mock_client_type,
@@ -932,17 +1078,17 @@ class TestResearchSafetyAndLedger:
         assert checkpoints[-1]["status"] == "interrupted"
 
     @patch(
-        "filmot.cli._find_probe_pairs",
+        "filmot.commands.research._find_probe_pairs",
         return_value=[("language models", "neural networks", 4, 2)],
     )
     @patch(
-        "filmot.cli._extract_probe_terms",
+        "filmot.commands.research._extract_probe_terms",
         return_value=["language models", "neural networks"],
     )
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_probe_channel_scope_fails_closed_on_outside_result(
         self,
         mock_client_type,
@@ -1004,21 +1150,23 @@ class TestResearchSafetyAndLedger:
         )
 
     @patch(
-        "filmot.cli._find_probe_pairs",
+        "filmot.commands.research._find_probe_pairs",
         return_value=[("language models", "neural networks", 4, 2)],
     )
     @patch(
-        "filmot.cli._extract_probe_terms",
+        "filmot.commands.research._extract_probe_terms",
         return_value=["language models", "neural networks"],
     )
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
+    @patch("filmot.ledger.log_result")
     @patch("filmot.library.get_library")
-    @patch("filmot.cli.FilmotClient")
+    @patch("filmot.commands.research.FilmotClient")
     def test_probe_query_failure_is_aggregated(
         self,
         mock_client_type,
         mock_get_library,
+        mock_log_result,
         mock_log,
         mock_proxy,
         mock_terms,
@@ -1058,13 +1206,18 @@ class TestResearchSafetyAndLedger:
 
         assert result.exit_code == 0, result.output
         assert "1 query failed" in result.output
-        aggregate = [
+        aggregate = mock_log_result.call_args
+        assert aggregate.args[0] == "research"
+        outcome = aggregate.args[1]
+        assert outcome.data["probe_query_failed"] == 1
+        assert outcome.status_value == "partial"
+        assert outcome.errors[0].type == "ResearchItemFailure"
+        end_events = [
             call
             for call in mock_log.call_args_list
-            if call.args[0] == "research"
-        ][-1]
-        assert aggregate.kwargs["probe_query_failed"] == 1
-        assert aggregate.kwargs["status"] == "completed_with_failures"
+            if call.args[0] == "research_end"
+        ]
+        assert end_events[-1].kwargs["status"] == "partial"
 
 
 def _proxy_pool_with_sessions(tmp_path, sessions):
@@ -1075,10 +1228,16 @@ def _proxy_pool_with_sessions(tmp_path, sessions):
 
     pool = WebshareProxyPool(
         "test-token",
-        state_path=tmp_path / "proxy-pool.json",
+        state_path=tmp_path / "proxy-pool.sqlite3",
     )
     pool._sessions = sessions
     pool._last_refresh = time.time()
+    for session in sessions:
+        initial_successes = max(int(session.success), 0)
+        if initial_successes:
+            session.success = 0
+            for _ in range(initial_successes):
+                pool.report_success(session)
     return pool
 
 
@@ -1088,6 +1247,7 @@ class TestProxyCommands:
     ):
         import time
 
+        from filmot.commands.proxy import _render_proxy_status
         from filmot.proxy_pool import WebshareSession
 
         untested = WebshareSession(
@@ -1108,7 +1268,11 @@ class TestProxyCommands:
 
         with (
             patch("filmot.proxy_pool.get_pool", return_value=pool),
-            patch("filmot.ledger.log_event"),
+            patch("filmot.ledger.log_event") as mock_log,
+            patch(
+                "filmot.commands.proxy._render_proxy_status",
+                wraps=_render_proxy_status,
+            ) as mock_render,
         ):
             result = runner.invoke(cli, ["proxy", "status", "--full"])
 
@@ -1130,6 +1294,12 @@ class TestProxyCommands:
             healthy.password,
         ):
             assert secret not in result.output
+            assert secret not in json.dumps(
+                mock_render.call_args.args[0].to_dict()
+            )
+        status_outcome = mock_render.call_args.args[0]
+        assert "username" not in status_outcome.data["sessions"][0]
+        mock_log.assert_not_called()
 
     def test_file_backed_refresh_reloads_without_remote_rotation(self, runner):
         pool = MagicMock()
@@ -1140,7 +1310,7 @@ class TestProxyCommands:
 
         with (
             patch("filmot.proxy_pool.get_pool", return_value=pool),
-            patch("filmot.ledger.log_event"),
+            patch("filmot.ledger.log_event") as mock_log,
         ):
             result = runner.invoke(cli, ["proxy", "refresh", "--full"])
 
@@ -1150,10 +1320,41 @@ class TestProxyCommands:
         assert "0 recently healthy" in result.output
         pool.request_full_refresh.assert_not_called()
         pool.refresh.assert_called_once_with(force=True)
+        mock_log.assert_not_called()
+
+    def test_refresh_rotation_failure_is_a_typed_partial_outcome(self, runner):
+        from filmot.commands.proxy import _render_proxy_refresh
+
+        pool = MagicMock()
+        pool.source = "webshare-api"
+        pool.request_full_refresh.side_effect = RuntimeError(
+            "rotation unavailable"
+        )
+        pool.refresh.return_value = 2
+        pool.available_count.return_value = 2
+        pool.recently_healthy_count.return_value = 1
+
+        with (
+            patch("filmot.proxy_pool.get_pool", return_value=pool),
+            patch(
+                "filmot.commands.proxy._render_proxy_refresh",
+                wraps=_render_proxy_refresh,
+            ) as mock_render,
+            patch("filmot.ledger.log_event") as mock_log,
+        ):
+            result = runner.invoke(cli, ["proxy", "refresh", "--full"])
+
+        assert result.exit_code == 1, result.output
+        outcome = mock_render.call_args.args[0]
+        assert outcome.status_value == "partial"
+        assert outcome.errors[0].type == "RuntimeError"
+        assert outcome.errors[0].stage == "remote_rotation"
+        mock_log.assert_not_called()
 
     def test_proxy_test_uses_distinct_redacted_sessions_and_exits_partial(
         self, tmp_path, runner
     ):
+        from filmot.commands.proxy import _render_proxy_test_summary
         from filmot.proxy_pool import WebshareSession
 
         first = WebshareSession(
@@ -1183,11 +1384,16 @@ class TestProxyCommands:
 
         with (
             patch("filmot.proxy_pool.get_pool", return_value=pool),
+            patch.object(pool, "pick", wraps=pool.pick) as mock_pick,
             patch(
                 "filmot.transcript.probe_pool_session",
                 side_effect=probe_results,
             ) as mock_probe,
-            patch("filmot.ledger.log_event"),
+            patch("filmot.ledger.log_event") as mock_log,
+            patch(
+                "filmot.commands.proxy._render_proxy_test_summary",
+                wraps=_render_proxy_test_summary,
+            ) as mock_render,
         ):
             result = runner.invoke(
                 cli,
@@ -1206,6 +1412,10 @@ class TestProxyCommands:
         assert result.exit_code == 2, result.output
         assert "1 passed, 1 failed, 1 unattempted" in result.output
         assert len(mock_probe.call_args_list) == 2
+        assert all(
+            call_item.kwargs["lease"] is True
+            for call_item in mock_pick.call_args_list
+        )
         attempted = [call.args[1] for call in mock_probe.call_args_list]
         assert attempted == [first, second]
         assert pool.redacted_session_id(first) in result.output
@@ -1219,6 +1429,13 @@ class TestProxyCommands:
             second.password,
         ):
             assert secret not in result.output
+        outcome = mock_render.call_args.args[0]
+        assert outcome.status_value == "partial"
+        assert {error.type for error in outcome.errors} == {
+            "ProxyProbeFailure",
+            "IncompleteProxyProbe",
+        }
+        mock_log.assert_not_called()
 
     def test_proxy_test_with_no_passing_session_is_failure(
         self, tmp_path, runner
@@ -1301,7 +1518,7 @@ class TestLibraryTopicMigration:
 
         with (
             patch("filmot.library.get_library", return_value=library),
-            patch("filmot.ledger.log_event") as mock_log,
+            patch("filmot.ledger.log_result") as mock_log,
         ):
             declined = runner.invoke(
                 cli,
@@ -1321,20 +1538,20 @@ class TestLibraryTopicMigration:
         saved = library.get("legacy-video", "人工知能")
         assert saved["transcript"] == "legacy transcript"
         assert saved["topic"] == "人工知能"
-        migration_calls = [
-            call
-            for call in mock_log.call_args_list
-            if call.args[0] == "library_migrate_topic"
-        ]
-        assert len(migration_calls) == 1
-        assert migration_calls[0].kwargs["legacy_slug"] == "uncategorized"
-        assert migration_calls[0].kwargs["canonical_slug"] == "人工知能"
-        assert migration_calls[0].kwargs["migrated"] == 1
+        mock_log.assert_called_once()
+        migration = mock_log.call_args
+        assert migration.args[0] == "library_migrate_topic"
+        outcome = migration.args[1]
+        assert outcome.command == "library-migrate-topic"
+        assert outcome.status_value == "completed"
+        assert migration.kwargs["data"]["legacy_slug"] == "uncategorized"
+        assert migration.kwargs["data"]["canonical_slug"] == "人工知能"
+        assert migration.kwargs["data"]["migrated"] == 1
 
 
 class TestSessionsRawContract:
     @patch("filmot.ledger.read_events")
-    def test_named_session_raw_is_one_json_array(
+    def test_named_session_raw_is_one_versioned_result(
         self, mock_read_events, runner
     ):
         mock_read_events.return_value = [
@@ -1345,16 +1562,27 @@ class TestSessionsRawContract:
         result = runner.invoke(cli, ["sessions", "topic", "--raw"])
 
         assert result.exit_code == 0, result.output
-        assert json.loads(result.stdout) == mock_read_events.return_value
+        payload = json.loads(result.stdout)
+        assert payload["name"] == "topic"
+        assert payload["events"] == mock_read_events.return_value
+        assert payload["_filmot"] == {
+            "schema": "filmot.result/v1",
+            "command": "sessions",
+            "status": "completed",
+            "errors": [],
+            "warnings": [],
+        }
 
     @patch("filmot.ledger.list_sessions", return_value=[])
-    def test_empty_session_inventory_raw_is_empty_array(
+    def test_empty_session_inventory_raw_is_empty_versioned_result(
         self, mock_list_sessions, runner
     ):
         result = runner.invoke(cli, ["sessions", "--raw"])
 
         assert result.exit_code == 0, result.output
-        assert json.loads(result.stdout) == []
+        payload = json.loads(result.stdout)
+        assert payload["rows"] == []
+        assert payload["_filmot"]["status"] == "empty"
 
 
 class TestMainModule:

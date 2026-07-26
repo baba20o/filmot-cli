@@ -5,19 +5,21 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
+from .paths import project_data_dir
+
 
 class Watchlist:
     """Manage saved videos and search results."""
     
-    def __init__(self, storage_dir: str = ".filmot_data"):
+    def __init__(self, storage_dir=None):
         """
         Initialize the watchlist.
         
         Args:
             storage_dir: Directory to store watchlist data
         """
-        self.storage_dir = Path(storage_dir)
-        self.storage_dir.mkdir(exist_ok=True)
+        self.storage_dir = project_data_dir(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         self.watchlist_file = self.storage_dir / "watchlist.json"
         self.saved_searches_file = self.storage_dir / "saved_searches.json"
@@ -238,8 +240,9 @@ _watchlist: Optional[Watchlist] = None
 
 
 def get_watchlist() -> Watchlist:
-    """Get or create the global watchlist instance."""
+    """Get the watchlist for the active project data root."""
     global _watchlist
-    if _watchlist is None:
-        _watchlist = Watchlist()
+    root = project_data_dir()
+    if _watchlist is None or _watchlist.storage_dir != root:
+        _watchlist = Watchlist(root)
     return _watchlist

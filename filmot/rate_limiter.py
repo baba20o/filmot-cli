@@ -12,13 +12,20 @@ from pathlib import Path
 from typing import Optional
 from collections import deque
 
+from .paths import user_state_dir
+
 logger = logging.getLogger(__name__)
 
-# Shared lockfile location — all processes using the same API key coordinate here
-_DEFAULT_SHARED_DB = Path(os.environ.get(
-    "FILMOT_RATE_LIMIT_DB",
-    Path.home() / ".filmot" / "rate_limit.db",
-))
+
+def _default_shared_db() -> Path:
+    """Return the current per-user cross-process rate-limit database."""
+    configured = os.environ.get("FILMOT_RATE_LIMIT_DB")
+    if configured:
+        path = Path(os.path.expandvars(configured)).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path.resolve(strict=False)
+    return user_state_dir() / "rate_limit.db"
 
 
 class RateLimiter:
@@ -123,7 +130,7 @@ class SharedRateLimiter(RateLimiter):
     def __init__(self, requests_per_second: float = 1.0, burst_size: int = 5,
                  db_path: Optional[Path] = None):
         super().__init__(requests_per_second, burst_size)
-        self.db_path = db_path or _DEFAULT_SHARED_DB
+        self.db_path = Path(db_path) if db_path is not None else _default_shared_db()
         self.consecutive_errors = 0
         self.backoff_factor = 1.0
         self.max_backoff = 10.0
@@ -271,6 +278,12 @@ def get_rate_limiter(requests_per_second: float = 2.0, burst_size: int = 5,
         shared: Use cross-process SQLite limiter (default True).
     """
     global _rate_limiter
+    if (
+        shared
+        and isinstance(_rate_limiter, SharedRateLimiter)
+        and _rate_limiter.db_path != _default_shared_db()
+    ):
+        _rate_limiter = None
     if _rate_limiter is None:
         if shared:
             _rate_limiter = SharedRateLimiter(requests_per_second, burst_size)

@@ -390,11 +390,17 @@ This auto-saves to `{topic}-context.md` with full metadata headers:
 
 Search, transcript saves, bulk/research downloads, library operations, and other research-facing commands log to `.filmot_data/sessions/`. This matters for agents: a fresh instance with no memory of yesterday can read the ledger and pick up an investigation instead of re-deriving it from scratch.
 
+`.filmot_data` is resolved from the invocation directory, so it belongs to the
+active research project; set `FILMOT_DATA_DIR` when an agent must use a
+different explicit project root. Do not treat proxy state as project memory.
+Proxy credentials live in Filmot's per-user configuration directory, while
+credential-free health and leases live in the per-user state directory.
+
 ```bash
 filmot sessions                    # list all sessions (newest activity first)
 filmot sessions fable-5-mythos     # replay a topic-scoped research session
 filmot sessions 2026-06-10         # replay a day's ad-hoc search queries
-filmot sessions 2026-06-10 --raw   # one JSON array containing all events
+filmot sessions 2026-06-10 --raw   # one result with an events array
 ```
 
 `research <topic>` logs a run ID, `research_start`, phase checkpoints, every selected/downloaded item, and `research_end` with completed, failed, or interrupted status to `<topic>.jsonl`. Ad-hoc commands use the current date unless a topic is explicit. Partial runs therefore retain enough state to inspect completed work and resume deliberately.
@@ -407,9 +413,11 @@ Review the displayed source and destination slugs, and confirm only when every
 source file belongs to that topic. Existing destination conflicts remain in
 the legacy directory and are never overwritten.
 
-`sessions NAME --raw` emits one JSON array, so use `jq '.[]'` when you want to
-stream individual events. The `.filmot_data/sessions/*.jsonl` storage files
-remain newline-delimited internally.
+`sessions NAME --raw` emits one `filmot.result/v1` object, so use
+`jq '.events[]'` when you want to stream individual `filmot.event/v1` records.
+The `.filmot_data/sessions/*.jsonl` storage files remain newline-delimited
+internally. Proxy status, refresh, and probe activity is machine state and is
+therefore deliberately absent from this project ledger.
 
 ---
 
@@ -797,6 +805,26 @@ re-pulls API-backed pools but reloads a file-backed session list locally.
 `filmot proxy test` streams each redacted, bounded probe instead of buffering
 all results.
 
+Proxy configuration is machine-scoped by default. Put shared values such as
+`WEBSHARE_API_TOKEN` in the per-user `config.env`:
+
+- Windows: `%APPDATA%\filmot\config.env`
+- macOS: `~/Library/Application Support/filmot/config.env`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/filmot/config.env`
+
+Existing process environment variables take precedence, followed by the
+per-user file and then `.env` in the current working directory. Useful
+overrides are `FILMOT_CONFIG_FILE`, `FILMOT_CONFIG_DIR`,
+`FILMOT_STATE_DIR`, and `FILMOT_CACHE_DIR`.
+
+The default session inventory is `webshare_info.txt` in that per-user config
+directory. Health, cooldowns, the round-robin cursor, and short-lived leases
+are coordinated through a credential-free SQLite database in the per-user
+state directory. Legacy `.filmot_data/webshare_info.txt`,
+`.filmot_data/webshare_pool.json`, and
+`.filmot_data/webshare_pool_file.json` are migrated non-destructively on first
+use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
+
 ### Exit and raw-output contracts
 
 - A successful empty search exits 0.
@@ -806,8 +834,12 @@ all results.
 - `--raw` emits exactly one JSON value on stdout. Interactive route progress is
   suppressed and other diagnostics stay off stdout; JSON error output still
   carries a nonzero exit. Search JSON reflects client-side filters, ranking,
-  limits, and scope metadata rather than an untouched upstream response;
-  `sessions NAME --raw` emits one JSON array of events.
+  limits, and scope metadata rather than an untouched upstream response.
+- Raw command results use `filmot.result/v1`. Object payloads keep their domain
+  keys and add `_filmot` metadata (`schema`, `command`, `status`, `errors`,
+  `warnings`). `sessions NAME --raw` exposes its replay in `events`; every
+  entry uses the durable `filmot.event/v1` envelope with the same outcome
+  vocabulary.
 
 ### Very long transcripts
 For 2+ hour videos, use `Select-Object -First N` or save to file:

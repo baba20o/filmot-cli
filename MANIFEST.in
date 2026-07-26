@@ -1,0 +1,5 @@
+include .env.example
+include AGENTS_README.md
+include CHANGELOG.md
+recursive-include scripts *.py
+recursive-include tests/fixtures/filmot_api *.json *.md

@@ -84,7 +84,7 @@ def test_ledger_roundtrip(tmp_path):
     # topic file is normalized and readable
     research = ledger.read_events("deep-sea-mining", data_dir=d)
     assert len(research) == 1
-    assert research[0]["saved"] == 5
+    assert research[0]["data"]["saved"] == 5
     assert research[0]["kind"] == "research"
 
     sessions = ledger.list_sessions(data_dir=d)
@@ -103,8 +103,8 @@ def test_ledger_skips_none_fields(tmp_path):
     d = str(tmp_path / ".filmot_data")
     ledger.log_event("search", data_dir=d, query="q", lang=None, results=3)
     ev = ledger.read_events(date.today().strftime("%Y-%m-%d"), data_dir=d)[0]
-    assert "lang" not in ev
-    assert ev["results"] == 3
+    assert "lang" not in ev["data"]
+    assert ev["data"]["results"] == 3
 
 
 def test_ledger_uses_same_unicode_slug_as_library(tmp_path):
@@ -122,7 +122,7 @@ def test_ledger_uses_same_unicode_slug_as_library(tmp_path):
     for index, topic in enumerate(topics):
         events = ledger.read_events(topic, data_dir=d)
         assert len(events) == 1
-        assert events[0]["saved"] == index
+        assert events[0]["data"]["saved"] == index
         assert events[0]["topic"] == normalize_topic_name(topic)
 
 
@@ -148,15 +148,21 @@ def test_ledger_reads_and_migrates_only_matching_legacy_events(tmp_path):
 
     # Backward-compatible read does not expose the Korean event under Japanese.
     events = ledger.read_events("人工知能", data_dir=str(d))
-    assert [event["saved"] for event in events] == [1]
+    assert [event["data"]["saved"] for event in events] == [1]
 
     # The next write checkpoints the attributable old history into the new
     # Unicode-safe file and leaves unrelated legacy history untouched.
     ledger.log_event(
         "research", topic="人工知能", data_dir=str(d), query="人工知能", saved=3
     )
-    assert [event["saved"] for event in ledger.read_events("人工知能", data_dir=str(d))] == [1, 3]
-    assert [event["saved"] for event in ledger.read_events("초전도체", data_dir=str(d))] == [2]
+    assert [
+        event["data"]["saved"]
+        for event in ledger.read_events("人工知能", data_dir=str(d))
+    ] == [1, 3]
+    assert [
+        event["data"]["saved"]
+        for event in ledger.read_events("초전도체", data_dir=str(d))
+    ] == [2]
     assert '"초전도체"' in legacy_path.read_text(encoding="utf-8")
     assert '"人工知能"' not in legacy_path.read_text(encoding="utf-8")
 
@@ -173,12 +179,18 @@ def test_ledger_migrates_research_events_from_old_uncategorized_file(tmp_path):
 
     # Old research normalized through the library before reaching the ledger,
     # producing uncategorized.jsonl rather than session.jsonl.
-    assert [event["saved"] for event in ledger.read_events("人工知能", data_dir=str(d))] == [1]
+    assert [
+        event["data"]["saved"]
+        for event in ledger.read_events("人工知能", data_dir=str(d))
+    ] == [1]
     ledger.log_event(
         "research", topic="人工知能", data_dir=str(d), query="人工知能", saved=2
     )
 
-    assert [event["saved"] for event in ledger.read_events("人工知能", data_dir=str(d))] == [1, 2]
+    assert [
+        event["data"]["saved"]
+        for event in ledger.read_events("人工知能", data_dir=str(d))
+    ] == [1, 2]
     assert not legacy_path.exists()
 
 
@@ -227,5 +239,5 @@ def test_yt_search_logs_to_ledger(tmp_path, monkeypatch):
     events = ledger.read_events(date.today().strftime("%Y-%m-%d"), data_dir=str(tmp_path / ".filmot_data"))
     yt_events = [e for e in events if e["kind"] == "yt-search"]
     assert len(yt_events) == 1
-    assert yt_events[0]["query"] == "quantum"
-    assert yt_events[0]["results"] == 1
+    assert yt_events[0]["data"]["query"] == "quantum"
+    assert yt_events[0]["data"]["results"] == 1

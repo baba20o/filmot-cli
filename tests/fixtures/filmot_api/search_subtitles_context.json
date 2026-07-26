@@ -1,0 +1,61 @@
+{
+  "totalresultcount": 2,
+  "result": [
+    {
+      "id": "recorded-video-001",
+      "title": "Recorded video title 001",
+      "duration": 642,
+      "uploaddate": "2026-01-01",
+      "viewcount": 12034,
+      "likecount": 512,
+      "license": 1,
+      "category": "Science & Technology",
+      "channelname": "Recorded channel 001",
+      "channelsubcount": 45000,
+      "channelcountryname": "Recorded country",
+      "channelthumbnailurl": "https://example.invalid/channel.jpg",
+      "channelid": "recorded-channel-001",
+      "lang": "en",
+      "hits": [
+        {
+          "id": 1042,
+          "start": 117.25,
+          "dur": 4,
+          "token": "recorded phrase",
+          "token_len": 15,
+          "ctx_before": "context before ",
+          "ctx_after": " context after",
+          "break": 0
+        }
+      ]
+    },
+    {
+      "id": "recorded-video-002",
+      "title": "Recorded video title 002",
+      "duration": 1884,
+      "uploaddate": "2026-01-01",
+      "viewcount": 8400,
+      "likecount": 201,
+      "license": 1,
+      "category": "Education",
+      "channelname": "Recorded channel 002",
+      "channelsubcount": 17000,
+      "channelcountryname": "Recorded country",
+      "channelthumbnailurl": "https://example.invalid/channel-2.jpg",
+      "channelid": "recorded-channel-002",
+      "lang": "en",
+      "hits": [
+        {
+          "id": 488,
+          "start": 42.0,
+          "dur": 3,
+          "token": "recorded phrase",
+          "token_len": 15,
+          "ctx_before": "context before ",
+          "ctx_after": " context after",
+          "break": 0
+        }
+      ]
+    }
+  ]
+}

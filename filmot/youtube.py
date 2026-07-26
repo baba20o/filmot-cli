@@ -3,9 +3,10 @@
 import os
 from datetime import datetime, timedelta
 from typing import Optional
-from dotenv import load_dotenv
 
-load_dotenv()
+# Importing config runs the explicit user-config/project-.env sequence without
+# python-dotenv's implicit parent-directory search.
+from . import config as _config  # noqa: F401
 
 
 def get_youtube_api_key() -> str:

@@ -10,9 +10,10 @@ import os
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
-from dotenv import load_dotenv
 
-load_dotenv()
+# Importing config runs the explicit user-config/project-.env sequence without
+# python-dotenv's implicit parent-directory search.
+from . import config as _config  # noqa: F401
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"

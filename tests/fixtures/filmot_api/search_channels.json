@@ -1,0 +1,26 @@
+[
+  {
+    "r": 1,
+    "value": "recorded-channel-001",
+    "label": "Recorded channel 001",
+    "thumbnailurl": "https://example.invalid/channel.jpg",
+    "subcount": 45000,
+    "subcountp": "45K",
+    "viewcount": 3200000,
+    "viewcountp": "3.2M",
+    "newshortname": "@recorded-channel-001",
+    "islist": false
+  },
+  {
+    "r": 2,
+    "value": "recorded-channel-002",
+    "label": "Recorded channel 002",
+    "thumbnailurl": "https://example.invalid/channel-2.jpg",
+    "subcount": 17000,
+    "subcountp": "17K",
+    "viewcount": 910000,
+    "viewcountp": "910K",
+    "newshortname": "@recorded-channel-002",
+    "islist": false
+  }
+]

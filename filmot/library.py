@@ -20,8 +20,10 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
+
+from .paths import project_data_dir
 
 
 _WINDOWS_RESERVED_NAMES = frozenset({
@@ -109,14 +111,14 @@ def _legacy_normalize_topic(name: str, fallback: str = "uncategorized") -> str:
 class TranscriptLibrary:
     """Manage a local library of YouTube transcripts organized by topic."""
     
-    def __init__(self, data_dir: str = ".filmot_data"):
+    def __init__(self, data_dir: Optional[Union[str, Path]] = None):
         """
         Initialize the library.
         
         Args:
             data_dir: Base directory for all filmot data
         """
-        self.data_dir = Path(data_dir)
+        self.data_dir = project_data_dir(data_dir)
         self.transcripts_dir = self.data_dir / "transcripts"
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
     
@@ -560,8 +562,9 @@ _library: Optional[TranscriptLibrary] = None
 
 
 def get_library() -> TranscriptLibrary:
-    """Get the default library instance."""
+    """Get the library for the active project data root."""
     global _library
-    if _library is None:
-        _library = TranscriptLibrary()
+    root = project_data_dir()
+    if _library is None or _library.data_dir != root:
+        _library = TranscriptLibrary(root)
     return _library

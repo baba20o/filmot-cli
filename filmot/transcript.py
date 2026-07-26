@@ -13,22 +13,21 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 from typing import Any, Callable, Optional
-import queue
 import re
 import os
-import threading
 import time
 import requests
-from dotenv import load_dotenv
 
+from ._process import (
+    IsolatedWorkerProtocolError,
+    IsolatedWorkerTimeout,
+    run_json_worker,
+)
 from .proxy_pool import (
     WebshareProxyError,
-    classify_transport_error,
     get_pool,
     redact_sensitive_text,
 )
-
-load_dotenv()
 
 # Default number of pool sessions to try on transport-class failures.
 _POOL_RETRY_LIMIT = int(os.getenv("FILMOT_PROXY_RETRY_LIMIT", "4"))
@@ -40,6 +39,7 @@ _POOL_RETRY_LIMIT = int(os.getenv("FILMOT_PROXY_RETRY_LIMIT", "4"))
 DEFAULT_CONNECT_TIMEOUT = 8.0
 DEFAULT_READ_TIMEOUT = 15.0
 DEFAULT_ROUTE_TIMEOUT = 30.0
+_TRANSCRIPT_WORKER_PROTOCOL_VERSION = 1
 
 # Webshare gateway for the legacy username/password path.
 _WEBSHARE_GATEWAY = os.getenv("WEBSHARE_GATEWAY", "p.webshare.io:80")
@@ -66,6 +66,7 @@ class TranscriptRouteTimeout(TimeoutError):
     def __init__(self, route: str, timeout_seconds: float) -> None:
         self.route = route
         self.timeout_seconds = timeout_seconds
+        self.worker_terminated = True
         super().__init__(
             f"Transcript route {route!r} timed out after "
             f"{timeout_seconds:g} seconds"
@@ -99,19 +100,44 @@ def _env_timeout(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
-def _new_http_session() -> requests.Session:
+def _new_http_session(
+    connect_timeout: Optional[float] = None,
+    read_timeout: Optional[float] = None,
+) -> requests.Session:
     return _BoundedSession(
-        _env_timeout("FILMOT_TRANSCRIPT_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT),
-        _env_timeout("FILMOT_TRANSCRIPT_READ_TIMEOUT", DEFAULT_READ_TIMEOUT),
+        connect_timeout
+        if connect_timeout is not None
+        else _env_timeout(
+            "FILMOT_TRANSCRIPT_CONNECT_TIMEOUT",
+            DEFAULT_CONNECT_TIMEOUT,
+        ),
+        read_timeout
+        if read_timeout is not None
+        else _env_timeout(
+            "FILMOT_TRANSCRIPT_READ_TIMEOUT",
+            DEFAULT_READ_TIMEOUT,
+        ),
     )
 
 
-def _build_direct_api() -> YouTubeTranscriptApi:
+def _build_direct_api(
+    *,
+    connect_timeout: Optional[float] = None,
+    read_timeout: Optional[float] = None,
+) -> YouTubeTranscriptApi:
     """Build a direct YouTubeTranscriptApi client."""
-    return YouTubeTranscriptApi(http_client=_new_http_session())
+    return YouTubeTranscriptApi(
+        http_client=_new_http_session(connect_timeout, read_timeout)
+    )
 
 
-def _build_webshare_api(proxy_username: str, proxy_password: str) -> YouTubeTranscriptApi:
+def _build_webshare_api(
+    proxy_username: str,
+    proxy_password: str,
+    *,
+    connect_timeout: Optional[float] = None,
+    read_timeout: Optional[float] = None,
+) -> YouTubeTranscriptApi:
     """Build a Webshare-backed YouTubeTranscriptApi client.
 
     Static-session Webshare plans reject the library's default ``-rotate``
@@ -127,13 +153,24 @@ def _build_webshare_api(proxy_username: str, proxy_password: str) -> YouTubeTran
                 proxy_password=proxy_password,
                 retries_when_blocked=0,
             ),
-            http_client=_new_http_session(),
+            http_client=_new_http_session(connect_timeout, read_timeout),
         )
     url = f"http://{proxy_username}:{proxy_password}@{_WEBSHARE_GATEWAY}"
-    return _build_generic_proxy_api(url, url)
+    return _build_generic_proxy_api(
+        url,
+        url,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+    )
 
 
-def _build_generic_proxy_api(http_proxy: Optional[str], https_proxy: Optional[str]) -> YouTubeTranscriptApi:
+def _build_generic_proxy_api(
+    http_proxy: Optional[str],
+    https_proxy: Optional[str],
+    *,
+    connect_timeout: Optional[float] = None,
+    read_timeout: Optional[float] = None,
+) -> YouTubeTranscriptApi:
     """Build a generic HTTP/HTTPS proxy-backed YouTubeTranscriptApi client."""
     from youtube_transcript_api.proxies import GenericProxyConfig
 
@@ -142,7 +179,7 @@ def _build_generic_proxy_api(http_proxy: Optional[str], https_proxy: Optional[st
             http_url=http_proxy,
             https_url=https_proxy or http_proxy,
         ),
-        http_client=_new_http_session(),
+        http_client=_new_http_session(connect_timeout, read_timeout),
     )
 
 
@@ -293,6 +330,52 @@ def _fresh_primary_api() -> YouTubeTranscriptApi:
         return _build_direct_api()
     api, _, _ = _primary_from_environment()
     return api
+
+
+def _primary_route_config() -> dict:
+    """Return a serializable description of the configured primary route."""
+    _init_api()
+    if _resolve_proxy_mode() == "direct-only" or _proxy_source == "direct":
+        return {"kind": "direct"}
+
+    if _primary_override:
+        if _primary_override["kind"] == "webshare":
+            return {
+                "kind": "webshare",
+                "username": _primary_override["username"],
+                "password": _primary_override["password"],
+            }
+        return {
+            "kind": "generic-proxy",
+            "http_proxy": _primary_override["http_proxy"],
+            "https_proxy": _primary_override["https_proxy"],
+        }
+
+    if _proxy_source == "legacy-webshare":
+        return {
+            "kind": "webshare",
+            "username": os.getenv("WEBSHARE_PROXY_USERNAME"),
+            "password": os.getenv("WEBSHARE_PROXY_PASSWORD"),
+        }
+    if _proxy_source == "env-proxy":
+        return {
+            "kind": "generic-proxy",
+            "http_proxy": os.getenv("HTTP_PROXY") or os.getenv("http_proxy"),
+            "https_proxy": os.getenv("HTTPS_PROXY") or os.getenv("https_proxy"),
+        }
+    # Never silently turn an unknown/custom proxy client into a direct route.
+    raise RuntimeError(
+        f"Primary transcript route {_proxy_source!r} cannot be isolated"
+    )
+
+
+def _route_secrets(route_config: dict) -> tuple[str, ...]:
+    """Return credential-bearing route values for diagnostic redaction."""
+    return tuple(
+        str(route_config[key])
+        for key in ("username", "password", "http_proxy", "https_proxy")
+        if route_config.get(key)
+    )
 
 
 def disable_proxy() -> None:
@@ -478,14 +561,15 @@ def get_transcript(
     
     attempts: list[str] = []
     route_errors: list[dict] = []
-    last_error: Optional[Exception] = None
+    last_error_message: Optional[str] = None
+    last_error_type: Optional[str] = None
     attempt_timeout = (
         route_timeout
         if route_timeout is not None and route_timeout > 0
         else _env_timeout("FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT)
     )
 
-    for attempt_number, (label, api, on_outcome) in enumerate(
+    for attempt_number, (label, route_config, on_outcome) in enumerate(
         _iter_routes(
             progress_callback,
             route_errors,
@@ -503,48 +587,61 @@ def get_transcript(
             timeout_s=attempt_timeout,
         )
         try:
-            result = _call_with_route_timeout(
-                lambda: _fetch_transcript_from_api(
-                    api,
-                    video_id,
-                    languages=languages,
-                    preserve_formatting=preserve_formatting,
-                ),
+            worker_response = _call_with_route_timeout(
+                route_config,
                 route=label,
                 timeout_seconds=attempt_timeout,
+                video_id=video_id,
+                languages=languages,
+                preserve_formatting=preserve_formatting,
             )
-        except (TranscriptsDisabled, VideoUnavailable, NoTranscriptFound) as terminal:
-            # Caption-side terminal failures — not a transport problem.
-            # Don't penalise the route; surface the error immediately.
+        except TranscriptRouteTimeout as exc:
+            kind = "connection"
+            safe_error = redact_sensitive_text(
+                exc,
+                _route_secrets(route_config),
+            )
             if on_outcome is not None:
-                on_outcome("success", None)
-            _emit_progress(
-                progress_callback,
-                event="route_terminal",
-                route=label,
-                attempt=attempt_number,
-                elapsed_s=time.monotonic() - started,
-                error_type=type(terminal).__name__,
-                error=str(terminal),
-            )
-            return _terminal_error_result(
-                terminal,
-                video_id,
-                label,
-                routes_tried=attempts,
-                route_errors=route_errors,
-            )
-        except Exception as exc:  # noqa: BLE001 - we re-raise via result dict
-            kind = classify_transport_error(exc)
-            safe_error = redact_sensitive_text(exc)
-            if on_outcome is not None:
-                on_outcome("failure", (kind or "other", safe_error))
-            last_error = exc
+                on_outcome("failure", (kind, safe_error))
+            last_error_message = safe_error
+            last_error_type = type(exc).__name__
             elapsed = time.monotonic() - started
             route_errors.append(
                 {
                     "route": label,
-                    "kind": kind or "other",
+                    "kind": kind,
+                    "error_type": type(exc).__name__,
+                    "error": safe_error,
+                    "elapsed_s": elapsed,
+                    "worker_terminated": True,
+                }
+            )
+            _emit_progress(
+                progress_callback,
+                event="route_timeout",
+                route=label,
+                attempt=attempt_number,
+                elapsed_s=elapsed,
+                kind=kind,
+                error_type=type(exc).__name__,
+                error=safe_error,
+                worker_terminated=True,
+            )
+            continue
+        except Exception as exc:  # worker start/protocol/internal supervisor error
+            safe_error = redact_sensitive_text(
+                exc,
+                _route_secrets(route_config),
+            )
+            if on_outcome is not None:
+                on_outcome("release", None)
+            last_error_message = safe_error
+            last_error_type = type(exc).__name__
+            elapsed = time.monotonic() - started
+            route_errors.append(
+                {
+                    "route": label,
+                    "kind": "internal",
                     "error_type": type(exc).__name__,
                     "error": safe_error,
                     "elapsed_s": elapsed,
@@ -552,24 +649,108 @@ def get_transcript(
             )
             _emit_progress(
                 progress_callback,
-                event=(
-                    "route_timeout"
-                    if isinstance(exc, TranscriptRouteTimeout)
-                    else "route_failed"
-                ),
+                event="route_failed",
                 route=label,
                 attempt=attempt_number,
                 elapsed_s=elapsed,
-                kind=kind or "other",
+                kind="internal",
                 error_type=type(exc).__name__,
                 error=safe_error,
             )
-            if not kind:
-                # Unknown / non-transport error — stop retrying.
-                break
-            continue
+            break
+        except BaseException:
+            # run_json_worker has already killed and reaped its child. Release
+            # the parent-owned pool lease before propagating interruption.
+            if on_outcome is not None:
+                on_outcome("release", None)
+            raise
+
+        status = worker_response["status"]
+        if status != "success":
+            error_type, safe_error, kind = _worker_error_details(
+                worker_response,
+                route_config,
+            )
+            elapsed = time.monotonic() - started
+            if status == "terminal":
+                # The route reached YouTube. Caption availability is not a
+                # proxy-health failure, and no later route can change it.
+                if on_outcome is not None:
+                    on_outcome("success", None)
+                _emit_progress(
+                    progress_callback,
+                    event="route_terminal",
+                    route=label,
+                    attempt=attempt_number,
+                    elapsed_s=elapsed,
+                    error_type=error_type,
+                    error=safe_error,
+                )
+                return _terminal_error_result_from_details(
+                    error_type,
+                    safe_error,
+                    video_id,
+                    label,
+                    routes_tried=attempts,
+                    route_errors=route_errors,
+                )
+
+            if status == "transport_error":
+                if on_outcome is not None:
+                    on_outcome("failure", (kind, safe_error))
+                last_error_message = safe_error
+                last_error_type = error_type
+                route_errors.append(
+                    {
+                        "route": label,
+                        "kind": kind,
+                        "error_type": error_type,
+                        "error": safe_error,
+                        "elapsed_s": elapsed,
+                    }
+                )
+                _emit_progress(
+                    progress_callback,
+                    event="route_failed",
+                    route=label,
+                    attempt=attempt_number,
+                    elapsed_s=elapsed,
+                    kind=kind,
+                    error_type=error_type,
+                    error=safe_error,
+                )
+                continue
+
+            # A worker-internal error says nothing about route health. Release
+            # any pool lease without cooling/retiring the proxy, then fail
+            # closed rather than repeating a deterministic software error.
+            if on_outcome is not None:
+                on_outcome("release", None)
+            last_error_message = safe_error
+            last_error_type = error_type
+            route_errors.append(
+                {
+                    "route": label,
+                    "kind": "internal",
+                    "error_type": error_type,
+                    "error": safe_error,
+                    "elapsed_s": elapsed,
+                }
+            )
+            _emit_progress(
+                progress_callback,
+                event="route_failed",
+                route=label,
+                attempt=attempt_number,
+                elapsed_s=elapsed,
+                kind="internal",
+                error_type=error_type,
+                error=safe_error,
+            )
+            break
 
         # Success.
+        result = worker_response["result"]
         if on_outcome is not None:
             on_outcome("success", None)
         if isinstance(result, dict) and "error" not in result:
@@ -586,9 +767,9 @@ def get_transcript(
         )
         return result
 
-    if last_error is not None:
-        error_msg = redact_sensitive_text(last_error)
-        error_type = type(last_error).__name__
+    if last_error_message is not None:
+        error_msg = last_error_message
+        error_type = last_error_type or "TranscriptWorkerError"
     elif route_errors:
         error_msg = route_errors[-1]["error"]
         error_type = route_errors[-1]["error_type"]
@@ -633,39 +814,89 @@ def _emit_progress(
 
 
 def _call_with_route_timeout(
-    operation: Callable[[], dict],
+    route_config: dict,
     *,
     route: str,
     timeout_seconds: float,
+    video_id: str,
+    languages: list[str],
+    preserve_formatting: bool,
 ) -> dict:
-    """Run one route attempt with a strict wall-clock deadline.
+    """Run one route attempt in a process that can be killed at its deadline."""
+    payload = {
+        "protocol_version": _TRANSCRIPT_WORKER_PROTOCOL_VERSION,
+        "route": route_config,
+        "video_id": video_id,
+        "languages": languages,
+        "preserve_formatting": preserve_formatting,
+        "connect_timeout": _env_timeout(
+            "FILMOT_TRANSCRIPT_CONNECT_TIMEOUT",
+            DEFAULT_CONNECT_TIMEOUT,
+        ),
+        "read_timeout": _env_timeout(
+            "FILMOT_TRANSCRIPT_READ_TIMEOUT",
+            DEFAULT_READ_TIMEOUT,
+        ),
+    }
+    try:
+        response = run_json_worker(
+            "filmot._transcript_worker",
+            payload,
+            timeout_seconds=timeout_seconds,
+            secrets=_route_secrets(route_config),
+        )
+    except IsolatedWorkerTimeout as exc:
+        raise TranscriptRouteTimeout(route, timeout_seconds) from exc
 
-    The worker is daemonized so a stuck third-party call cannot keep the CLI
-    alive. The underlying bounded requests session still has connect/read
-    deadlines and will clean itself up shortly after the caller advances.
-    """
-    outcome: queue.Queue = queue.Queue(maxsize=1)
+    if response.get("protocol_version") != _TRANSCRIPT_WORKER_PROTOCOL_VERSION:
+        raise IsolatedWorkerProtocolError(
+            "Transcript worker returned an unsupported protocol version"
+        )
+    status = response.get("status")
+    if status == "success":
+        if not isinstance(response.get("result"), dict):
+            raise IsolatedWorkerProtocolError(
+                "Transcript worker success response is missing its result"
+            )
+        return response
+    if status not in {"terminal", "transport_error", "internal_error"}:
+        raise IsolatedWorkerProtocolError(
+            "Transcript worker returned an invalid status"
+        )
+    error = response.get("error")
+    if not isinstance(error, dict):
+        raise IsolatedWorkerProtocolError(
+            "Transcript worker error response is missing diagnostics"
+        )
+    if not isinstance(error.get("error_type"), str) or not isinstance(
+        error.get("message"), str
+    ):
+        raise IsolatedWorkerProtocolError(
+            "Transcript worker diagnostics are malformed"
+        )
+    if status == "transport_error" and not isinstance(
+        error.get("failure_kind"), str
+    ):
+        raise IsolatedWorkerProtocolError(
+            "Transcript worker transport error is missing its failure kind"
+        )
+    return response
 
-    def _worker() -> None:
-        try:
-            outcome.put((True, operation()))
-        except BaseException as exc:  # propagate the original exception
-            outcome.put((False, exc))
 
-    worker = threading.Thread(
-        target=_worker,
-        name=f"filmot-transcript-{route}",
-        daemon=True,
+def _worker_error_details(
+    response: dict,
+    route_config: dict,
+) -> tuple[str, str, str]:
+    """Return ``(type, message, failure_kind)`` from a worker response."""
+    error = response.get("error") or {}
+    return (
+        str(error.get("error_type") or "TranscriptWorkerError"),
+        redact_sensitive_text(
+            error.get("message") or "Transcript worker failed",
+            _route_secrets(route_config),
+        ),
+        str(error.get("failure_kind") or ""),
     )
-    worker.start()
-    worker.join(timeout_seconds)
-    if worker.is_alive():
-        raise TranscriptRouteTimeout(route, timeout_seconds)
-
-    succeeded, value = outcome.get_nowait()
-    if succeeded:
-        return value
-    raise value
 
 
 def _terminal_error_result(
@@ -676,15 +907,34 @@ def _terminal_error_result(
     routes_tried: Optional[list[str]] = None,
     route_errors: Optional[list[dict]] = None,
 ) -> dict:
-    if isinstance(exc, TranscriptsDisabled):
+    return _terminal_error_result_from_details(
+        type(exc).__name__,
+        str(exc),
+        video_id,
+        route,
+        routes_tried=routes_tried,
+        route_errors=route_errors,
+    )
+
+
+def _terminal_error_result_from_details(
+    error_type: str,
+    message: str,
+    video_id: str,
+    route: str,
+    *,
+    routes_tried: Optional[list[str]] = None,
+    route_errors: Optional[list[dict]] = None,
+) -> dict:
+    if error_type == "TranscriptsDisabled":
         msg = "Transcripts are disabled for this video"
-    elif isinstance(exc, VideoUnavailable):
+    elif error_type == "VideoUnavailable":
         msg = "Video is unavailable"
     else:
-        msg = str(exc) or "No transcript available"
+        msg = message or "No transcript available"
     return {
         "error": redact_sensitive_text(msg),
-        "error_type": type(exc).__name__,
+        "error_type": error_type,
         "video_id": video_id,
         "route": route,
         "routes_tried": list(routes_tried or [route]),
@@ -698,11 +948,12 @@ def _iter_routes(
     *,
     fresh_primary: bool = False,
 ):
-    """Yield ``(label, api_client, on_outcome)`` tuples per the active mode.
+    """Yield ``(label, route_config, on_outcome)`` tuples per the active mode.
 
     ``on_outcome`` is a callable invoked once per attempt with either
-    ``("success", None)`` or ``("failure", (kind, summary))`` so the pool can
-    update health stats. ``None`` for non-pool routes.
+    ``("success", None)``, ``("failure", (kind, summary))``, or
+    ``("release", None)`` so the pool can update health only for real route
+    outcomes. ``None`` for non-pool routes.
     """
     # Initialize before reading ``_proxy_source``. Python evaluates tuple
     # elements left-to-right, so the former ``(_proxy_source, get_api(), ...)``
@@ -747,33 +998,44 @@ def _iter_routes(
                 break
             if session is None:
                 break
-            url = pool.proxy_url(session)
             try:
-                api = _build_generic_proxy_api(url, url)
-            except Exception:
+                url = pool.proxy_url(session)
+            except BaseException:
                 pool.release(session)
                 raise
+            route_config = {
+                "kind": "generic-proxy",
+                "http_proxy": url,
+                "https_proxy": url,
+            }
 
             def _cb(outcome, info, _s=session, _p=pool):
                 if outcome == "success":
                     _p.report_success(_s)
+                elif outcome == "release":
+                    _p.release(_s)
                 else:
                     kind, summary = info
                     _p.report_failure(_s, kind or "other", summary=summary)
 
-            yield (f"pool:{pool.source}:{pool.redacted_session_id(session)}", api, _cb)
+            yield (
+                f"pool:{pool.source}:{pool.redacted_session_id(session)}",
+                route_config,
+                _cb,
+            )
 
     # 2. Primary client (direct, env-proxy, legacy-webshare, or operator-supplied).
     if mode == "direct-only":
         yield (
             "direct",
-            _fresh_primary_api() if fresh_primary else get_api(),
+            {"kind": "direct"},
             None,
         )
     elif mode in {"auto", "primary-only"}:
-        primary_api = _fresh_primary_api() if fresh_primary else get_api()
         primary_label = _proxy_source
-        yield (primary_label, primary_api, None)
+        # Every subprocess owns a new HTTP session, so ``fresh_primary`` is
+        # naturally satisfied for all isolated route attempts.
+        yield (primary_label, _primary_route_config(), None)
 
 
 def probe_pool_session(
@@ -799,10 +1061,16 @@ def probe_pool_session(
         else _env_timeout("FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT)
     )
     label = f"pool:{pool.source}:{pool.redacted_session_id(session)}"
-    api = _build_generic_proxy_api(
-        pool.proxy_url(session),
-        pool.proxy_url(session),
-    )
+    try:
+        proxy_url = pool.proxy_url(session)
+    except BaseException:
+        pool.release(session)
+        raise
+    route_config = {
+        "kind": "generic-proxy",
+        "http_proxy": proxy_url,
+        "https_proxy": proxy_url,
+    }
     started = time.monotonic()
     _emit_progress(
         progress_callback,
@@ -812,37 +1080,19 @@ def probe_pool_session(
         timeout_s=timeout_seconds,
     )
     try:
-        result = _call_with_route_timeout(
-            lambda: _fetch_transcript_from_api(
-                api,
-                video_id,
-                languages=languages,
-                preserve_formatting=False,
-            ),
+        worker_response = _call_with_route_timeout(
+            route_config,
             route=label,
             timeout_seconds=timeout_seconds,
+            video_id=video_id,
+            languages=languages,
+            preserve_formatting=False,
         )
-    except (TranscriptsDisabled, VideoUnavailable, NoTranscriptFound) as terminal:
-        # The route reached YouTube successfully; captions are a video concern.
-        pool.report_success(session)
-        result = _terminal_error_result(terminal, video_id, label)
-        result["transport_ok"] = True
-        result["route_elapsed_seconds"] = time.monotonic() - started
-        _emit_progress(
-            progress_callback,
-            event="route_terminal",
-            route=label,
-            attempt=1,
-            elapsed_s=result["route_elapsed_seconds"],
-            error_type=type(terminal).__name__,
-            error=str(terminal),
-        )
-        return result
-    except Exception as exc:  # noqa: BLE001 - normalized to a result
-        kind = classify_transport_error(exc) or "other"
+    except TranscriptRouteTimeout as exc:
+        kind = "connection"
         safe_error = redact_sensitive_text(
             exc,
-            (session.username, session.password),
+            _route_secrets(route_config),
         )
         pool.report_failure(session, kind, summary=safe_error)
         result = {
@@ -853,23 +1103,108 @@ def probe_pool_session(
             "failure_kind": kind,
             "transport_ok": False,
             "route_elapsed_seconds": time.monotonic() - started,
+            "worker_terminated": True,
         }
         _emit_progress(
             progress_callback,
-            event=(
-                "route_timeout"
-                if isinstance(exc, TranscriptRouteTimeout)
-                else "route_failed"
-            ),
+            event="route_timeout",
             route=label,
             attempt=1,
             elapsed_s=result["route_elapsed_seconds"],
             kind=kind,
             error_type=type(exc).__name__,
             error=safe_error,
+            worker_terminated=True,
+        )
+        return result
+    except Exception as exc:  # worker start/protocol/supervisor failure
+        safe_error = redact_sensitive_text(
+            exc,
+            _route_secrets(route_config),
+        )
+        pool.release(session)
+        result = {
+            "error": safe_error,
+            "error_type": type(exc).__name__,
+            "video_id": video_id,
+            "route": label,
+            "failure_kind": "internal",
+            "transport_ok": False,
+            "route_elapsed_seconds": time.monotonic() - started,
+        }
+        _emit_progress(
+            progress_callback,
+            event="route_failed",
+            route=label,
+            attempt=1,
+            elapsed_s=result["route_elapsed_seconds"],
+            kind="internal",
+            error_type=type(exc).__name__,
+            error=safe_error,
+        )
+        return result
+    except BaseException:
+        pool.release(session)
+        raise
+
+    status = worker_response["status"]
+    if status != "success":
+        error_type, safe_error, kind = _worker_error_details(
+            worker_response,
+            route_config,
+        )
+        elapsed = time.monotonic() - started
+        if status == "terminal":
+            # The route reached YouTube successfully; captions are a video
+            # concern rather than a proxy-health failure.
+            pool.report_success(session)
+            result = _terminal_error_result_from_details(
+                error_type,
+                safe_error,
+                video_id,
+                label,
+            )
+            result["transport_ok"] = True
+            result["route_elapsed_seconds"] = elapsed
+            _emit_progress(
+                progress_callback,
+                event="route_terminal",
+                route=label,
+                attempt=1,
+                elapsed_s=elapsed,
+                error_type=error_type,
+                error=safe_error,
+            )
+            return result
+
+        if status == "transport_error":
+            pool.report_failure(session, kind, summary=safe_error)
+            failure_kind = kind
+        else:
+            pool.release(session)
+            failure_kind = "internal"
+        result = {
+            "error": safe_error,
+            "error_type": error_type,
+            "video_id": video_id,
+            "route": label,
+            "failure_kind": failure_kind,
+            "transport_ok": False,
+            "route_elapsed_seconds": elapsed,
+        }
+        _emit_progress(
+            progress_callback,
+            event="route_failed",
+            route=label,
+            attempt=1,
+            elapsed_s=elapsed,
+            kind=failure_kind,
+            error_type=error_type,
+            error=safe_error,
         )
         return result
 
+    result = worker_response["result"]
     pool.report_success(session)
     result["route"] = label
     result["transport_ok"] = True

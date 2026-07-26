@@ -17,8 +17,16 @@ import filmot.transcript as transcript_module
 
 
 @pytest.fixture(autouse=True)
-def _isolated_proxy_state():
-    """Reset proxy/pool singletons between tests so state never leaks."""
+def _isolated_proxy_state(monkeypatch, tmp_path):
+    """Keep machine-global runtime state inside each test's temp directory."""
+    monkeypatch.setenv("FILMOT_CONFIG_DIR", str(tmp_path / "user-config"))
+    monkeypatch.setenv("FILMOT_STATE_DIR", str(tmp_path / "user-state"))
+    monkeypatch.setenv("FILMOT_CACHE_DIR", str(tmp_path / "user-cache"))
+    monkeypatch.setenv(
+        "FILMOT_RATE_LIMIT_DB",
+        str(tmp_path / "user-state" / "rate_limit.db"),
+    )
+    monkeypatch.delenv("WEBSHARE_SESSION_FILE", raising=False)
     proxy_pool.reset_pool()
     transcript_module._initialized = False
     yield
