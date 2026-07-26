@@ -4,7 +4,7 @@ A powerful command-line interface for the [Filmot](https://filmot.com/) YouTube 
 
 ## Why Filmot CLI?
 
-Google lets you search *titles* and *descriptions*. Filmot lets you search **inside every word ever spoken** on YouTube — billions of auto-generated transcripts covering the full spoken content of videos.
+Google lets you search *titles* and *descriptions*. Filmot lets you search **inside indexed YouTube transcripts** — a large archive of auto-generated and manual captions covering spoken video content.
 
 This means you can do things no other search tool can:
 
@@ -12,11 +12,11 @@ This means you can do things no other search tool can:
 # Research a topic in one command: search → filter → download → summarize
 filmot research "deep sea mining" --depth 15 --dedupe --min-matches 2 --sort density
 
-# Compare how different sources discuss a specific claim
+# Locate matching passages across saved sources, then verify the claim
 filmot library compare "dark oxygen" --sort density
 
 # Find the exact moments where "deep sea mining" is discussed near "new species"
-# across ALL of YouTube — returns the 16 most relevant moments from millions of videos
+# in Filmot's index; widen the fetched candidate set explicitly when needed
 filmot search '"deep sea mining" NEAR/20 "new species"'
 
 # Search transcript content, but only in videos ABOUT a topic (title filter)
@@ -28,7 +28,7 @@ filmot search "polymetallic nodules" --title "deep sea" --bulk-download "deep-se
 filmot library compare "cobalt" --topic deep-sea-research --sort density
 ```
 
-**The proximity search (`NEAR/N`) is the killer feature.** Being able to search `"artificial intelligence" NEAR/20 "job displacement"` across all of YouTube's transcripts is more powerful than Google for this kind of research. It finds exactly the moments where two concepts are discussed together, not just videos that happen to contain both words somewhere.
+**The proximity search (`NEAR/N`) is the killer feature.** Searching `"artificial intelligence" NEAR/20 "job displacement"` across Filmot's transcript index finds moments where two concepts occur close together, rather than videos that merely contain both words somewhere.
 
 **The `--title` filter is your precision lever.** Without it, searching for "deep sea mining" returns 266,000+ results (any video that mentions the words). With `--title "deep sea mining"`, you get 172 results — every one a video *dedicated to* the topic. Combine `--title` with a different content query to ask questions like: "Which deep sea mining videos discuss dark oxygen?"
 
@@ -40,12 +40,12 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 - **Channel Discovery** — Search and explore YouTube channels by name or handle
 - **Transcript Download** — Fetch full YouTube transcripts for deep content analysis
 - **Rich Terminal UI** — Beautiful formatted output with tables, colors, and clickable links
-- **AI Agent Mode** — Full output mode with no truncation for LLM/agent workflows
-- **Raw JSON Mode** — Export raw API responses for scripting and automation
+- **Expanded Hit Mode** — Show all non-duplicate hit details returned for the displayed videos without widening the fetched page scope
+- **Structured JSON Mode** — Emit the processed search response, including client-side filters and scope metadata, as one JSON value
 
 ### Research & Analysis
 - **Compound Research** — `filmot research` orchestrates search → filter → download → summary in one command
-- **Cross-Source Comparison** — `filmot library compare` shows how different sources discuss a claim
+- **Cross-Source Concordance** — `filmot library compare` locates matching passages across saved sources
 - **Density Scoring** — Matches-per-minute metric reveals the most focused content
 - **Deduplication** — Skip duplicate/near-duplicate transcripts during bulk download
 - **Word-Boundary Search** — Library search with smart fallback for plurals/inflections
@@ -115,18 +115,21 @@ Get your API key from [Filmot API on RapidAPI](https://filmot.com/api).
 The fastest way to build a knowledge base on any topic:
 
 ```bash
-# Search, filter, download, and summarize in one step
-filmot research "nuclear fusion energy" --depth 12 --dedupe --min-matches 2 --sort density
+# Scout, run staged searches, preview candidates, download, and checkpoint
+filmot research "nuclear fusion energy" --depth 12 --dedupe --min-matches 2
 
 # Options:
-#   --depth N        Number of transcripts to download (default: 10)
-#   --min-views N    Minimum view count filter
-#   --dedupe         Skip duplicate transcripts (hashes first 500 chars)
-#   --min-matches N  Only download videos with N+ subtitle matches
-#   --sort density   Sort by matches-per-minute instead of views
-#   --fallback       Use AWS Transcribe when YouTube captions unavailable
-#   --lang CODE      Language code (default: en)
+#   --depth N                  Number of transcripts to download (default: 10)
+#   --candidate-pages N        Filmot pages fetched before client-side ranking
+#   --candidate-pool N         Maximum Filmot candidates to score
+#   --sort MODE                balanced (default), density, source-prior, or viewcount
+#   --channel/--channel-id     Constrain sources; fuzzy names resolve and fail closed
+#   --accept-broad             Explicitly allow a high-cardinality loose fallback
+#   --verbose                  Show full transcript failure details
+#   --fallback                 Use AWS Transcribe when captions are unavailable
 ```
+
+`research` first tries title+transcript, exact-phrase, and `NEAR/N` stages. Exact/`NEAR/N` fallback candidates must cover at least 75% of the topic tokens in one visible passage. A loose transcript-wide fallback above `--broad-threshold` is blocked unless you explicitly pass `--accept-broad`, and accepted broad candidates must still pass a passage-level relevance gate. The default balanced rank shows relevance, density, echo risk, and a separate `source-prior`. That prior is only an audience/engagement heuristic; it is not a credibility or truth score.
 
 ### Search Subtitles
 
@@ -151,15 +154,17 @@ filmot search "quantum computing" --min-matches 2 --full
 # Search within specific channels
 filmot search "tutorial" --channel "programming" --channel-count 5
 
-# Full output for AI agents (no truncation)
-filmot search "AI" --full --hit-format 1
+# Fetch three candidate pages, display 20 videos, at most 5 hits each
+filmot search "AI" --pages 3 --sort density --limit 20 --max-hits 5
 
 # Bulk download with deduplication
 filmot search "deep sea mining" --bulk-download deep-sea:10 --dedupe
 
-# Export raw JSON
+# Export the processed search response as JSON
 filmot search "AI" --raw > results.json
 ```
+
+Fuzzy `--channel` names are resolved to displayed channel IDs before searching. If no channel resolves—or Filmot returns a result outside the resolved ID set—the command fails closed instead of silently widening the search.
 
 ### Query Syntax (Full-Text Operators)
 
@@ -169,7 +174,7 @@ Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The
 
 | Operator | Syntax | Description | Example |
 |----------|--------|-------------|---------|
-| **AND** | `word1 word2` | Both words must appear (implicit) | `python tutorial` |
+| **AND** | `word1 word2` | Both words must appear somewhere in the same transcript; adjacency or a relationship is not implied | `python tutorial` |
 | **OR** | `word1 \| word2` | Either word can match | `"9 11" \| "nine eleven"` |
 | **Phrase** | `"exact phrase"` | Words must appear adjacent, in order | `"machine learning"` |
 | **Grouping** | `(expr1 \| expr2)` | Group expressions for complex queries | `python ("tutorial" \| "course")` |
@@ -187,6 +192,8 @@ Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The
 > **Not Supported:** Prefix wildcards (`thermo*`), Quorum (`"words"/N`), and Strict Order (`<<`) are not currently supported by the Filmot API.
 
 > **NOTNEAR vs NOT:** The NOT operator (`-word`) excludes the **entire video** if the excluded word appears **anywhere** in the transcript. NOTNEAR is usually more practical — it only excludes matches where the terms appear close together. For example, `python NOTNEAR/10 beginner` finds "python" mentions that aren't in a beginner context (max distance: 500 words).
+
+> **Recall tip:** Exact phrases and `NEAR/N` stay literal. A low count is not evidence that a subject is rare: try singular/plural, inflection, spelling, and likely auto-caption variants before drawing that conclusion.
 
 #### OR with Phrases (Handling Transcription Variations)
 
@@ -258,10 +265,12 @@ filmot search "cobalt" --title 'deep sea (mining | extraction)'
 |--------|-------------|---------|
 | `--lang, -l` | Language code | `--lang en` |
 | `--page, -p` | Page number (50 results/page) | `--page 2` |
+| `--pages` | Fetch N pages before client-side filtering/ranking | `--pages 3` |
+| `--candidate-pool` | Cap candidates fetched across `--pages` | `--candidate-pool 120` |
 | `--category, -c` | Video category | `--category "Education"` |
 | `--exclude` | Exclude categories (comma-separated) | `--exclude "Music,Gaming"` |
 | `--channel-id` | Limit to specific channel ID(s), comma-delimited | `--channel-id UCxyz...,UCabc...` |
-| `--channel` | Search within channels matching text | `--channel "tech"` |
+| `--channel` | Resolve channel text to displayed IDs; fail closed on no match | `--channel "tech"` |
 | `--channel-count` | Max channels for `--channel` (default 10) | `--channel-count 5` |
 | `--title` | Filter by video title — supports operators | `--title "deep sea mining"` |
 | `--min-views` | Minimum view count | `--min-views 10000` |
@@ -279,8 +288,10 @@ filmot search "cobalt" --title 'deep sea (mining | extraction)'
 | `--manual-subs` | Search manual subtitles only (default: auto subs) | `--manual-subs` |
 | `--max-query-time` | Max query time (4-15000 ms) | `--max-query-time 5000` |
 | `--hit-format` | 0=context snippets, 1=full lines | `--hit-format 1` |
-| `--full` | Show all matches (no truncation) | `--full` |
-| `--raw` | Output raw JSON response | `--raw` |
+| `--full` | Show all non-duplicate hit snippets returned for displayed videos on fetched candidate pages; duplicate segments may be collapsed and no extra pages are fetched | `--full` |
+| `--limit`, `--top` | Maximum video results to display/output | `--limit 20` |
+| `--max-hits` | Maximum hit details displayed per video | `--max-hits 5` |
+| `--raw` | Emit exactly one JSON value on stdout, including JSON errors | `--raw` |
 | `--min-matches` | Only show videos with N+ subtitle matches | `--min-matches 3` |
 | `--bulk-download` | Download top N transcripts to TOPIC | `--bulk-download topic:10` |
 | `--fallback` | Use AWS Transcribe fallback for bulk download | `--fallback` |
@@ -394,9 +405,12 @@ Download transcripts from piped search results for custom workflows:
 # Search with raw output, pipe to download
 filmot search "deep sea mining" --title "deep sea mining" --raw | filmot download -t deep-sea --dedupe
 
-# Multi-page search piped to download
-filmot search-all "AI safety" --pages 5 --raw > results.json
-type results.json | filmot download -t ai-safety --dedupe -n 20
+# Export a multi-page search, then feed the JSON file to download
+filmot search-all "AI safety" --pages 5 --output results.json --format json
+# Bash:
+filmot download -t ai-safety --dedupe -n 20 < results.json
+# PowerShell:
+Get-Content -Raw results.json | filmot download -t ai-safety --dedupe -n 20
 ```
 
 ### Transcript Library
@@ -416,7 +430,7 @@ filmot library search "dark oxygen"
 # Force substring matching (catches plurals automatically via fallback)
 filmot library search "patent" --substring
 
-# Compare how different sources discuss a claim
+# Find passages where different sources use the same term or phrase
 filmot library compare "cobalt" --sort density
 filmot library compare "moratorium" --context 200 --topic deep-sea-mining
 
@@ -432,10 +446,19 @@ filmot library context deep-sea-mining --max-chars 50000
 # Show library statistics
 filmot library stats
 
+# Explicitly assign an ambiguous pre-Unicode topic directory
+filmot library migrate-topic "AI 人工知能"
+
 # Delete a transcript or entire topic
 filmot library delete VIDEO_ID
 filmot library delete topic-name --all
 ```
+
+`migrate-topic` moves an entire legacy directory; it cannot infer which files
+belong to which original topic or partition a directory that old versions
+merged. Review the displayed source and destination paths, and confirm only
+when every source file belongs to the requested topic. Existing destination
+conflicts remain in the legacy directory rather than being overwritten.
 
 ### Search Channels
 
@@ -777,35 +800,46 @@ retires sessions that get rate-limited / blocked / fail to connect.
 4. Verify:
    ```bash
    filmot proxy refresh   # populate the pool
-   filmot proxy status    # see healthy session count
-   filmot proxy test      # probe 3 sessions against a known video
+   filmot proxy status    # see available and recently healthy sessions
+   filmot proxy test      # stream bounded probes through 3 sessions
    ```
 
 ### Configuration
 
 | Env var                      | Default       | Purpose                                                            |
 | ---------------------------- | ------------- | ------------------------------------------------------------------ |
-| `WEBSHARE_API_TOKEN`         | _(unset)_     | Required. Enables the dynamic pool.                                |
-| `FILMOT_PROXY_MODE`          | `proxy-only` if token set, else `auto` | `auto` \| `proxy-only` \| `direct-only` |
+| `WEBSHARE_API_TOKEN`         | _(unset)_     | Enables API-backed pool discovery and remote refresh.               |
+| `WEBSHARE_SESSION_FILE`      | `.filmot_data/webshare_info.txt` | Optional file-backed `host:port:user:password` pool. |
+| `FILMOT_PROXY_MODE`          | `proxy-only` if token set, else `auto` | `auto` \| `proxy-only` \| `primary-only` \| `direct-only` |
 | `FILMOT_PROXY_COUNTRIES`     | _(all)_       | Comma-separated ISO-2 codes (e.g. `US,GB,CA`).                     |
-| `FILMOT_PROXY_REFRESH_HOURS` | `24`          | How often the pool re-pulls the session list from Webshare.        |
+| `FILMOT_PROXY_REFRESH_HOURS` | `6`           | How often the pool re-pulls the session list from Webshare.        |
 | `FILMOT_PROXY_MAX_SESSIONS`  | `50`          | Cap on sessions kept in the pool.                                  |
 | `FILMOT_PROXY_RETRY_LIMIT`   | `4`           | Max pool sessions to try per transcript before giving up.          |
+| `FILMOT_PROXY_HEALTH_HOURS`  | `24`          | Recent-success window used by the “healthy” metric.                 |
+| `FILMOT_TRANSCRIPT_CONNECT_TIMEOUT` | `8`    | Per-request connection deadline in seconds.                        |
+| `FILMOT_TRANSCRIPT_READ_TIMEOUT` | `15`       | Per-request read deadline in seconds.                              |
+| `FILMOT_TRANSCRIPT_ROUTE_TIMEOUT` | `30`      | Overall deadline for one transcript route in seconds.              |
 
 On AWS hosts, `proxy-only` mode is the right default — direct requests will
-typically be blocked. On a residential dev box, `auto` mode tries direct first.
+typically be blocked. `proxy-only` tries only eligible pool sessions.
+`direct-only` bypasses all proxy routes. `auto` tries the file/API pool first,
+then the initialized primary route (an explicit proxy, legacy Webshare proxy,
+environment proxy, or direct connection). `primary-only` uses only that
+initialized primary route; the CLI selects it for an explicit `--proxy`.
 
 ### CLI commands
 
-- `filmot proxy status` — table of pool size, healthy count, and per-session
-  health (success / 429 / blocked / cooldown / last error). Use `--full` to
-  list every session.
-- `filmot proxy refresh` — re-pulls the list from `/api/v2/proxy/list/`. Add
-  `--full` to also `POST /proxy/list/refresh/`, which asks Webshare to rotate
-  the underlying IPs (consumes a refresh credit on your plan).
-- `filmot proxy test [-n N] [--video-id VID]` — probes `N` sessions by
-  fetching a known short transcript through each, printing per-session
-  latency + result.
+- `filmot proxy status` — separates sessions available now from sessions with a
+  recent successful live fetch, plus untested, cooling, failing, retired, and
+  invalid states. Use `--full` for every redacted session.
+- `filmot proxy refresh` — re-pulls an API-backed list. For a file-backed pool,
+  it re-reads the local session file while preserving retained health history.
+  `--full` requests remote IP rotation only for API-backed pools.
+- `filmot proxy test [-n N] [--video-id VID]` — probes up to `N` distinct
+  loaded sessions by fetching a known short transcript through each. Run
+  `proxy refresh` first if no sessions are loaded. It prints the redacted route
+  before the call, streams each result, and enforces per-route and total
+  command budgets.
 
 ### Legacy fallback
 
@@ -820,10 +854,10 @@ This CLI is designed to work seamlessly with AI agents and LLMs. See [AGENTS_REA
 ### Recommended Agent Workflow
 
 ```bash
-# 1. Research a topic (one command)
-filmot research "your topic" --depth 12 --dedupe --min-matches 2 --sort density
+# 1. Research a topic with staged fallbacks and balanced candidate ranking
+filmot research "your topic" --depth 12 --dedupe --min-matches 2
 
-# 2. Cross-reference claims across sources
+# 2. Navigate matching passages across sources, then verify the claims
 filmot library compare "specific claim" --sort density
 
 # 3. Export structured context for deep analysis
@@ -833,18 +867,22 @@ filmot library context your-topic --format structured
 ### Key Agent Features
 
 - **`filmot research`** — Single compound command that orchestrates search → filter → download → summary
-- **`filmot library compare`** — Cross-source verification: see how different sources discuss a claim
-- **`--sort density`** — Sort by matches-per-minute to find the most focused content
+- **`filmot library compare`** — Lexical cross-source concordance for locating matching passages
+- **`--sort density`** — Sort fetched candidates by matches-per-minute to find focused text coverage; this is not a credibility score
 - **`--min-matches N`** — Filter out videos with only passing mentions
 - **`--dedupe`** — Skip duplicate transcripts during bulk download
 - **`--format structured`** — Markdown export with metadata headers, auto-saved to file
-- **`--full`** — No truncation, complete output for LLM consumption
-- **`--raw`** — Raw JSON for programmatic access
+- **`--full`** — Expand non-duplicate hit snippets for displayed videos on fetched candidate pages; it does not widen the page scope
+- **`--pages` / `--candidate-pool`** — Widen the candidates considered by client-side ranking
+- **`--limit` / `--max-hits`** — Bound video and per-video hit output separately
+- **`--raw`** — Exactly one JSON value on stdout for programmatic access
 - **Word-boundary search** — Library search prevents false positives, auto-falls back to substring for plurals
 
-### Full Output Mode
+### Expanded Hit Output
 
-Use `--full` to get all subtitle matches without truncation:
+Use `--full` to remove the normal per-video hit cap for displayed videos on
+the candidate pages already fetched. Repeated duplicate segments may still be
+collapsed, and the option does not fetch additional result pages:
 
 ```bash
 # Get complete transcript matches for AI processing
@@ -864,6 +902,14 @@ filmot search "data science" --raw > results.json
 filmot search "tutorial" --raw | jq '.result[0].hits'
 ```
 
+Raw mode suppresses interactive progress and keeps any remaining diagnostics
+off stdout. Stdout contains one JSON value on success and one JSON error value
+with a nonzero exit status on operational failure. For `search`, this is the
+processed response after channel validation, client-side filtering/ranking,
+`--limit`, and `--max-hits`, with explicit scope metadata; it is not an
+untouched copy of the upstream API payload. `filmot sessions NAME --raw`
+similarly emits one JSON array containing all session events, not JSONL.
+
 ### Example Agent Workflow (Python)
 
 ```python
@@ -872,7 +918,7 @@ import json
 
 # Search for relevant content
 result = subprocess.run(
-    ["filmot", "search", "python tutorial", "--raw", "--full"],
+    ["filmot", "search", "python tutorial", "--raw"],
     capture_output=True, text=True
 )
 data = json.loads(result.stdout)
