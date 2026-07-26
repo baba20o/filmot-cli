@@ -136,6 +136,23 @@ class TestSaveAndGet:
         assert migrated["topic"] == "人工知能"
         assert not legacy_file.exists()
 
+    def test_mixed_script_legacy_ascii_remainder_is_not_read_implicitly(self, library):
+        legacy_dir = library.transcripts_dir / "ai"
+        legacy_dir.mkdir()
+        legacy_file = legacy_dir / "vid123456789.json"
+        legacy_file.write_text(json.dumps({
+            "video_id": "vid123456789",
+            "topic": "ai",
+            "saved_at": "2026-01-01T00:00:00",
+            "transcript": "ambiguous legacy text",
+            "metadata": {},
+        }), encoding="utf-8")
+
+        # Both names used to collapse to ``ai``. Neither may claim the old
+        # directory until an operator explicitly chooses its owner.
+        assert library.get("vid123456789", "AI 人工知能") is None
+        assert library.get("vid123456789", "AI 초전도체") is None
+
 
 # ── Exists ────────────────────────────────────────────────────────
 

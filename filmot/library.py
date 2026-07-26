@@ -122,27 +122,17 @@ class TranscriptLibrary:
         return normalize_topic_name(topic)
 
     def _topic_dirs_for_read(self, topic: str) -> List[Path]:
-        """Return the canonical topic directory or its legacy predecessor.
+        """Return only the canonical topic directory.
 
-        The old normalizer stripped Unicode from mixed-script names and collapsed
-        pure non-Latin topics into ``uncategorized``. A specific legacy slug is
-        safe to read as a compatibility fallback; the shared ``uncategorized``
-        directory is not, so assigning that corpus requires an explicit
+        Every legacy slug that differs from the canonical slug is potentially
+        ambiguous. The old normalizer discarded Unicode, so topics such as
+        ``AI 人工知能`` and ``AI 초전도체`` both became ``ai``; pure non-Latin
+        topics likewise shared ``uncategorized``. Reading either directory as a
+        compatibility fallback can silently cross-contaminate investigations.
+        Assigning old data therefore always requires an explicit
         :meth:`migrate_legacy_topic` call.
         """
         current = self.transcripts_dir / self._normalize_topic(topic)
-        if current.exists() and any(current.glob("*.json")):
-            return [current]
-
-        legacy_slug = _legacy_normalize_topic(topic)
-        legacy = self.transcripts_dir / legacy_slug
-        if (
-            legacy_slug != "uncategorized"
-            and legacy != current
-            and legacy.exists()
-            and any(legacy.glob("*.json"))
-        ):
-            return [legacy]
         return [current]
     
     def _get_topic_dir(self, topic: str) -> Path:
