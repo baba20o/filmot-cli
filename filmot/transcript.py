@@ -12,9 +12,13 @@ from youtube_transcript_api._errors import (
     NoTranscriptFound,
     VideoUnavailable,
 )
-from typing import Optional
+from typing import Any, Callable, Optional
+import queue
 import re
 import os
+import threading
+import time
+import requests
 from dotenv import load_dotenv
 
 from .proxy_pool import (
@@ -26,6 +30,14 @@ load_dotenv()
 
 # Default number of pool sessions to try on transport-class failures.
 _POOL_RETRY_LIMIT = int(os.getenv("FILMOT_PROXY_RETRY_LIMIT", "4"))
+
+# Every individual HTTP operation gets a connect/read deadline, and every
+# complete route attempt gets a wall-clock budget. The route budget matters
+# because one transcript fetch may issue several HTTP requests (fetch, list,
+# translation) and requests' read timeout is not an overall deadline.
+DEFAULT_CONNECT_TIMEOUT = 8.0
+DEFAULT_READ_TIMEOUT = 15.0
+DEFAULT_ROUTE_TIMEOUT = 30.0
 
 # Webshare gateway for the legacy username/password path.
 _WEBSHARE_GATEWAY = os.getenv("WEBSHARE_GATEWAY", "p.webshare.io:80")
@@ -45,9 +57,51 @@ _initialized = False
 _proxy_source = "direct"
 
 
+class TranscriptRouteTimeout(TimeoutError):
+    """Raised when one route exceeds its complete wall-clock budget."""
+
+    def __init__(self, route: str, timeout_seconds: float) -> None:
+        self.route = route
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"Transcript route {route!r} timed out after "
+            f"{timeout_seconds:g} seconds"
+        )
+
+
+class _BoundedSession(requests.Session):
+    """Requests session that supplies connect/read timeouts by default."""
+
+    def __init__(self, connect_timeout: float, read_timeout: float) -> None:
+        super().__init__()
+        self._filmot_timeout = (connect_timeout, read_timeout)
+
+    def request(self, method, url, **kwargs):  # noqa: ANN001 - requests signature
+        kwargs.setdefault("timeout", self._filmot_timeout)
+        return super().request(method, url, **kwargs)
+
+
+def _env_timeout(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _new_http_session() -> requests.Session:
+    return _BoundedSession(
+        _env_timeout("FILMOT_TRANSCRIPT_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT),
+        _env_timeout("FILMOT_TRANSCRIPT_READ_TIMEOUT", DEFAULT_READ_TIMEOUT),
+    )
+
+
 def _build_direct_api() -> YouTubeTranscriptApi:
     """Build a direct YouTubeTranscriptApi client."""
-    return YouTubeTranscriptApi()
+    return YouTubeTranscriptApi(http_client=_new_http_session())
 
 
 def _build_webshare_api(proxy_username: str, proxy_password: str) -> YouTubeTranscriptApi:
@@ -64,7 +118,9 @@ def _build_webshare_api(proxy_username: str, proxy_password: str) -> YouTubeTran
             proxy_config=WebshareProxyConfig(
                 proxy_username=proxy_username,
                 proxy_password=proxy_password,
-            )
+                retries_when_blocked=0,
+            ),
+            http_client=_new_http_session(),
         )
     url = f"http://{proxy_username}:{proxy_password}@{_WEBSHARE_GATEWAY}"
     return _build_generic_proxy_api(url, url)
@@ -78,7 +134,8 @@ def _build_generic_proxy_api(http_proxy: Optional[str], https_proxy: Optional[st
         proxy_config=GenericProxyConfig(
             http_url=http_proxy,
             https_url=https_proxy or http_proxy,
-        )
+        ),
+        http_client=_new_http_session(),
     )
 
 
@@ -128,7 +185,14 @@ def _init_api() -> None:
     if _initialized:
         return
 
-    _api, _proxy_source, _proxy_configured = _primary_from_environment()
+    if _resolve_proxy_mode() == "direct-only":
+        _api, _proxy_source, _proxy_configured = (
+            _build_direct_api(),
+            "direct",
+            False,
+        )
+    else:
+        _api, _proxy_source, _proxy_configured = _primary_from_environment()
     _initialized = True
 
 
@@ -211,6 +275,92 @@ def reset_api() -> None:
     _init_api()
 
 
+def routing_plan() -> dict:
+    """Return the actual transcript route plan without consuming a pool route.
+
+    This initializes the primary client before reading its label, fixing the
+    previous ordering bug where callers could report ``direct`` even though
+    environment proxy configuration had not yet been inspected. Pool
+    construction only reads local configuration/state; no session is picked
+    and no transcript or Webshare management request is made.
+    """
+    _init_api()
+    mode = _resolve_proxy_mode()
+    pool = None if mode == "direct-only" else get_pool()
+    routes = []
+    if pool is not None and mode in {"auto", "proxy-only"}:
+        routes.append(
+            {
+                "kind": "pool",
+                "label": f"{pool.source} pool",
+                "source": pool.source,
+                "max_attempts": _POOL_RETRY_LIMIT,
+                "total_sessions": len(pool._sessions),
+                "available_sessions": pool.available_count(),
+            }
+        )
+
+    if mode == "direct-only":
+        routes.append(
+            {
+                "kind": "primary",
+                "label": "direct",
+                "source": "direct",
+                "max_attempts": 1,
+            }
+        )
+        primary_label = "direct"
+        primary_is_proxy = False
+    else:
+        primary_label = _proxy_source
+        primary_is_proxy = _proxy_configured
+        if mode == "auto":
+            routes.append(
+                {
+                    "kind": "primary",
+                    "label": primary_label,
+                    "source": primary_label,
+                    "max_attempts": 1,
+                }
+            )
+
+    return {
+        "mode": mode,
+        "routes": routes,
+        "pool_configured": pool is not None,
+        "pool_source": pool.source if pool is not None else None,
+        "primary": primary_label,
+        "primary_is_proxy": primary_is_proxy,
+        "has_direct_route": any(r["source"] == "direct" for r in routes),
+        "connect_timeout_s": _env_timeout(
+            "FILMOT_TRANSCRIPT_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT
+        ),
+        "read_timeout_s": _env_timeout(
+            "FILMOT_TRANSCRIPT_READ_TIMEOUT", DEFAULT_READ_TIMEOUT
+        ),
+        "route_timeout_s": _env_timeout(
+            "FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT
+        ),
+    }
+
+
+def describe_routing_plan(plan: Optional[dict] = None) -> str:
+    """Render :func:`routing_plan` as a concise CLI-friendly description."""
+    plan = plan or routing_plan()
+    if not plan["routes"]:
+        return f"no usable routes ({plan['mode']} mode)"
+    labels = []
+    for route in plan["routes"]:
+        if route["kind"] == "pool":
+            labels.append(
+                f"{route['label']} (up to {route['max_attempts']} attempts, "
+                f"{route['available_sessions']} available)"
+            )
+        else:
+            labels.append(route["label"])
+    return " -> ".join(labels)
+
+
 def extract_video_id(video_input: str) -> str:
     """
     Extract video ID from various YouTube URL formats or return as-is if already an ID.
@@ -245,6 +395,9 @@ def get_transcript(
     video_id: str,
     languages: Optional[list[str]] = None,
     preserve_formatting: bool = False,
+    *,
+    route_timeout: Optional[float] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """
     Fetch the full transcript for a YouTube video.
@@ -254,6 +407,9 @@ def get_transcript(
         languages: Preferred languages in order (e.g., ['en', 'en-US'])
                    If None, tries to get any available transcript
         preserve_formatting: If True, keeps original line breaks
+        route_timeout: Maximum wall-clock seconds for each route attempt.
+                      Defaults to ``FILMOT_TRANSCRIPT_ROUTE_TIMEOUT`` or 30.
+        progress_callback: Optional callable receiving structured route events.
         
     Returns:
         dict with:
@@ -270,28 +426,79 @@ def get_transcript(
         languages = ['en', 'en-US', 'en-GB']
     
     attempts: list[str] = []
+    route_errors: list[dict] = []
     last_error: Optional[Exception] = None
+    attempt_timeout = (
+        route_timeout
+        if route_timeout is not None and route_timeout > 0
+        else _env_timeout("FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT)
+    )
 
-    for label, api, on_outcome in _iter_routes():
+    for attempt_number, (label, api, on_outcome) in enumerate(_iter_routes(), 1):
         attempts.append(label)
+        started = time.monotonic()
+        _emit_progress(
+            progress_callback,
+            event="route_start",
+            route=label,
+            attempt=attempt_number,
+            timeout_s=attempt_timeout,
+        )
         try:
-            result = _fetch_transcript_from_api(
-                api,
-                video_id,
-                languages=languages,
-                preserve_formatting=preserve_formatting,
+            result = _call_with_route_timeout(
+                lambda: _fetch_transcript_from_api(
+                    api,
+                    video_id,
+                    languages=languages,
+                    preserve_formatting=preserve_formatting,
+                ),
+                route=label,
+                timeout_seconds=attempt_timeout,
             )
         except (TranscriptsDisabled, VideoUnavailable, NoTranscriptFound) as terminal:
             # Caption-side terminal failures — not a transport problem.
             # Don't penalise the route; surface the error immediately.
             if on_outcome is not None:
                 on_outcome("success", None)
+            _emit_progress(
+                progress_callback,
+                event="route_terminal",
+                route=label,
+                attempt=attempt_number,
+                elapsed_s=time.monotonic() - started,
+                error_type=type(terminal).__name__,
+                error=str(terminal),
+            )
             return _terminal_error_result(terminal, video_id, label)
         except Exception as exc:  # noqa: BLE001 - we re-raise via result dict
             kind = classify_transport_error(exc)
             if on_outcome is not None:
                 on_outcome("failure", (kind or "other", str(exc)))
             last_error = exc
+            elapsed = time.monotonic() - started
+            route_errors.append(
+                {
+                    "route": label,
+                    "kind": kind or "other",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "elapsed_s": elapsed,
+                }
+            )
+            _emit_progress(
+                progress_callback,
+                event=(
+                    "route_timeout"
+                    if isinstance(exc, TranscriptRouteTimeout)
+                    else "route_failed"
+                ),
+                route=label,
+                attempt=attempt_number,
+                elapsed_s=elapsed,
+                kind=kind or "other",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             if not kind:
                 # Unknown / non-transport error — stop retrying.
                 break
@@ -302,14 +509,93 @@ def get_transcript(
             on_outcome("success", None)
         if isinstance(result, dict) and "error" not in result:
             result["route"] = label
+            result["route_elapsed_seconds"] = time.monotonic() - started
+        _emit_progress(
+            progress_callback,
+            event="route_success",
+            route=label,
+            attempt=attempt_number,
+            elapsed_s=time.monotonic() - started,
+        )
         return result
 
-    error_msg = str(last_error) if last_error else "all routes exhausted"
+    if last_error is not None:
+        error_msg = str(last_error)
+        error_type = type(last_error).__name__
+    elif _resolve_proxy_mode() == "proxy-only":
+        error_msg = (
+            "No proxy route is available in proxy-only mode. Configure a "
+            "Webshare pool or choose auto/direct-only mode."
+        )
+        error_type = "NoRouteAvailable"
+    else:
+        error_msg = "all routes exhausted"
+        error_type = "RoutesExhausted"
+    _emit_progress(
+        progress_callback,
+        event="routes_exhausted",
+        attempts=len(attempts),
+        error_type=error_type,
+        error=error_msg,
+    )
     return {
         "error": error_msg,
+        "error_type": error_type,
         "video_id": video_id,
         "routes_tried": attempts,
+        "route_errors": route_errors,
     }
+
+
+def _emit_progress(
+    callback: Optional[Callable[[dict], None]],
+    **event: Any,
+) -> None:
+    """Emit a progress event without allowing UI code to break retrieval."""
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        # Progress is observational. A renderer/log sink must never turn a
+        # successful transcript fetch into a failed one.
+        return
+
+
+def _call_with_route_timeout(
+    operation: Callable[[], dict],
+    *,
+    route: str,
+    timeout_seconds: float,
+) -> dict:
+    """Run one route attempt with a strict wall-clock deadline.
+
+    The worker is daemonized so a stuck third-party call cannot keep the CLI
+    alive. The underlying bounded requests session still has connect/read
+    deadlines and will clean itself up shortly after the caller advances.
+    """
+    outcome: queue.Queue = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            outcome.put((True, operation()))
+        except BaseException as exc:  # propagate the original exception
+            outcome.put((False, exc))
+
+    worker = threading.Thread(
+        target=_worker,
+        name=f"filmot-transcript-{route}",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise TranscriptRouteTimeout(route, timeout_seconds)
+
+    succeeded, value = outcome.get_nowait()
+    if succeeded:
+        return value
+    raise value
 
 
 def _terminal_error_result(exc: Exception, video_id: str, route: str) -> dict:
@@ -329,6 +615,10 @@ def _iter_routes():
     ``("success", None)`` or ``("failure", (kind, summary))`` so the pool can
     update health stats. ``None`` for non-pool routes.
     """
+    # Initialize before reading ``_proxy_source``. Python evaluates tuple
+    # elements left-to-right, so the former ``(_proxy_source, get_api(), ...)``
+    # could capture the default label before get_api inspected the environment.
+    _init_api()
     mode = _resolve_proxy_mode()
     pool = None if mode == "direct-only" else get_pool()
 
@@ -348,11 +638,119 @@ def _iter_routes():
                     kind, summary = info
                     _p.report_failure(_s, kind or "other", summary=summary)
 
-            yield (f"pool:{session.id}", api, _cb)
+            yield (f"pool:{pool.source}:{pool.redacted_session_id(session)}", api, _cb)
 
     # 2. Primary client (direct, env-proxy, legacy-webshare, or operator-supplied).
-    if mode != "proxy-only" or pool is None:
-        yield (_proxy_source, get_api(), None)
+    if mode == "direct-only":
+        yield ("direct", get_api(), None)
+    elif mode == "auto":
+        primary_api = get_api()
+        primary_label = _proxy_source
+        yield (primary_label, primary_api, None)
+
+
+def probe_pool_session(
+    pool,
+    session,
+    video_id: str,
+    *,
+    languages: Optional[list[str]] = None,
+    route_timeout: Optional[float] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+) -> dict:
+    """Boundedly probe one explicitly selected pool session.
+
+    This is the integration point for ``proxy test``: it uses the same
+    connect/read/overall deadlines as normal transcript retrieval, reports
+    health to the pool, and emits progress before the potentially slow call.
+    """
+    video_id = extract_video_id(video_id)
+    languages = languages or ["en", "en-US", "en-GB"]
+    timeout_seconds = (
+        route_timeout
+        if route_timeout is not None and route_timeout > 0
+        else _env_timeout("FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT)
+    )
+    label = f"pool:{pool.source}:{pool.redacted_session_id(session)}"
+    api = _build_generic_proxy_api(
+        pool.proxy_url(session),
+        pool.proxy_url(session),
+    )
+    started = time.monotonic()
+    _emit_progress(
+        progress_callback,
+        event="route_start",
+        route=label,
+        attempt=1,
+        timeout_s=timeout_seconds,
+    )
+    try:
+        result = _call_with_route_timeout(
+            lambda: _fetch_transcript_from_api(
+                api,
+                video_id,
+                languages=languages,
+                preserve_formatting=False,
+            ),
+            route=label,
+            timeout_seconds=timeout_seconds,
+        )
+    except (TranscriptsDisabled, VideoUnavailable, NoTranscriptFound) as terminal:
+        # The route reached YouTube successfully; captions are a video concern.
+        pool.report_success(session)
+        result = _terminal_error_result(terminal, video_id, label)
+        result["transport_ok"] = True
+        result["route_elapsed_seconds"] = time.monotonic() - started
+        _emit_progress(
+            progress_callback,
+            event="route_terminal",
+            route=label,
+            attempt=1,
+            elapsed_s=result["route_elapsed_seconds"],
+            error_type=type(terminal).__name__,
+            error=str(terminal),
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001 - normalized to a result
+        kind = classify_transport_error(exc) or "other"
+        pool.report_failure(session, kind, summary=str(exc))
+        result = {
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "video_id": video_id,
+            "route": label,
+            "failure_kind": kind,
+            "transport_ok": False,
+            "route_elapsed_seconds": time.monotonic() - started,
+        }
+        _emit_progress(
+            progress_callback,
+            event=(
+                "route_timeout"
+                if isinstance(exc, TranscriptRouteTimeout)
+                else "route_failed"
+            ),
+            route=label,
+            attempt=1,
+            elapsed_s=result["route_elapsed_seconds"],
+            kind=kind,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return result
+
+    pool.report_success(session)
+    result["route"] = label
+    result["transport_ok"] = True
+    result["route_elapsed_seconds"] = time.monotonic() - started
+    _emit_progress(
+        progress_callback,
+        event="route_success",
+        route=label,
+        attempt=1,
+        elapsed_s=result["route_elapsed_seconds"],
+    )
+    return result
 
 
 def _fetch_transcript_from_api(
@@ -565,6 +963,8 @@ def get_transcript_with_fallback(
     preserve_formatting: bool = False,
     use_aws_fallback: bool = True,
     aws_progress_callback=None,
+    route_timeout: Optional[float] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """
     Fetch transcript with AWS Transcribe fallback.
@@ -591,6 +991,8 @@ def get_transcript_with_fallback(
         preserve_formatting: Keep original line breaks
         use_aws_fallback: Enable AWS Transcribe fallback
         aws_progress_callback: Optional callback(stage, message) for AWS progress
+        route_timeout: Maximum wall-clock seconds for each YouTube route
+        progress_callback: Optional callable receiving YouTube route events
     
     Returns:
         dict with:
@@ -605,7 +1007,13 @@ def get_transcript_with_fallback(
     video_id = extract_video_id(video_id)
     
     # Try YouTube transcript API first
-    result = get_transcript(video_id, languages, preserve_formatting)
+    result = get_transcript(
+        video_id,
+        languages,
+        preserve_formatting,
+        route_timeout=route_timeout,
+        progress_callback=progress_callback,
+    )
     
     if 'error' not in result:
         result['source'] = 'youtube'

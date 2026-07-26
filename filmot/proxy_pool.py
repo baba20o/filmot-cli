@@ -24,7 +24,8 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from hashlib import sha256
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -39,6 +40,7 @@ DEFAULT_GATEWAY_HOST = "p.webshare.io"
 DEFAULT_GATEWAY_PORT = 80
 DEFAULT_REFRESH_HOURS = 6
 DEFAULT_MAX_SESSIONS = 50
+DEFAULT_RECENT_SUCCESS_HOURS = 24
 DEFAULT_STATE_PATH = Path(".filmot_data") / "webshare_pool.json"
 # A pre-exported list of backbone sessions ("host:port:username:password" per
 # line). Lets the pool rotate across many residential exit IPs without a
@@ -69,6 +71,8 @@ class WebshareSession:
     country_code: Optional[str] = None
     last_verification: Optional[str] = None
     valid: bool = True
+    proxy_host: Optional[str] = None
+    proxy_port: Optional[int] = None
 
     # health
     success: int = 0
@@ -78,11 +82,20 @@ class WebshareSession:
     consecutive_failures: int = 0
     cooldown_until: float = 0.0  # epoch seconds
     last_used_at: float = 0.0
+    last_success_at: float = 0.0
+    last_failure_at: float = 0.0
+    last_failure_kind: Optional[str] = None
     last_error: Optional[str] = None
     retired: bool = False
 
     def is_available(self, now: float) -> bool:
         return self.valid and not self.retired and self.cooldown_until <= now
+
+    def was_recently_successful(self, now: float, window_seconds: float) -> bool:
+        return (
+            self.last_success_at > 0
+            and now - self.last_success_at <= window_seconds
+        )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -123,6 +136,7 @@ class WebshareProxyPool:
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         state_path: Optional[Path] = None,
         request_timeout: float = 15.0,
+        recent_success_hours: float = DEFAULT_RECENT_SUCCESS_HOURS,
     ) -> None:
         if not token:
             raise WebshareProxyError("WEBSHARE_API_TOKEN is required")
@@ -134,16 +148,26 @@ class WebshareProxyPool:
         self.max_sessions = max_sessions
         self.state_path = Path(state_path) if state_path else DEFAULT_STATE_PATH
         self.request_timeout = request_timeout
+        self.recent_success_hours = recent_success_hours
 
         self._lock = threading.Lock()
         self._sessions: list[WebshareSession] = []
         self._last_refresh: float = 0.0
         self._cursor: int = 0  # round-robin pointer
         self._file_backed: bool = False
+        self._session_file_path: Optional[Path] = None
 
         self._load_state()
 
-    def _init_file_backed(self, sessions: list, state_path: Optional[Path] = None) -> None:
+    def _init_file_backed(
+        self,
+        sessions: list,
+        *,
+        session_file_path: Path,
+        state_path: Optional[Path] = None,
+        max_sessions: Optional[int] = None,
+        recent_success_hours: float = DEFAULT_RECENT_SUCCESS_HOURS,
+    ) -> None:
         """Initialize a token-less pool from a pre-exported session list.
 
         Never calls the Webshare API; rotates across the provided sessions and
@@ -154,14 +178,16 @@ class WebshareProxyPool:
         self.gateway_host = DEFAULT_GATEWAY_HOST
         self.gateway_port = DEFAULT_GATEWAY_PORT
         self.refresh_hours = DEFAULT_REFRESH_HOURS
-        self.max_sessions = len(sessions)
+        self.max_sessions = max_sessions or len(sessions)
         self.state_path = Path(state_path) if state_path else (Path(".filmot_data") / "webshare_pool_file.json")
         self.request_timeout = 15.0
+        self.recent_success_hours = recent_success_hours
         self._lock = threading.Lock()
         self._sessions = sessions
         self._last_refresh = time.time()
         self._cursor = 0
         self._file_backed = True
+        self._session_file_path = Path(session_file_path)
         # Merge prior health stats (cooldowns, retirement) for known sessions.
         try:
             if self.state_path.exists():
@@ -176,6 +202,11 @@ class WebshareProxyPool:
                         sess.fail_other = merged.fail_other
                         sess.consecutive_failures = merged.consecutive_failures
                         sess.cooldown_until = merged.cooldown_until
+                        sess.last_used_at = merged.last_used_at
+                        sess.last_success_at = merged.last_success_at
+                        sess.last_failure_at = merged.last_failure_at
+                        sess.last_failure_kind = merged.last_failure_kind
+                        sess.last_error = merged.last_error
                         sess.retired = merged.retired
                 self._cursor = int(data.get("cursor", 0)) % max(len(self._sessions), 1)
         except (OSError, json.JSONDecodeError, KeyError):
@@ -266,8 +297,11 @@ class WebshareProxyPool:
     def refresh(self, *, force: bool = False) -> int:
         """Pull sessions from Webshare. Returns the number now in the pool."""
         if getattr(self, "_file_backed", False):
-            # File-backed pools have a fixed session list; nothing to pull.
-            return len(self._sessions)
+            # A file-backed pool has no remote list to refresh, but the local
+            # export may have changed since this process started. Re-read it so
+            # ``proxy refresh`` performs real work instead of reporting a
+            # misleading no-op.
+            return self.reload_file()
         with self._lock:
             now = time.time()
             stale = (now - self._last_refresh) > self.refresh_hours * 3600
@@ -312,13 +346,75 @@ class WebshareProxyPool:
 
     def request_full_refresh(self) -> None:
         """Ask Webshare to rotate the entire underlying proxy list (POST)."""
+        if getattr(self, "_file_backed", False):
+            raise WebshareProxyError(
+                "A file-backed pool cannot request a remote IP refresh; "
+                "replace the session file and reload it instead."
+            )
         self._api_post("/api/v2/proxy/list/refresh/")
 
+    def reload_file(self) -> int:
+        """Reload a file-backed session list, preserving health by session id.
+
+        Raises :class:`WebshareProxyError` for API-backed pools, missing files,
+        and files with no valid session rows. The existing in-memory pool is
+        left untouched on failure.
+        """
+        if not getattr(self, "_file_backed", False):
+            raise WebshareProxyError("reload_file() is only valid for file-backed pools")
+        path = getattr(self, "_session_file_path", None)
+        if path is None:
+            raise WebshareProxyError("File-backed pool has no source path")
+        if not path.exists():
+            raise WebshareProxyError(f"Session file no longer exists: {path}")
+
+        fresh_sessions = _load_sessions_from_file(path, self.max_sessions)
+        if not fresh_sessions:
+            raise WebshareProxyError(
+                f"Session file contains no valid host:port:user:password rows: {path}"
+            )
+
+        with self._lock:
+            existing = {s.id: s for s in self._sessions}
+            merged_sessions: list[WebshareSession] = []
+            for fresh in fresh_sessions:
+                prior = existing.get(fresh.id)
+                if prior is None:
+                    merged_sessions.append(fresh)
+                    continue
+                prior.username = fresh.username
+                prior.password = fresh.password
+                prior.proxy_host = fresh.proxy_host
+                prior.proxy_port = fresh.proxy_port
+                prior.valid = fresh.valid
+                merged_sessions.append(prior)
+
+            self._sessions = merged_sessions
+            self._last_refresh = time.time()
+            self._cursor %= max(len(self._sessions), 1)
+            self._save_state()
+            return len(self._sessions)
+
     def proxy_url(self, session: WebshareSession) -> str:
+        host = session.proxy_host or self.gateway_host
+        port = session.proxy_port or self.gateway_port
         return (
             f"http://{session.username}:{session.password}"
-            f"@{self.gateway_host}:{self.gateway_port}"
+            f"@{host}:{port}"
         )
+
+    def redacted_session_id(self, session: WebshareSession) -> str:
+        """Return a stable, non-credential identifier suitable for output."""
+        digest = sha256(session.id.encode("utf-8")).hexdigest()[:8]
+        return f"session-{digest}"
+
+    @property
+    def source(self) -> str:
+        return "session-file" if getattr(self, "_file_backed", False) else "webshare-api"
+
+    @property
+    def session_file_path(self) -> Optional[Path]:
+        return getattr(self, "_session_file_path", None)
 
     def pick(self) -> Optional[WebshareSession]:
         """Return the next available session, or None if pool is empty/exhausted.
@@ -350,9 +446,11 @@ class WebshareProxyPool:
 
     def report_success(self, session: WebshareSession) -> None:
         with self._lock:
+            now = time.time()
             session.success += 1
             session.consecutive_failures = 0
             session.cooldown_until = 0.0
+            session.last_success_at = now
             session.last_error = None
             self._save_state()
 
@@ -379,20 +477,64 @@ class WebshareProxyPool:
                 session.fail_other += 1
             session.consecutive_failures += 1
             session.cooldown_until = now + cooldowns.get(kind, COOLDOWN_OTHER)
+            session.last_failure_at = now
+            session.last_failure_kind = kind
             if summary:
                 session.last_error = summary[:200]
             if session.consecutive_failures >= RETIRE_AFTER_CONSECUTIVE_FAILURES:
                 session.retired = True
             self._save_state()
 
-    def healthy_count(self) -> int:
+    def available_count(self) -> int:
+        """Return sessions eligible for selection right now.
+
+        Availability is not a health assertion: an untested or historically
+        failing session becomes available again after its cooldown.
+        """
         now = time.time()
         return sum(1 for s in self._sessions if s.is_available(now))
 
+    def recently_healthy_count(self) -> int:
+        """Return available sessions with a successful recent live fetch."""
+        now = time.time()
+        window = (
+            getattr(self, "recent_success_hours", DEFAULT_RECENT_SUCCESS_HOURS)
+            * 3600
+        )
+        return sum(
+            1
+            for s in self._sessions
+            if s.is_available(now) and s.was_recently_successful(now, window)
+        )
+
+    def healthy_count(self) -> int:
+        """Compatibility alias for genuinely, recently healthy sessions."""
+        return self.recently_healthy_count()
+
     def status_snapshot(self) -> dict:
         now = time.time()
+        recent_window = (
+            getattr(self, "recent_success_hours", DEFAULT_RECENT_SUCCESS_HOURS)
+            * 3600
+        )
         sessions = []
         for s in self._sessions:
+            recently_successful = s.was_recently_successful(now, recent_window)
+            available = s.is_available(now)
+            if not s.valid:
+                state = "invalid"
+            elif s.retired:
+                state = "retired"
+            elif not available:
+                state = "cooldown"
+            elif s.consecutive_failures:
+                state = "ready-failing"
+            elif recently_successful:
+                state = "ready-tested"
+            elif s.success:
+                state = "ready-stale"
+            else:
+                state = "ready-untested"
             sessions.append(
                 {
                     "id": s.id,
@@ -400,21 +542,51 @@ class WebshareProxyPool:
                     "country": s.country_code,
                     "valid": s.valid,
                     "retired": s.retired,
-                    "available": s.is_available(now),
+                    "available": available,
+                    "recently_successful": recently_successful,
+                    "state": state,
                     "cooldown_remaining_s": max(0, int(s.cooldown_until - now)),
                     "success": s.success,
                     "fail_429": s.fail_429,
                     "fail_blocked": s.fail_blocked,
                     "fail_other": s.fail_other,
                     "consecutive_failures": s.consecutive_failures,
+                    "last_success_at": s.last_success_at,
+                    "last_failure_at": s.last_failure_at,
+                    "last_failure_kind": s.last_failure_kind,
                     "last_error": s.last_error,
                 }
             )
+        counts = {
+            "available": sum(1 for s in sessions if s["available"]),
+            "recently_healthy": sum(
+                1
+                for s in sessions
+                if s["available"] and s["recently_successful"]
+            ),
+            "untested": sum(1 for s in self._sessions if s.success == 0),
+            "cooling": sum(1 for s in sessions if s["state"] == "cooldown"),
+            "retired": sum(1 for s in sessions if s["state"] == "retired"),
+            "invalid": sum(1 for s in sessions if s["state"] == "invalid"),
+            "failing": sum(
+                1 for s in self._sessions if s.consecutive_failures > 0
+            ),
+        }
         return {
+            "source": self.source,
+            "session_file": (
+                str(self.session_file_path)
+                if self.session_file_path is not None
+                else None
+            ),
             "gateway": f"{self.gateway_host}:{self.gateway_port}",
             "countries": self.countries,
             "total": len(self._sessions),
-            "healthy": self.healthy_count(),
+            # Keep ``healthy`` for callers on the older schema, but give it
+            # the corrected meaning rather than silently equating it with
+            # availability.
+            "healthy": counts["recently_healthy"],
+            **counts,
             "last_refresh": self._last_refresh,
             "stale": (now - self._last_refresh) > self.refresh_hours * 3600,
             "sessions": sessions,
@@ -450,13 +622,26 @@ def _load_sessions_from_file(path: Path, limit: int) -> list[WebshareSession]:
             # host:port:username:password (password may itself contain ':')
             host, port, username = parts[0], parts[1], parts[2]
             password = ":".join(parts[3:])
-            parsed.append((username, password))
+            try:
+                parsed_port = int(port)
+            except ValueError:
+                continue
+            parsed.append((host, parsed_port, username, password))
     if not parsed:
         return []
     if len(parsed) > limit:
         step = len(parsed) / limit
         parsed = [parsed[int(i * step)] for i in range(limit)]
-    return [WebshareSession(id=u, username=u, password=p) for u, p in parsed]
+    return [
+        WebshareSession(
+            id=username,
+            username=username,
+            password=password,
+            proxy_host=host,
+            proxy_port=port,
+        )
+        for host, port, username, password in parsed
+    ]
 
 
 def get_pool(*, force_new: bool = False) -> Optional[WebshareProxyPool]:
@@ -483,6 +668,12 @@ def get_pool(*, force_new: bool = False) -> Optional[WebshareProxyPool]:
                         os.getenv("FILMOT_PROXY_REFRESH_HOURS", DEFAULT_REFRESH_HOURS)
                     ),
                     max_sessions=max_sessions,
+                    recent_success_hours=float(
+                        os.getenv(
+                            "FILMOT_PROXY_HEALTH_HOURS",
+                            DEFAULT_RECENT_SUCCESS_HOURS,
+                        )
+                    ),
                 )
             except WebshareProxyError:
                 _pool = None
@@ -495,7 +686,17 @@ def get_pool(*, force_new: bool = False) -> Optional[WebshareProxyPool]:
             sessions = _load_sessions_from_file(session_file, max_sessions)
             if sessions:
                 _pool = WebshareProxyPool.__new__(WebshareProxyPool)
-                _pool._init_file_backed(sessions)
+                _pool._init_file_backed(
+                    sessions,
+                    session_file_path=session_file,
+                    max_sessions=max_sessions,
+                    recent_success_hours=float(
+                        os.getenv(
+                            "FILMOT_PROXY_HEALTH_HOURS",
+                            DEFAULT_RECENT_SUCCESS_HOURS,
+                        )
+                    ),
+                )
                 return _pool
 
         _pool = None

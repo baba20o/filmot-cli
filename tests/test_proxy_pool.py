@@ -31,11 +31,14 @@ def _make_pool(tmp_path, sessions=None) -> WebshareProxyPool:
     pool.max_sessions = 25
     pool.countries = []
     pool.request_timeout = 5
+    pool.recent_success_hours = 24
     pool.state_path = tmp_path / "webshare_pool.json"
     pool._lock = threading.Lock()
     pool._sessions = list(sessions or [])
     pool._last_refresh = time.time()  # not stale
     pool._cursor = 0
+    pool._file_backed = False
+    pool._session_file_path = None
     return pool
 
 
@@ -205,6 +208,7 @@ class TestReportOutcome:
         assert s.success == 1
         assert s.consecutive_failures == 0
         assert s.cooldown_until == 0.0
+        assert s.last_success_at > 0
 
     def test_rate_limited_short_cooldown(self, tmp_path):
         s = WebshareSession(id="b-US-1", username="u", password="p")
@@ -212,6 +216,8 @@ class TestReportOutcome:
         before = time.time()
         pool.report_failure(s, "rate_limited", summary="429")
         assert s.fail_429 == 1
+        assert s.last_failure_at >= before
+        assert s.last_failure_kind == "rate_limited"
         assert pp_mod.COOLDOWN_RATE_LIMITED - 5 < (s.cooldown_until - before) < pp_mod.COOLDOWN_RATE_LIMITED + 5
 
     def test_blocked_long_cooldown(self, tmp_path):
@@ -239,10 +245,52 @@ class TestStatusSnapshot:
         ])
         snap = pool.status_snapshot()
         assert snap["total"] == 1
-        assert snap["healthy"] == 1
+        assert snap["available"] == 1
+        assert snap["healthy"] == 0
+        assert snap["recently_healthy"] == 0
+        assert snap["untested"] == 1
         assert snap["gateway"] == "p.webshare.io:80"
         assert snap["sessions"][0]["id"] == "b-US-1"
         assert snap["sessions"][0]["available"] is True
+        assert snap["sessions"][0]["state"] == "ready-untested"
+
+    def test_availability_is_not_health(self, tmp_path):
+        session = WebshareSession(id="b-US-1", username="u", password="p")
+        pool = _make_pool(tmp_path, sessions=[session])
+
+        assert pool.available_count() == 1
+        assert pool.recently_healthy_count() == 0
+
+        pool.report_success(session)
+        assert pool.available_count() == 1
+        assert pool.recently_healthy_count() == 1
+        assert pool.status_snapshot()["sessions"][0]["state"] == "ready-tested"
+
+    def test_expired_success_is_available_but_stale(self, tmp_path):
+        session = WebshareSession(
+            id="b-US-1",
+            username="u",
+            password="p",
+            success=1,
+            last_success_at=time.time() - (25 * 3600),
+        )
+        pool = _make_pool(tmp_path, sessions=[session])
+
+        snap = pool.status_snapshot()
+        assert snap["available"] == 1
+        assert snap["recently_healthy"] == 0
+        assert snap["sessions"][0]["state"] == "ready-stale"
+
+    def test_cooling_and_failing_are_reported_separately(self, tmp_path):
+        session = WebshareSession(id="b-US-1", username="u", password="p")
+        pool = _make_pool(tmp_path, sessions=[session])
+        pool.report_failure(session, "connection", summary="timed out")
+
+        snap = pool.status_snapshot()
+        assert snap["available"] == 0
+        assert snap["cooling"] == 1
+        assert snap["failing"] == 1
+        assert snap["sessions"][0]["state"] == "cooldown"
 
 
 # ── module-level get_pool ─────────────────────────────────────────
@@ -283,8 +331,97 @@ class TestGetPool:
         a = pool.pick()
         b = pool.pick()
         assert a is not None and b is not None and a.id != b.id
-        # refresh is a no-op (must never hit the API)
+        # refresh performs a local reload and must never hit the API
         assert pool.refresh() == 5
+        reset_pool()
+
+    def test_file_backed_reload_replaces_rows_and_preserves_health(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("WEBSHARE_API_TOKEN", raising=False)
+        session_file = tmp_path / "sessions.txt"
+        session_file.write_text(
+            "old.gateway.test:9000:user-1:old-pass\n"
+            "old.gateway.test:9000:user-2:pass-2\n"
+        )
+        monkeypatch.setenv("WEBSHARE_SESSION_FILE", str(session_file))
+        monkeypatch.setenv("FILMOT_PROXY_MAX_SESSIONS", "10")
+        monkeypatch.chdir(tmp_path)
+        reset_pool()
+        pool = get_pool()
+        first = next(s for s in pool._sessions if s.id == "user-1")
+        pool.report_success(first)
+
+        session_file.write_text(
+            "new.gateway.test:9100:user-1:new-pass\n"
+            "new.gateway.test:9100:user-3:pass-3\n"
+        )
+        assert pool.reload_file() == 2
+
+        assert {s.id for s in pool._sessions} == {"user-1", "user-3"}
+        kept = next(s for s in pool._sessions if s.id == "user-1")
+        assert kept.success == 1
+        assert kept.password == "new-pass"
+        assert kept.proxy_host == "new.gateway.test"
+        assert kept.proxy_port == 9100
+        assert pool.proxy_url(kept) == (
+            "http://user-1:new-pass@new.gateway.test:9100"
+        )
+        snap = pool.status_snapshot()
+        assert snap["source"] == "session-file"
+        assert snap["session_file"] == str(session_file)
+        reset_pool()
+
+    def test_file_backed_reload_failure_preserves_existing_pool(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("WEBSHARE_API_TOKEN", raising=False)
+        session_file = tmp_path / "sessions.txt"
+        session_file.write_text("proxy.test:80:user-1:pass-1\n")
+        monkeypatch.setenv("WEBSHARE_SESSION_FILE", str(session_file))
+        monkeypatch.chdir(tmp_path)
+        reset_pool()
+        pool = get_pool()
+        session_file.write_text("malformed\n")
+
+        with pytest.raises(WebshareProxyError, match="no valid"):
+            pool.refresh(force=True)
+        assert [s.id for s in pool._sessions] == ["user-1"]
+        reset_pool()
+
+    def test_file_backed_reload_keeps_configured_capacity(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("WEBSHARE_API_TOKEN", raising=False)
+        session_file = tmp_path / "sessions.txt"
+        session_file.write_text("proxy.test:80:user-1:pass-1\n")
+        monkeypatch.setenv("WEBSHARE_SESSION_FILE", str(session_file))
+        monkeypatch.setenv("FILMOT_PROXY_MAX_SESSIONS", "3")
+        monkeypatch.chdir(tmp_path)
+        reset_pool()
+        pool = get_pool()
+        assert pool.max_sessions == 3
+
+        session_file.write_text(
+            "\n".join(
+                f"proxy.test:80:user-{index}:pass-{index}"
+                for index in range(1, 6)
+            )
+        )
+        assert pool.reload_file() == 3
+        reset_pool()
+
+    def test_file_backed_full_refresh_is_rejected(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("WEBSHARE_API_TOKEN", raising=False)
+        session_file = tmp_path / "sessions.txt"
+        session_file.write_text("proxy.test:80:user-1:pass-1\n")
+        monkeypatch.setenv("WEBSHARE_SESSION_FILE", str(session_file))
+        monkeypatch.chdir(tmp_path)
+        reset_pool()
+        pool = get_pool()
+
+        with pytest.raises(WebshareProxyError, match="file-backed"):
+            pool.request_full_refresh()
         reset_pool()
 
 
