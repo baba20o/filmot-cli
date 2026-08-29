@@ -182,7 +182,14 @@ def migrate_legacy_session(
             if not isinstance(event, dict):
                 remaining_lines.append(line)
                 continue
-            event = normalize_event_dict(event)
+            try:
+                event = normalize_event_dict(event)
+            except ValueError:
+                # Leave lines the current schema cannot validate where they
+                # are. One bad legacy record must not block every future
+                # ledger write for this topic.
+                remaining_lines.append(line)
+                continue
             if _event_matches_topic(event, topic_slug):
                 matching.append(event)
             else:

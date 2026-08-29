@@ -9,6 +9,7 @@ from typing import Optional
 import click
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from ..api_contract import FilmotAPIContractError
 from ..api import FilmotClient
 from ..cli_support import (
     command_error as _command_error,
@@ -1401,6 +1402,21 @@ def research(
                         continue
                     seen_hashes.add(digest)
 
+                if not full_text.strip():
+                    checkpoint(
+                        "download_item",
+                        status="skipped",
+                        video_id=video_id,
+                        reason="empty_transcript",
+                        stage=source,
+                        signals=selection,
+                    )
+                    console.print(
+                        f"  [{index}/{selected_count}] [yellow]Skip[/yellow] "
+                        f"{title_text[:60]} [dim]- empty transcript[/dim]"
+                    )
+                    continue
+
                 metadata = {
                     "title": title_text,
                     "channel": channel_name,
@@ -1726,6 +1742,18 @@ def research(
                             )
                             continue
                         full_text = transcript_result.get("full_text", "")
+                        if not full_text.strip():
+                            checkpoint(
+                                "probe_download",
+                                status="skipped",
+                                video_id=video_id,
+                                reason="empty_transcript",
+                            )
+                            console.print(
+                                f"  [yellow]Skip[/yellow] {title_text[:60]} "
+                                f"[dim]- empty transcript[/dim]"
+                            )
+                            continue
                         library.save(
                             video_id=video_id,
                             topic=normalized_topic,
@@ -1849,6 +1877,8 @@ def research(
     except click.ClickException as error:
         run_error = str(error)
         raise
+    except FilmotAPIContractError as error:
+        run_error = f"Invalid Filmot API response: {error}"
     except ValueError as error:
         run_error = f"Configuration error: {error}"
         _command_error(run_error)

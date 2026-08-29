@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import time
 import unicodedata
 import uuid
 from pathlib import Path
@@ -178,6 +179,25 @@ def _legacy_normalize_topic(name: str, fallback: str = "uncategorized") -> str:
     normalized = re.sub(r"[^a-z0-9\-]", "", normalized)
     normalized = re.sub(r"-+", "-", normalized).strip("-")
     return normalized or fallback
+
+
+def _replace_with_retry(source: Path, destination: Path, attempts: int = 6) -> None:
+    """``os.replace`` with a short retry for Windows sharing violations.
+
+    On Windows ``os.replace`` raises ``PermissionError`` while another process
+    holds the destination open for reading. The previous in-place write
+    succeeded in that situation, so retry briefly before surfacing the error.
+    """
+    delay = 0.05
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
 
 
 class TranscriptLibrary:
@@ -509,7 +529,7 @@ class TranscriptLibrary:
         
         temporary = _write_json_temporary(file_path, data)
         try:
-            os.replace(temporary, file_path)
+            _replace_with_retry(temporary, file_path)
         finally:
             if temporary.exists():
                 try:

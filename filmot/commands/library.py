@@ -470,7 +470,10 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
 
     # Structured output defaults to a file instead of dumping large markdown.
     if fmt == "structured" and not output:
-        output = f"{topic}-context.md"
+        from ..library import normalize_topic_name
+        # Build the default filename from the normalized topic so path
+        # separators or OS-invalid characters in TOPIC never become a path.
+        output = f"{normalize_topic_name(topic)}-context.md"
 
     if output:
         try:

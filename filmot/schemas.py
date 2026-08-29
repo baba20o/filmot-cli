@@ -513,6 +513,14 @@ def normalize_event_dict(payload: Mapping[str, Any]) -> Dict[str, Any]:
     appends always use ``filmot.event/v1``.
     """
     if payload.get("schema") == EVENT_SCHEMA:
+        # The documented v1 envelope allowed these fields to be omitted.
+        # Restore the defaults before strict validation so historical files
+        # stay readable instead of silently dropping out of replay.
+        payload = dict(payload)
+        payload.setdefault("errors", [])
+        payload.setdefault("warnings", [])
+        payload.setdefault("command", str(payload.get("kind") or "unknown"))
+        payload.setdefault("status", ResultStatus.COMPLETED.value)
         required_text = ("ts", "kind", "command")
         for field_name in required_text:
             if not isinstance(payload.get(field_name), str) or not payload[field_name]:

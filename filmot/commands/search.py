@@ -1270,6 +1270,14 @@ def _bulk_download_transcripts(
                     continue
                 seen_hashes.add(text_hash)
 
+            if not full_text.strip():
+                log_event(
+                    "transcript_save", topic=topic, video_id=video_id,
+                    status="skipped", reason="empty_transcript", source="bulk_download",
+                )
+                console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {video_id} - empty transcript")
+                continue
+
             # Save to library
             metadata = {
                 "title": title,
