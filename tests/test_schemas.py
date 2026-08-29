@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import pytest
 
 from filmot.schemas import (
+    CLAIM_SCHEMA,
+    ECHO_ANALYSIS_SCHEMA,
     EVENT_SCHEMA,
     RESULT_SCHEMA,
     CommandResult,
@@ -106,3 +108,65 @@ def test_legacy_event_normalizes_without_rewriting_source():
 def test_unknown_status_is_rejected_at_schema_boundary():
     with pytest.raises(ValueError, match="Unsupported result status"):
         CommandResult(command="x", status="maybe", data={})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"status": "bogus"},
+        {"command": ""},
+        {"data": []},
+        {"errors": ["not-an-error-object"]},
+        {"errors": [{}]},
+        {"errors": [{"type": "Failure", "message": "bad", "stage": 4}]},
+        {"errors": [{"type": "Failure", "message": "bad", "details": []}]},
+        {"warnings": [1]},
+    ],
+)
+def test_invalid_v1_event_envelope_is_rejected(override):
+    event = {
+        "schema": EVENT_SCHEMA,
+        "ts": "2026-01-01T00:00:00",
+        "kind": "search",
+        "command": "search",
+        "status": "completed",
+        "data": {},
+        "errors": [],
+        "warnings": [],
+    }
+    event.update(override)
+
+    with pytest.raises(ValueError):
+        normalize_event_dict(event)
+
+
+def test_declared_future_event_schema_is_not_treated_as_legacy():
+    with pytest.raises(ValueError, match="Unsupported event schema"):
+        normalize_event_dict({
+            "schema": "filmot.event/v2",
+            "ts": "2026-01-01T00:00:00",
+            "kind": "search",
+        })
+
+
+def test_claim_and_echo_payloads_remain_json_safe():
+    result = CommandResult.completed(
+        "claims-show",
+        {
+            "claim_schema": CLAIM_SCHEMA,
+            "rows": [{
+                "claim_id": "c-one",
+                "text": "薬剤 X は改善した",
+                "evidence": [{
+                    "relation": "supports",
+                    "start_seconds": 12.5,
+                }],
+            }],
+            "echo_schema": ECHO_ANALYSIS_SCHEMA,
+        },
+    )
+
+    payload = result.to_raw_dict()
+    assert payload["claim_schema"] == "filmot.claim/v2"
+    assert payload["echo_schema"] == "filmot.echo-analysis/v1"
+    assert payload["rows"][0]["text"] == "薬剤 X は改善した"

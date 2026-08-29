@@ -367,6 +367,43 @@ class TestMetadataRawContracts:
 
     @patch("filmot.ledger.log_result")
     @patch("filmot.commands.search.FilmotClient")
+    def test_video_raw_unwraps_contract_result_list(
+        self, mock_client_type, mock_log, runner
+    ):
+        client = mock_client_type.return_value
+        client.last_cache_hit = False
+        client.get_videos.return_value = {
+            "result": [
+                {"id": "one", "title": "First"},
+                {"id": "two", "title": "Second"},
+            ]
+        }
+
+        result = runner.invoke(cli, ["video", "one,two", "--raw"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert [item["id"] for item in payload["videos"]] == ["one", "two"]
+        assert mock_log.call_args.kwargs["data"]["results"] == 2
+
+    @patch("filmot.ledger.log_result")
+    @patch("filmot.commands.search.FilmotClient")
+    def test_video_raw_serialization_failure_is_the_logged_outcome(
+        self, mock_client_type, mock_log, runner
+    ):
+        client = mock_client_type.return_value
+        client.last_cache_hit = False
+        client.get_videos.return_value = [{"id": "vid", "score": float("nan")}]
+
+        result = runner.invoke(cli, ["video", "vid", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["errors"][0]["stage"] == "serialize-result"
+        assert mock_log.call_args.args[1].to_raw_dict() == payload
+
+    @patch("filmot.ledger.log_result")
+    @patch("filmot.commands.search.FilmotClient")
     def test_channels_raw_uses_shared_result_contract(
         self, mock_client_type, mock_log, runner
     ):
@@ -389,6 +426,150 @@ class TestMetadataRawContracts:
 
 class TestTranscriptRawContract:
     @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.transcript.get_transcript", return_value=None)
+    def test_raw_non_object_backend_response_is_one_json_failure(
+        self, mock_get_transcript, mock_log, mock_pool, runner
+    ):
+        result = runner.invoke(cli, ["transcript", "video-id", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["errors"][0]["stage"] == "validate-response"
+        assert mock_log.call_args.kwargs["failure_stage"] == "validate-response"
+
+    @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch("filmot.ledger.log_event")
+    @patch(
+        "filmot.transcript.get_transcript",
+        return_value={"video_id": "video-id", "full_text": None, "segments": []},
+    )
+    def test_raw_malformed_mapping_response_is_one_json_failure(
+        self, mock_get_transcript, mock_log, mock_pool, runner
+    ):
+        result = runner.invoke(cli, ["transcript", "video-id", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["errors"][0]["stage"] == "validate-response"
+
+    @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch("filmot.ledger.log_event")
+    @patch(
+        "filmot.transcript.get_transcript",
+        return_value={
+            "video_id": "other-id",
+            "language": "en",
+            "full_text": "hello",
+            "segments": [],
+        },
+    )
+    def test_raw_mismatched_video_identity_is_one_json_failure(
+        self, mock_get_transcript, mock_log, mock_pool, runner
+    ):
+        result = runner.invoke(cli, ["transcript", "video-id", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["errors"][0]["stage"] == "validate-response"
+        assert "does not match" in payload["_filmot"]["errors"][0]["message"]
+
+    @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch("filmot.ledger.log_event")
+    @patch(
+        "filmot.transcript.get_transcript",
+        return_value={
+            "video_id": "video-id",
+            "full_text": "hello",
+            "segments": [],
+        },
+    )
+    def test_missing_language_fails_before_completed_log(
+        self, mock_get_transcript, mock_log, mock_pool, runner
+    ):
+        result = runner.invoke(cli, ["transcript", "video-id", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["errors"][0]["stage"] == "validate-response"
+        assert "language" in payload["_filmot"]["errors"][0]["message"]
+
+    @pytest.mark.parametrize("full_text", ["", "   \n\t"])
+    @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.transcript.get_transcript")
+    def test_empty_transcript_is_invalid_before_logging_or_side_effects(
+        self,
+        mock_get_transcript,
+        mock_log,
+        mock_pool,
+        runner,
+        full_text,
+    ):
+        mock_get_transcript.return_value = {
+            "video_id": "video-id",
+            "language": "en",
+            "full_text": full_text,
+            "segments": [],
+        }
+
+        result = runner.invoke(cli, ["transcript", "video-id", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        error = payload["_filmot"]["errors"][0]
+        assert error["stage"] == "validate-response"
+        assert "non-empty" in error["message"]
+        assert mock_log.call_args.kwargs["failure_stage"] == "validate-response"
+
+    @pytest.mark.parametrize("value", ["nan", "inf"])
+    @patch("filmot.transcript.get_transcript")
+    def test_non_finite_chunk_fails_before_fetch(
+        self, mock_get_transcript, runner, value
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "video-id", "--chunk", value, "--raw"],
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["errors"][0]["stage"] == "validate-options"
+        mock_get_transcript.assert_not_called()
+
+    @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch("filmot.ledger.log_result")
+    @patch("filmot.library.get_library")
+    @patch(
+        "filmot.transcript.get_transcript",
+        return_value={
+            "video_id": "video-id",
+            "language": "en",
+            "full_text": "hello",
+            "segments": [],
+            "score": float("nan"),
+        },
+    )
+    def test_raw_serialization_failure_logs_then_exits_before_library_save(
+        self,
+        mock_get_transcript,
+        mock_get_library,
+        mock_log_result,
+        mock_pool,
+        runner,
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "video-id", "--save-to", "science", "--raw"],
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["errors"][0]["stage"] == "serialize-result"
+        assert mock_log_result.call_args.args[1].to_raw_dict() == payload
+        mock_get_library.assert_not_called()
+
+    @patch("filmot.proxy_pool.get_pool", return_value=None)
     @patch("filmot.ledger.log_result")
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
@@ -409,10 +590,13 @@ class TestTranscriptRawContract:
         mock_get_transcript.return_value = {
             "video_id": "vid",
             "full_text": "hello",
-            "segments": [],
+            "segments": [
+                {"text": "hello", "start": 0.0, "duration": 1.0}
+            ],
             "language": "en",
             "segment_count": 1,
             "duration_seconds": 1,
+            "source": "youtube",
             "route": "direct",
             "routes_tried": ["direct"],
         }
@@ -440,8 +624,12 @@ class TestTranscriptRawContract:
         }
         assert "Saved to library" not in result.stdout
         metadata = library.save.call_args.kwargs["metadata"]
+        assert metadata["source"] == "youtube"
         assert metadata["route"] == "direct"
         assert metadata["routes_tried"] == ["direct"]
+        assert library.save.call_args.kwargs["segments"] == [
+            {"text": "hello", "start": 0.0, "duration": 1.0}
+        ]
         assert any(
             item.kwargs.get("topic") == "topic"
             for item in mock_log_event.call_args_list
@@ -451,6 +639,7 @@ class TestTranscriptRawContract:
         assert "full_text" not in mock_log_result.call_args.kwargs["data"]
 
     @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch("filmot.ledger.log_result")
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
     @patch("filmot.transcript.get_transcript")
@@ -459,6 +648,7 @@ class TestTranscriptRawContract:
         mock_get_transcript,
         mock_get_library,
         mock_log,
+        mock_log_result,
         mock_pool,
         runner,
     ):
@@ -480,6 +670,8 @@ class TestTranscriptRawContract:
         assert result.exit_code != 0
         payload = json.loads(result.stdout)
         assert "disk full" in payload["error"]
+        assert payload["_filmot"]["errors"][0]["stage"] == "save-library"
+        assert mock_log_result.call_args.args[1].to_raw_dict() == payload
         failed_save = [
             call
             for call in mock_log.call_args_list
@@ -487,6 +679,55 @@ class TestTranscriptRawContract:
             and call.kwargs.get("status") == "failed"
         ]
         assert len(failed_save) == 1
+
+    @patch("filmot.proxy_pool.get_pool", return_value=None)
+    @patch(
+        "filmot.transcript.get_transcript_with_timestamps",
+        return_value={
+            "video_id": "video-id",
+            "language": "en",
+            "full_text": "caption text",
+            "segments": [
+                {"text": "caption text", "start": 0.0, "duration": 1.0}
+            ],
+            "segment_count": 1,
+            "chunks": [
+                {
+                    "start": 0.0,
+                    "start_formatted": "0:00",
+                    "text": "chunked presentation",
+                }
+            ],
+            "chunk_minutes": 5.0,
+        },
+    )
+    def test_chunk_takes_precedence_for_human_and_plain_file_output(
+        self, mock_chunked, mock_pool, runner, tmp_path
+    ):
+        rendered = runner.invoke(
+            cli,
+            ["transcript", "video-id", "--chunk", "5", "--timestamps"],
+        )
+        destination = tmp_path / "chunked.txt"
+        written = runner.invoke(
+            cli,
+            [
+                "transcript",
+                "video-id",
+                "--chunk",
+                "5",
+                "--timestamps",
+                "--output",
+                str(destination),
+            ],
+        )
+
+        assert rendered.exit_code == 0, rendered.output
+        assert "chunked presentation" in rendered.output
+        assert written.exit_code == 0, written.output
+        assert destination.read_text(encoding="utf-8") == (
+            "[0:00] chunked presentation\n"
+        )
 
     @pytest.mark.parametrize(
         "options",
@@ -538,7 +779,10 @@ class TestBulkDownloadContracts:
             "video_id": "video-id",
             "language": "ja",
             "full_text": "日本語の文字起こし",
-            "segments": [],
+            "segments": [
+                {"text": "日本語", "start": 3.0, "duration": 2.0}
+            ],
+            "source": "youtube",
             "route": "direct",
         }
 
@@ -558,6 +802,10 @@ class TestBulkDownloadContracts:
         assert mock_transcript.call_args.kwargs["languages"] == ["ja"]
         assert mock_transcript.call_args.kwargs["fresh_primary"] is True
         assert library.save.call_args.kwargs["topic"] == "japanese"
+        assert library.save.call_args.kwargs["segments"] == [
+            {"text": "日本語", "start": 3.0, "duration": 2.0}
+        ]
+        assert library.save.call_args.kwargs["metadata"]["source"] == "youtube"
 
 
 class TestSearchAllLedger:
@@ -801,6 +1049,57 @@ class TestResearchSafetyAndLedger:
         assert "Scout relevance gate: 1 -> 0" in result.output
         mock_transcript.assert_not_called()
 
+    @patch("filmot.youtube_search.search_recent")
+    @patch("filmot.youtube_search.validate_youtube_api")
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_saved_scout_preserves_available_source_metadata(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_transcript,
+        mock_validate,
+        mock_search_recent,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        mock_client_type.return_value.search_subtitles_all.return_value = {
+            "result": [],
+            "totalresultcount": 0,
+        }
+        mock_search_recent.return_value = [{
+            "video_id": "scout-video",
+            "channel_id": "UC_SCOUT",
+            "channel_title": "Scout Channel",
+            "published_at": "2026-08-22T12:00:00Z",
+            "title": "Alpha beta field report",
+            "description": "Alpha beta evidence and analysis",
+            "views": 321,
+        }]
+        mock_transcript.return_value = {
+            "video_id": "scout-video",
+            "full_text": "alpha beta transcript",
+            "segments": [
+                {"text": "alpha beta transcript", "start": 4.0, "duration": 2.0}
+            ],
+            "source": "youtube",
+            "route": "direct",
+        }
+
+        result = runner.invoke(
+            cli,
+            ["research", "alpha beta", "--depth", "1"],
+        )
+
+        assert result.exit_code == 0, result.output
+        metadata = library.save.call_args.kwargs["metadata"]
+        assert metadata["channel_id"] == "UC_SCOUT"
+        assert metadata["published_at"] == "2026-08-22T12:00:00Z"
+        assert metadata["views"] == 321
+
     @patch("filmot.commands.research._backfill_metadata", return_value=("Title", "Channel"))
     @patch("filmot.transcript.get_transcript")
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
@@ -844,7 +1143,10 @@ class TestResearchSafetyAndLedger:
         mock_transcript.return_value = {
             "video_id": "coherent",
             "full_text": "alpha beta transcript",
-            "segments": [],
+            "segments": [
+                {"text": "alpha beta", "start": 9.0, "duration": 2.0}
+            ],
+            "source": "youtube",
             "route": "direct",
         }
 
@@ -863,6 +1165,11 @@ class TestResearchSafetyAndLedger:
         assert "relationship-evidence gate: 2 -> 1" in result.output
         assert mock_transcript.call_count == 1
         assert mock_transcript.call_args.args[0] == "coherent"
+        library = mock_get_library.return_value
+        assert library.save.call_args.kwargs["segments"] == [
+            {"text": "alpha beta", "start": 9.0, "duration": 2.0}
+        ]
+        assert library.save.call_args.kwargs["metadata"]["source"] == "youtube"
 
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
@@ -1504,7 +1811,7 @@ class TestLibraryTopicMigration:
 
         library = TranscriptLibrary(str(tmp_path / ".filmot_data"))
         legacy_dir = library.transcripts_dir / "uncategorized"
-        legacy_dir.mkdir()
+        legacy_dir.mkdir(parents=True)
         legacy_path = legacy_dir / "legacy-video.json"
         legacy_path.write_text(
             json.dumps({
@@ -1573,6 +1880,46 @@ class TestSessionsRawContract:
             "warnings": [],
         }
 
+    @patch("filmot.ledger.read_events")
+    def test_named_session_raw_summary_is_derived_without_replay_body(
+        self, mock_read_events, runner
+    ):
+        mock_read_events.return_value = [{
+            "ts": "2026-01-01T00:00:00",
+            "kind": "search",
+            "status": "completed",
+            "data": {
+                "query": "alpha",
+                "api_total": 24,
+                "page_count": 20,
+                "post_filter_count": 15,
+            },
+        }]
+
+        result = runner.invoke(
+            cli,
+            ["sessions", "topic", "--summary", "--raw"],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert "events" not in payload
+        assert payload["summary"]["searches"]["scope_rows"][0] == {
+            "ts": "2026-01-01T00:00:00",
+            "status": "completed",
+            "query": "alpha",
+            "api_total": 24,
+            "candidates_fetched": 20,
+            "post_filter_count": 15,
+            "partial": False,
+        }
+
+    def test_summary_requires_session_name(self, runner):
+        result = runner.invoke(cli, ["sessions", "--summary"])
+
+        assert result.exit_code == 2
+        assert "requires a session NAME" in result.output
+
     @patch("filmot.ledger.list_sessions", return_value=[])
     def test_empty_session_inventory_raw_is_empty_versioned_result(
         self, mock_list_sessions, runner
@@ -1584,6 +1931,164 @@ class TestSessionsRawContract:
         assert payload["rows"] == []
         assert payload["_filmot"]["status"] == "empty"
 
+    def test_summary_surfaces_malformed_ledger_line_as_partial(
+        self,
+        runner,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        sessions_dir = tmp_path / ".filmot_data" / "sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "topic.jsonl").write_text(
+            json.dumps({
+                "ts": "2026-01-01T00:00:00",
+                "kind": "search",
+                "status": "completed",
+                "query": "alpha",
+                "results": 1,
+            })
+            + "\n{not-json\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli,
+            ["sessions", "topic", "--summary", "--raw"],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["status"] == "partial"
+        assert payload["_filmot"]["errors"][0]["stage"] == "read-session"
+        assert payload["_filmot"]["errors"][0]["details"]["line"] == 2
+        assert payload["summary"]["event_count"] == 1
+        assert payload["summary"]["read_diagnostics"] == 1
+
+    @pytest.mark.parametrize(
+        "invalid_line",
+        [
+            '{"schema":"filmot.event/v1","data":{"score":NaN}}',
+            (
+                '{"schema":"filmot.event/v1","ts":"2026-01-01",'
+                '"kind":"search","command":"search","status":"bogus",'
+                '"data":{},"errors":[],"warnings":[]}'
+            ),
+        ],
+    )
+    def test_session_rejects_non_json_or_invalid_v1_event(
+        self,
+        runner,
+        tmp_path,
+        monkeypatch,
+        invalid_line,
+    ):
+        monkeypatch.chdir(tmp_path)
+        sessions_dir = tmp_path / ".filmot_data" / "sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "topic.jsonl").write_text(
+            invalid_line + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["sessions", "topic", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["status"] == "failed"
+        assert payload["_filmot"]["errors"][0]["stage"] == "read-session"
+        json.dumps(payload, allow_nan=False)
+
+    def test_unreadable_only_session_is_failed_not_empty(
+        self,
+        runner,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        sessions_dir = tmp_path / ".filmot_data" / "sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "topic.jsonl").write_text(
+            "{not-json\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli,
+            ["sessions", "topic", "--summary", "--raw"],
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["status"] == "failed"
+        assert payload["summary"]["event_count"] == 0
+        assert payload["summary"]["read_diagnostics"] == 1
+
+    def test_inventory_does_not_hide_corrupt_session_file(
+        self,
+        runner,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        sessions_dir = tmp_path / ".filmot_data" / "sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "broken.jsonl").write_text(
+            "{not-json\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["sessions", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["rows"] == []
+        assert payload["_filmot"]["status"] == "failed"
+        assert payload["_filmot"]["errors"][0]["details"]["line"] == 1
+
+    @pytest.mark.parametrize(
+        ("arguments", "target"),
+        [
+            (["sessions", "--raw"], "filmot.ledger.list_sessions"),
+            (["sessions", "topic", "--raw"], "filmot.ledger.read_events"),
+        ],
+    )
+    def test_session_runtime_read_failure_is_one_raw_result(
+        self,
+        runner,
+        arguments,
+        target,
+    ):
+        with patch(target, side_effect=OSError("synthetic read failure")):
+            result = runner.invoke(cli, arguments)
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["status"] == "failed"
+        assert payload["_filmot"]["errors"][0]["message"] == (
+            "synthetic read failure"
+        )
+
+    def test_session_storage_file_is_reported_as_failed_topology(
+        self,
+        runner,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        data_dir = tmp_path / ".filmot_data"
+        data_dir.mkdir()
+        (data_dir / "sessions").write_text("not a directory", encoding="utf-8")
+
+        result = runner.invoke(cli, ["sessions", "--raw"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["status"] == "failed"
+        assert payload["_filmot"]["errors"][0]["type"] == (
+            "InvalidSessionStorage"
+        )
+
 
 class TestMainModule:
     """Test python -m filmot entry point."""
@@ -1592,6 +2097,41 @@ class TestMainModule:
         """The __main__ module can be imported without executing main()."""
         from filmot import __main__
         assert hasattr(__main__, 'main')
+
+    def test_script_entrypoint_propagates_click_usage_exit_code(self):
+        repository = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [sys.executable, "main.py", "transcript"],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 2
+        assert "Missing argument" in result.stderr
+
+    def test_script_entrypoint_propagates_raw_operational_exit_code(self):
+        repository = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [
+                sys.executable,
+                "main.py",
+                "claims",
+                "cite",
+                "science",
+                "c-missing",
+                "--relation",
+                "supports",
+                "--raw",
+            ],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 1
+        payload = json.loads(result.stdout)
+        assert payload["_filmot"]["status"] == "failed"
 
     @pytest.mark.skipif(
         os.name == "nt",

@@ -1,5 +1,6 @@
 """Typed result, ledger, and renderer contracts for library commands."""
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9,7 +10,13 @@ from click.testing import CliRunner
 from filmot.cli import cli
 
 
-def _invoke_with_contract(library, arguments, renderer):
+def _invoke_with_contract(
+    library,
+    arguments,
+    renderer,
+    *,
+    expect_log=True,
+):
     with (
         patch("filmot.library.get_library", return_value=library),
         patch("filmot.ledger.log_result") as log_result,
@@ -18,12 +25,18 @@ def _invoke_with_contract(library, arguments, renderer):
         ) as render,
     ):
         result = CliRunner().invoke(cli, arguments)
-    outcome = log_result.call_args.args[1]
+    if expect_log:
+        outcome = log_result.call_args.args[1]
+        compact = log_result.call_args.kwargs["data"]
+    else:
+        assert not log_result.called
+        outcome = render.call_args.args[0]
+        compact = None
     assert render.call_args.args[0] is outcome
-    return result, outcome, log_result.call_args.kwargs["data"]
+    return result, outcome, compact
 
 
-def test_library_search_logs_and_renders_one_typed_outcome():
+def test_library_search_is_read_only_and_renders_one_typed_outcome():
     library = MagicMock()
     library.search.return_value = [{
         "video_id": "video-id",
@@ -38,6 +51,7 @@ def test_library_search_logs_and_renders_one_typed_outcome():
         library,
         ["library", "search", "alpha", "--topic", "science"],
         "_render_library_search",
+        expect_log=False,
     )
 
     assert result.exit_code == 0, result.output
@@ -45,16 +59,10 @@ def test_library_search_logs_and_renders_one_typed_outcome():
     assert outcome.status_value == "completed"
     assert outcome.data["rows"][0]["video_id"] == "video-id"
     assert outcome.data["summary"]["matches"] == 2
-    assert compact == {
-        "query": "alpha",
-        "substring": False,
-        "sources": 1,
-        "matches": 2,
-    }
-    assert "rows" not in compact
+    assert compact is None
 
 
-def test_library_context_ledger_projection_omits_context_body():
+def test_library_context_stdout_is_read_only():
     library = MagicMock()
     library.get_context.return_value = "full context body"
 
@@ -62,16 +70,14 @@ def test_library_context_ledger_projection_omits_context_body():
         library,
         ["library", "context", "science"],
         "_render_library_context",
+        expect_log=False,
     )
 
     assert result.exit_code == 0, result.output
     assert outcome.command == "library-context"
     assert outcome.data["rows"] == [{"content": "full context body"}]
     assert outcome.data["summary"]["delivery"] == "rendered"
-    assert compact["chars"] == len("full context body")
-    assert compact["delivery"] == "rendered"
-    assert "rows" not in compact
-    assert "content" not in compact
+    assert compact is None
 
 
 @pytest.mark.parametrize(
@@ -109,19 +115,24 @@ def test_library_stats_and_delete_share_outcome_with_renderer(
     library = MagicMock()
     getattr(library, method).return_value = return_value
 
+    is_mutation = method == "delete"
     result, outcome, compact = _invoke_with_contract(
         library,
         arguments,
         renderer,
+        expect_log=is_mutation,
     )
 
     assert result.exit_code == 0, result.output
     assert outcome.command == command
     assert outcome.status_value == "completed"
-    assert "rows" not in compact
+    if is_mutation:
+        assert "rows" not in compact
+    else:
+        assert compact is None
 
 
-def test_library_compare_precomputes_renderer_rows_but_logs_counts_only():
+def test_library_compare_precomputes_rows_without_logging():
     library = MagicMock()
     library.search.return_value = [{
         "video_id": "video-id",
@@ -135,7 +146,14 @@ def test_library_compare_precomputes_renderer_rows_but_logs_counts_only():
         "metadata": {"duration_seconds": 120},
         "transcript": "alpha and alpha",
     }
-    library._find_matches.return_value = ["alpha and alpha"]
+    library._find_match_details.return_value = [{
+        "excerpt": "alpha and alpha",
+        "start_char": 0,
+        "end_char": 5,
+        "start_seconds": None,
+        "timestamp": None,
+        "url": "https://youtube.com/watch?v=video-id",
+    }]
 
     result, outcome, compact = _invoke_with_contract(
         library,
@@ -149,6 +167,7 @@ def test_library_compare_precomputes_renderer_rows_but_logs_counts_only():
             "density",
         ],
         "_render_library_compare",
+        expect_log=False,
     )
 
     assert result.exit_code == 0, result.output
@@ -156,15 +175,223 @@ def test_library_compare_precomputes_renderer_rows_but_logs_counts_only():
     assert outcome.status_value == "completed"
     assert outcome.data["rows"][0]["density"] == 1.0
     assert outcome.data["rows"][0]["excerpts"] == ["alpha and alpha"]
-    assert compact["sources"] == 1
-    assert compact["matches"] == 2
-    assert "rows" not in compact
-    assert "excerpts" not in compact
+    assert outcome.data["rows"][0]["excerpt_details"][0]["url"].endswith(
+        "video-id"
+    )
+    assert compact is None
+
+
+@pytest.mark.parametrize(
+    ("arguments", "method", "return_value", "expected_command"),
+    [
+        (
+            ["library", "list", "science", "--raw"],
+            "list_transcripts",
+            [{"video_id": "video-id", "title": "Source"}],
+            "library-list",
+        ),
+        (
+            ["library", "search", "alpha", "--topic", "science", "--raw"],
+            "search",
+            [{
+                "video_id": "video-id",
+                "topic": "science",
+                "match_count": 1,
+                "matches": ["alpha"],
+                "match_details": [],
+            }],
+            "library-search",
+        ),
+    ],
+)
+def test_library_inspection_raw_is_one_result_and_does_not_log(
+    arguments,
+    method,
+    return_value,
+    expected_command,
+):
+    library = MagicMock()
+    getattr(library, method).return_value = return_value
+    with (
+        patch("filmot.library.get_library", return_value=library),
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["command"] == expected_command
+    assert payload["rows"]
+    log_result.assert_not_called()
+
+
+def test_library_compare_raw_includes_timestamp_locator_and_does_not_log():
+    library = MagicMock()
+    library.search.return_value = [{
+        "video_id": "video-id",
+        "topic": "science",
+        "title": "A source",
+        "channel": "Primary Lab",
+        "match_count": 1,
+    }]
+    library.get.return_value = {
+        "metadata": {"duration_seconds": 120},
+        "transcript": "before alpha after",
+        "segments": [{"text": "before alpha after", "start": 42}],
+    }
+    library._find_match_details.return_value = [{
+        "excerpt": "before alpha after",
+        "start_char": 7,
+        "end_char": 12,
+        "start_seconds": 42.0,
+        "timestamp": "0:42",
+        "url": "https://youtube.com/watch?v=video-id&t=42s",
+    }]
+    with (
+        patch("filmot.library.get_library", return_value=library),
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["library", "compare", "alpha", "--topic", "science", "--raw"],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    detail = payload["rows"][0]["excerpt_details"][0]
+    assert detail["start_seconds"] == 42.0
+    assert detail["url"].endswith("&t=42s")
+    log_result.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["library", "search", "alpha", "--raw"],
+        ["library", "compare", "alpha", "--raw"],
+    ],
+)
+def test_library_raw_inspection_never_starts_terminal_status(arguments):
+    library = MagicMock()
+    library.search.return_value = []
+    with (
+        patch("filmot.library.get_library", return_value=library),
+        patch("filmot.commands.library.console.status") as status,
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    json.loads(result.stdout)
+    status.assert_not_called()
+    log_result.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["library", "search", "alpha", "--raw"],
+        ["library", "compare", "alpha", "--raw"],
+    ],
+)
+def test_library_raw_open_failure_is_one_structured_result(arguments):
+    with patch(
+        "filmot.library.get_library",
+        side_effect=OSError("cannot open library"),
+    ):
+        result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["status"] == "failed"
+    assert payload["_filmot"]["errors"][0]["message"] == "cannot open library"
+    assert payload["_filmot"]["errors"][0]["stage"] == "open-library"
+
+
+def test_library_list_raw_failure_is_one_structured_result():
+    library = MagicMock()
+    library.list_transcripts.side_effect = OSError("synthetic disk failure")
+    with (
+        patch("filmot.library.get_library", return_value=library),
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["library", "list", "science", "--raw"],
+        )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["command"] == "library-list"
+    assert payload["_filmot"]["status"] == "failed"
+    assert payload["_filmot"]["errors"][0]["stage"] == "list"
+    assert payload["rows"] == []
+    log_result.assert_not_called()
+
+
+def test_library_raw_serializer_rejects_non_finite_values():
+    library = MagicMock()
+    library.list_transcripts.return_value = [{
+        "video_id": "video-id",
+        "score": float("nan"),
+    }]
+    with patch("filmot.library.get_library", return_value=library):
+        result = CliRunner().invoke(
+            cli,
+            ["library", "list", "science", "--raw"],
+        )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["status"] == "failed"
+    assert payload["_filmot"]["errors"][0]["stage"] == "serialize-result"
+    assert payload["_filmot"]["errors"][0]["type"] == "InvalidJSONValue"
+    json.dumps(payload, allow_nan=False)
+
+
+def test_library_raw_escapes_unpaired_surrogates_safely():
+    library = MagicMock()
+    library.list_transcripts.return_value = [{
+        "video_id": "video-id",
+        "title": "\ud800",
+    }]
+    with patch("filmot.library.get_library", return_value=library):
+        result = CliRunner().invoke(
+            cli,
+            ["library", "list", "science", "--raw"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "\\ud800" in result.stdout
+    assert json.loads(result.stdout)["rows"][0]["title"] == "\ud800"
+
+
+@pytest.mark.parametrize("malformed", [None, [{}]])
+def test_library_search_malformed_rows_are_one_typed_raw_failure(malformed):
+    library = MagicMock()
+    library.search.return_value = malformed
+    with patch("filmot.library.get_library", return_value=library):
+        result = CliRunner().invoke(
+            cli,
+            ["library", "search", "alpha", "--substring", "--raw"],
+        )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["status"] == "failed"
+    assert payload["_filmot"]["errors"][0]["stage"] == "build-result"
+    assert payload["rows"] == []
 
 
 @pytest.mark.parametrize(
     ("arguments", "method", "renderer", "stage"),
     [
+        (
+            ["library", "list", "science"],
+            "list_transcripts",
+            "_render_library_list",
+            "list",
+        ),
         (
             ["library", "search", "alpha"],
             "search",
@@ -206,10 +433,12 @@ def test_library_operation_failures_are_structured_and_nonzero(
     library = MagicMock()
     getattr(library, method).side_effect = OSError("synthetic disk failure")
 
+    is_mutation = method == "delete"
     result, outcome, compact = _invoke_with_contract(
         library,
         arguments,
         renderer,
+        expect_log=is_mutation,
     )
 
     assert result.exit_code == 1
@@ -217,7 +446,10 @@ def test_library_operation_failures_are_structured_and_nonzero(
     assert outcome.errors[0].type == "OSError"
     assert outcome.errors[0].message == "synthetic disk failure"
     assert outcome.errors[0].stage == stage
-    assert "rows" not in compact
+    if is_mutation:
+        assert "rows" not in compact
+    else:
+        assert compact is None
 
 
 def test_library_context_write_failure_has_structured_error():

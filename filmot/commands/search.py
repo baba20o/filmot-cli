@@ -16,10 +16,13 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from ..api import FilmotClient
+from ..api_contract import FilmotAPIContractError, validate_api_response
 from ..cli_support import (
     command_error as _command_error,
     console,
     diagnostic as _diagnostic,
+    emit_raw_result as _emit_raw_result,
+    prepare_raw_result as _prepare_raw_result,
     route_progress_for as _route_progress_for,
     silence_broken_pipe_streams as _silence_broken_pipe_streams,
     status_context as _search_status,
@@ -84,6 +87,11 @@ def _result_videos(results: dict) -> list:
 
 def _channel_candidates(payload: object) -> list:
     """Normalize the Filmot channel-search response to candidate dictionaries."""
+    # The low-level client validates network and cache responses, but this
+    # command boundary deliberately validates again.  That keeps mocked,
+    # injected, or future alternate clients from turning malformed data into a
+    # legitimate-looking empty result.
+    validate_api_response("/getsearchchannels", payload)
     if isinstance(payload, list):
         return payload
     if not isinstance(payload, dict):
@@ -218,6 +226,34 @@ def _low_result_query_hint(query: str, count: int) -> Optional[str]:
     )
 
 
+def _parse_bulk_download_spec(spec: str) -> tuple[str, int]:
+    """Return the library topic and bounded count from ``TOPIC[:N]``."""
+    if ":" in spec:
+        topic, count_str = spec.rsplit(":", 1)
+        try:
+            max_count = int(count_str)
+        except ValueError:
+            topic = spec
+            max_count = 10
+    else:
+        topic = spec
+        max_count = 10
+    return topic, max(0, max_count)
+
+
+def _resolve_search_session(
+    session: Optional[str],
+    bulk_download: Optional[str],
+) -> Optional[str]:
+    """Prefer an explicit/environment session, then the bulk-download topic."""
+    if session:
+        return session
+    if bulk_download:
+        topic, _ = _parse_bulk_download_spec(bulk_download)
+        return topic or None
+    return None
+
+
 @click.command()
 @click.argument("query")
 @click.option("--lang", "-l", default=None, help="Language code (e.g., en, nl, fr, de)")
@@ -260,6 +296,16 @@ def _low_result_query_hint(query: str, count: int) -> Optional[str]:
               help="Maximum hit details to display per video")
 @click.option("--context", "context_chars", default=50, type=click.IntRange(0), help="Characters of context per side in snippets (raise for fuller quotes)")
 @click.option("--bulk-download", default=None, help="Download top N transcripts to TOPIC (e.g., --bulk-download prompt-injection:10)")
+@click.option(
+    "--session",
+    default=None,
+    envvar="FILMOT_SESSION",
+    show_envvar=True,
+    help=(
+        "Route this search event to a named session; overrides FILMOT_SESSION "
+        "and the inferred --bulk-download topic"
+    ),
+)
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback during bulk download when captions unavailable")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts during bulk download")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy during bulk download, connect directly")
@@ -271,7 +317,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
            max_query_time: int, hit_format: str, full: bool, raw: bool, min_matches: int,
            limit: int, max_hits: int, context_chars: int, bulk_download: str,
-           fallback: bool, dedupe: bool, no_proxy: bool):
+           session: str, fallback: bool, dedupe: bool, no_proxy: bool):
     """Search for videos by subtitle/transcript content.
 
     Unquoted words use loose transcript-wide implicit AND: each word may occur
@@ -288,8 +334,16 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
         filmot search '"AI" NEAR/20 "job loss"'      # relationship/proximity
         filmot search "recipe" --pages 3 --sort density --limit 20
         filmot search "tutorial" --channel "programming" --channel-count 5
+        filmot search "follow-up phrase" --session my-investigation
+
+    Session routing changes only the activity ledger, never search scope. The
+    precedence is --session, FILMOT_SESSION, --bulk-download TOPIC, then the
+    date-scoped ad-hoc ledger.
     """
     from ..ledger import log_event
+
+    resolved_session = _resolve_search_session(session, bulk_download)
+    search_event_logged = False
 
     if raw and bulk_download:
         raise click.UsageError("--raw and --bulk-download cannot be combined")
@@ -306,6 +360,10 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
             raise click.UsageError(
                 f"minimum {label} cannot exceed maximum {label}"
             )
+    if page is not None and (pages > 1 or candidate_pool is not None):
+        raise click.UsageError(
+            "--page cannot be combined with --pages or --candidate-pool"
+        )
 
     try:
         client = FilmotClient()
@@ -316,9 +374,29 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
                 resolved_channel_ids, resolved_channels = _resolve_channel_filter(
                     client, channel, channel_count
                 )
+            except FilmotAPIContractError as error:
+                log_event(
+                    "search",
+                    topic=resolved_session,
+                    query=query,
+                    channel=channel,
+                    channel_count=channel_count,
+                    status="failed",
+                    failure_stage="invalid-response",
+                    error=str(error),
+                    raw=raw,
+                )
+                _command_error(
+                    str(error),
+                    raw=raw,
+                    payload=error.as_response() if raw else None,
+                    error_type=type(error).__name__,
+                    stage="invalid-response",
+                )
             except click.ClickException as error:
                 log_event(
                     "search",
+                    topic=resolved_session,
                     query=query,
                     channel=channel,
                     channel_count=channel_count,
@@ -352,11 +430,6 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
             hit_format=int(hit_format) if hit_format else None,
         )
 
-        if page is not None and (pages > 1 or candidate_pool is not None):
-            raise click.UsageError(
-                "--page cannot be combined with --pages or --candidate-pool"
-            )
-
         fetch_many = pages > 1 or candidate_pool is not None
         with _search_status(
             f"[bold green]Searching subtitles for '{query}'...", raw=raw
@@ -387,6 +460,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
         if "error" in results:
             log_event(
                 "search",
+                topic=resolved_session,
                 query=query,
                 lang=lang,
                 status="failed",
@@ -422,6 +496,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
                 )
                 log_event(
                     "search",
+                    topic=resolved_session,
                     query=query,
                     channel=channel,
                     channel_id=effective_channel_ids,
@@ -543,6 +618,8 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
             data=output_results,
             errors=_pagination_errors(output_results),
         )
+        if raw:
+            outcome = _prepare_raw_result(outcome)
 
         # B1/B6c: persist the same typed outcome consumed by raw and human
         # renderers before any pipe-sensitive output. The ledger stores a
@@ -552,6 +629,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
         log_result(
             "search",
             outcome,
+            topic=resolved_session,
             data={
                 "query": query,
                 "effective_query": (
@@ -604,6 +682,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
                 "max_hits": max_hits,
             },
         )
+        search_event_logged = True
 
         # Rendering can encounter EPIPE. The durable event above is already on
         # disk before any of these human diagnostics are emitted.
@@ -611,13 +690,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
             _diagnostic(message, raw=raw)
 
         if raw:
-            click.echo(
-                json_mod.dumps(
-                    outcome.to_raw_dict(),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            _emit_raw_result(outcome, indent=2)
             return
 
         if client.last_cache_hit:
@@ -653,6 +726,49 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
         if hint:
             console.print(f"\n{hint}")
 
+    except KeyboardInterrupt:
+        if not search_event_logged:
+            interrupted_data: SearchResultData = {
+                "query": query,
+                "result": [],
+                "scope": {
+                    "api_total": 0,
+                    "candidates_fetched": 0,
+                    "post_filter_count": 0,
+                    "output_count": 0,
+                },
+                "effective_filters": {
+                    "channel_id": channel_id,
+                    "title": title,
+                    "lang": lang,
+                },
+            }
+            interrupted_outcome = CommandResult(
+                command="search",
+                status=ResultStatus.INTERRUPTED,
+                data=interrupted_data,
+                errors=[ErrorDetail(
+                    type="KeyboardInterrupt",
+                    message="Search interrupted by user",
+                    stage="user-interrupt",
+                )],
+            )
+            from ..ledger import log_result
+            log_result(
+                "search",
+                interrupted_outcome,
+                topic=resolved_session,
+                data={
+                    "query": query,
+                    "interrupted": True,
+                    "failure_stage": "user-interrupt",
+                    "raw": raw,
+                },
+            )
+            if raw:
+                _emit_raw_result(interrupted_outcome)
+                raise click.exceptions.Exit(1)
+        raise click.Abort()
     except BrokenPipeError:
         _silence_broken_pipe_streams()
         return
@@ -662,6 +778,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
             return
         log_event(
             "search",
+            topic=resolved_session,
             query=query,
             status="failed",
             failure_stage="io",
@@ -676,6 +793,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
     except ValueError as e:
         log_event(
             "search",
+            topic=resolved_session,
             query=query,
             status="failed",
             failure_stage="configuration",
@@ -686,6 +804,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
     except Exception as e:
         log_event(
             "search",
+            topic=resolved_session,
             query=query,
             status="failed",
             failure_stage="unexpected",
@@ -768,7 +887,7 @@ def _display_hit(hit: dict, video_id: str, context_chars: int = 50):
 
 
 def _hit_fingerprint_text(video: dict) -> str:
-    """Normalized concatenation of a video's hit text, for echo detection."""
+    """Concatenate a video's visible hit text for advisory echo detection."""
     parts = []
     for hit in video.get("hits", []):
         lines = hit.get("lines", [])
@@ -778,57 +897,37 @@ def _hit_fingerprint_text(video: dict) -> str:
             parts.append(hit.get("ctx_before", ""))
             parts.append(hit.get("token", ""))
             parts.append(hit.get("ctx_after", ""))
-    text = " ".join(parts).lower()
-    return re.sub(r"[^a-z0-9 ]", " ", text)
+    return " ".join(parts)
 
 
 def _detect_echo_clusters(videos: list, n: int = 5, threshold: float = 0.5) -> dict:
-    """Flag videos whose hit phrasing is near-identical (script-copying / AI-slop echo).
+    """Flag videos whose visible hit phrasing is near-identical.
 
     Builds word n-gram shingle sets per video and clusters by Jaccard similarity.
     Returns {video_index: cluster_label} only for videos in a cluster of >= 2.
     Convergence (different words, same idea) scores low and is left unflagged;
-    echo (copied phrasing) scores high. See research guide §3 (convergence vs echo).
+    shared phrasing scores high and is an advisory lineage candidate, not proof
+    of copying or dependence. See research guide §3 (convergence vs echo).
     """
-    shingles = []
-    for v in videos:
-        words = _hit_fingerprint_text(v).split()
-        grams = {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)} if len(words) >= n else set()
-        shingles.append(grams)
+    from ..analysis import analyze_echoes
 
-    parent = list(range(len(videos)))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(len(videos)):
-        if not shingles[i]:
-            continue
-        for j in range(i + 1, len(videos)):
-            if not shingles[j]:
-                continue
-            inter = len(shingles[i] & shingles[j])
-            if not inter:
-                continue
-            union = len(shingles[i] | shingles[j])
-            if union and inter / union >= threshold:
-                parent[find(i)] = find(j)
-
-    groups = {}
-    for i in range(len(videos)):
-        groups.setdefault(find(i), []).append(i)
-
-    clusters = {}
-    label = 0
-    for members in groups.values():
-        if len(members) >= 2:
-            label += 1
-            for idx in members:
-                clusters[idx] = label
-    return clusters
+    analysis = analyze_echoes(
+        [
+            {
+                "source_id": str(index),
+                "text": _hit_fingerprint_text(video),
+            }
+            for index, video in enumerate(videos)
+        ],
+        ngram=n,
+        threshold=threshold,
+        include_pair_rows=False,
+    )
+    mapped = {}
+    for label, cluster in enumerate(analysis["clusters"], 1):
+        for source_id in cluster["source_ids"]:
+            mapped[int(source_id)] = label
+    return mapped
 
 
 def _format_count(count: int) -> str:
@@ -1010,7 +1109,7 @@ def _bulk_download_transcripts(
         bulk_download: Format "TOPIC:N" or just "TOPIC" (defaults to 10)
         console: Rich console for output
         fallback: If True, use AWS Transcribe when YouTube captions unavailable
-        dedupe: If True, skip transcripts that are near-duplicates of already downloaded ones
+        dedupe: If True, skip matching first-500-character fingerprints
         lang: Optional preferred transcript language
     """
     import hashlib
@@ -1023,18 +1122,8 @@ def _bulk_download_transcripts(
         routing_plan,
     )
 
-    # Parse bulk_download format: "topic:10" or just "topic"
-    if ":" in bulk_download:
-        topic, count_str = bulk_download.rsplit(":", 1)
-        try:
-            max_count = int(count_str)
-        except ValueError:
-            topic = bulk_download
-            max_count = 10
-    else:
-        topic = bulk_download
-        max_count = 10
-    max_count = max(0, max_count)
+    # Parse bulk_download format: "topic:10" or just "topic".
+    topic, max_count = _parse_bulk_download_spec(bulk_download)
 
     videos = results.get("result", results.get("videos", results.get("items", [])))
 
@@ -1181,22 +1270,35 @@ def _bulk_download_transcripts(
                     continue
                 seen_hashes.add(text_hash)
 
+            if not full_text.strip():
+                log_event(
+                    "transcript_save", topic=topic, video_id=video_id,
+                    status="skipped", reason="empty_transcript", source="bulk_download",
+                )
+                console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {video_id} - empty transcript")
+                continue
+
             # Save to library
             metadata = {
                 "title": title,
                 "channel": channel,
+                "channel_id": video.get("channelid"),
+                "published_at": video.get("uploaddate"),
+                "source": result.get("source", "youtube"),
                 "language": result.get("language"),
                 "is_generated": result.get("is_generated"),
                 "duration_seconds": result.get("duration_seconds"),
                 "segment_count": result.get("segment_count"),
                 "views": video.get("viewcount"),
                 "route": result.get("route"),
+                "routes_tried": result.get("routes_tried"),
             }
             library.save(
                 video_id=video_id,
                 topic=topic,
                 transcript_text=full_text,
                 metadata=metadata,
+                segments=result.get("segments", []),
             )
             log_event(
                 "transcript_save", topic=topic, video_id=video_id,
@@ -1303,7 +1405,7 @@ def _display_subtitle_results(
         n_groups = len(set(echo_clusters.values()))
         console.print(
             f"[yellow]⚠ Echo warning:[/yellow] {n_flagged} results across {n_groups} "
-            f"cluster(s) share near-identical phrasing (possible script-copying / AI-slop). "
+            f"cluster(s) share near-identical phrasing (possible reuse/common lineage). "
             f"Tagged [yellow]\\[echo#N][/yellow] below."
         )
 
@@ -1396,7 +1498,7 @@ def _display_subtitle_results(
 @click.command()
 @click.argument("video_ids")
 @click.option("--flags", "-f", default=None, type=int, help="Flags parameter")
-@click.option("--raw", is_flag=True, help="Output raw JSON response")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
 def video(video_ids: str, flags: int, raw: bool):
     """Get metadata for one or more videos.
 
@@ -1427,13 +1529,21 @@ def video(video_ids: str, flags: int, raw: bool):
             )
             _command_error(str(result["error"]), raw=raw, payload=result)
 
-        videos = (
-            result
-            if isinstance(result, list)
-            else [result]
-            if result
-            else []
-        )
+        if isinstance(result, list):
+            videos = result
+        elif isinstance(result, dict) and "result" in result:
+            videos = result["result"]
+            if not isinstance(videos, list):
+                raise ValueError("Video response 'result' must be a list")
+        elif isinstance(result, dict):
+            videos = [result] if result else []
+        elif result is None:
+            videos = []
+        else:
+            raise ValueError("Video response must be an object or list")
+        if any(not isinstance(item, dict) for item in videos):
+            raise ValueError("Every video response item must be an object")
+        videos = [dict(item) for item in videos]
         data: VideoResultData = {
             "video_ids": video_ids,
             "videos": videos,
@@ -1447,6 +1557,8 @@ def video(video_ids: str, flags: int, raw: bool):
             ),
             data=data,
         )
+        if raw:
+            outcome = _prepare_raw_result(outcome)
         log_result(
             "video",
             outcome,
@@ -1459,13 +1571,7 @@ def video(video_ids: str, flags: int, raw: bool):
         )
 
         if raw:
-            click.echo(
-                json_mod.dumps(
-                    outcome.to_raw_dict(),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            _emit_raw_result(outcome, indent=2)
             return
 
         if client.last_cache_hit:
@@ -1563,7 +1669,7 @@ def _display_video_results(
 
 @click.command()
 @click.argument("term")
-@click.option("--raw", is_flag=True, help="Output raw JSON response")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
 def channels(term: str, raw: bool):
     """Search for YouTube channels by name or handle.
 
@@ -1594,6 +1700,9 @@ def channels(term: str, raw: bool):
             _command_error(str(result["error"]), raw=raw, payload=result)
 
         candidates = _channel_candidates(result)
+        if any(not isinstance(item, dict) for item in candidates):
+            raise ValueError("Every channel response item must be an object")
+        candidates = [dict(item) for item in candidates]
         data: ChannelResultData = {
             "query": term,
             "channels": candidates,
@@ -1607,6 +1716,8 @@ def channels(term: str, raw: bool):
             ),
             data=data,
         )
+        if raw:
+            outcome = _prepare_raw_result(outcome)
         log_result(
             "channels",
             outcome,
@@ -1618,13 +1729,7 @@ def channels(term: str, raw: bool):
         )
 
         if raw:
-            click.echo(
-                json_mod.dumps(
-                    outcome.to_raw_dict(),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            _emit_raw_result(outcome, indent=2)
             return
 
         if client.last_cache_hit:
@@ -1637,6 +1742,22 @@ def channels(term: str, raw: bool):
         raise
     except click.ClickException:
         raise
+    except FilmotAPIContractError as e:
+        log_event(
+            "channels",
+            query=term,
+            raw=raw,
+            status="failed",
+            failure_stage="invalid-response",
+            error=f"{type(e).__name__}: {e}",
+        )
+        _command_error(
+            str(e),
+            raw=raw,
+            payload=e.as_response() if raw else None,
+            error_type=type(e).__name__,
+            stage="invalid-response",
+        )
     except ValueError as e:
         log_event(
             "channels",

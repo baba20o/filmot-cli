@@ -1,5 +1,11 @@
 # Filmot CLI — Agent Experience Feature Plan
 
+> **Status:** Historical implementation plan plus the current follow-on batch.
+> The original work was later split across `filmot/commands/` modules; file
+> lists below name the current owners rather than the former monolithic CLI.
+> README command contracts and the test suite are authoritative. Do not use a
+> hard-coded historical test count as a release signal.
+
 ## Tier 1: Fundamental Workflow Changes
 
 ### 1. `filmot research "topic"` — Compound Research Command
@@ -7,16 +13,17 @@
 **What it does:** Single command that orchestrates: search → filter → bulk download → summary.
 
 **Implementation:**
-- New CLI command `research` in `cli.py`
+- Research command in `filmot/commands/research.py`
 - Options: `--depth N` (number of transcripts, default 10), `--min-views N`, `--lang`, `--fallback`
 - Workflow:
-  1. Search with `--title` matching the topic + content matching the topic
-  2. Sort by views (most credible/popular first)
+  1. Run staged title+transcript, exact-phrase, and proximity searches
+  2. Rank fetched candidates with separate relevance, density, echo-risk, and
+     audience/engagement signals; none is a credibility score
   3. Download top N transcripts to library under normalized topic name
   4. Print summary: X saved, Y skipped, Z failed, total chars, sources list
 - Uses existing `FilmotClient.search_subtitles()` and `_bulk_download_transcripts()` logic
 
-**Files modified:** `filmot/cli.py`
+**Current owner:** `filmot/commands/research.py`
 
 ---
 
@@ -30,7 +37,7 @@
 - Update total count display to reflect filtered count
 - Also add to `search-all` command
 
-**Files modified:** `filmot/cli.py`
+**Current owner:** `filmot/commands/search.py`
 
 ---
 
@@ -40,11 +47,13 @@
 
 **Implementation:**
 - Modify `TranscriptLibrary.search()` in `library.py`
-- Change `query_lower in transcript.lower()` to `re.search(r'\b' + re.escape(query_lower) + r'\b', transcript.lower())`
-- Same change in `_find_matches()` for finding match positions
+- Match the original transcript with an escaped Unicode `re.IGNORECASE` pattern
+  and word-boundary lookarounds, preserving source-relative character offsets
+- Use the same original-text pattern in excerpt/segment timestamp mapping;
+  lowercasing first can expand Unicode characters and shift citations
 - Add `--substring` flag to CLI `library search` for backwards-compatible substring matching
 
-**Files modified:** `filmot/library.py`, `filmot/cli.py`
+**Current owners:** `filmot/library.py`, `filmot/commands/library.py`
 
 ---
 
@@ -52,7 +61,9 @@
 
 ### 4. Deduplication (`--dedupe`)
 
-**What it does:** Detect and skip duplicate/near-duplicate transcripts during bulk download. Many YouTube channels repackage the same content into compilation videos.
+**What it does:** Detect and skip transcripts with the same first-500-character
+fingerprint during bulk download. This exact dedupe mechanism is distinct from
+the full-transcript similarity analysis performed by `library echoes`.
 
 **Implementation:**
 - Add `--dedupe` flag to `search` command (affects bulk download)
@@ -62,7 +73,7 @@
   - Also check against existing library entries in the topic
 - Report deduplicated count in summary
 
-**Files modified:** `filmot/cli.py`
+**Current owners:** `filmot/commands/search.py`, `filmot/library.py`
 
 ---
 
@@ -75,13 +86,15 @@
 - Display as `Density: 2.4/min` after the matches count
 - Add `--sort density` option (client-side sort after API returns)
 
-**Files modified:** `filmot/cli.py`
+**Current owner:** `filmot/commands/search.py`
 
 ---
 
-### 6. `filmot library compare "claim"` — Cross-Source Verification
+### 6. `filmot library compare "term"` — Cross-Source Concordance
 
-**What it does:** Search for a term across library transcripts and present results in a structured comparison format, showing each source's treatment of the claim.
+**What it does:** Search for a term across library transcripts and present the
+matching passages by source. This is lexical navigation: it does not infer
+stance, agreement, contradiction, independence, credibility, or truth.
 
 **Implementation:**
 - New subcommand under `library` group: `library compare QUERY`
@@ -93,9 +106,9 @@
   Source 2: "Another Video" (Other Channel)
     [1 mention] "...context around match..."
   ```
-- Sort by mention count (most mentions = most relevant to claim)
+- Sort by mention count (most lexical occurrences of the query)
 
-**Files modified:** `filmot/cli.py` (uses existing `TranscriptLibrary.search()`)
+**Current owners:** `filmot/commands/library.py`, `filmot/library.py`
 
 ---
 
@@ -103,15 +116,16 @@
 
 ### 7. Pipeline/Stdin Mode
 
-**What it does:** Accept search results from stdin to feed into bulk download, enabling: `filmot search ... --raw | filmot download --stdin --topic "mining"`
+**What it does:** Accept search results from stdin to feed into bulk download,
+enabling: `filmot search ... --raw | filmot download --topic "mining"`
 
 **Implementation:**
-- New command `download` with `--stdin` flag
+- `download` reads a piped raw search value from stdin
 - Reads JSON from stdin, expects same format as search `--raw` output
 - Passes to existing `_bulk_download_transcripts()` logic
 - Options: `--topic` (required), `--count N`, `--fallback`, `--dedupe`
 
-**Files modified:** `filmot/cli.py`
+**Current owner:** `filmot/commands/transcript.py`
 
 ---
 
@@ -136,19 +150,20 @@
   ```
 - Add new method `get_context_structured()` to `TranscriptLibrary`
 
-**Files modified:** `filmot/library.py`, `filmot/cli.py`
+**Current owners:** `filmot/library.py`, `filmot/commands/library.py`
 
 ---
 
-### 9. `--title` Operator Support (Test & Document)
+### 9. `--title` Operator Support
 
-**What it does:** Test whether the Filmot API already supports Manticore operators in the `--title` parameter. If yes, document it. If no, note the limitation.
+**What it does:** Document the supported phrase, grouped OR, and implicit-AND
+forms in the `--title` parameter.
 
 **Implementation:**
-- Test: `filmot search "mining" --title "deep sea AND (mining | extraction)"`
-- If operators work: update README with examples
-- If not: document that `--title` is literal-only
-- No code changes needed if API-side
+- Test: `filmot search "mining" --title 'deep sea (mining | extraction)'`
+- Document that spaces express implicit AND and the literal word `AND` should
+  not be used as an operator.
+- No code changes are needed for API-side syntax.
 
 **Files modified:** Possibly just `README.md`
 
@@ -164,7 +179,109 @@
 - Likely limited: auto-captions never have speaker labels, manual captions sometimes do
 - Add `--manual-subs` note in transcript command help explaining this
 
-**Files modified:** `filmot/transcript.py` (if data available), `README.md`
+**Current owner:** `filmot/transcript.py` (if upstream data becomes available)
+
+---
+
+## Current Follow-On Batch: Durable Research Provenance
+
+### Named search routing and session summaries
+
+- `filmot search --session NAME` routes the search activity event to a named
+  session; Ctrl-C before the final outcome leaves one `interrupted` breadcrumb.
+- Routing precedence is CLI `--session`, `FILMOT_SESSION`, bulk-download TOPIC,
+  then the current date.
+- `filmot sessions NAME --summary [--raw]` derives separate standalone-search
+  and staged research-search universes, unique transcript saves/failures,
+  selected-download and probe outcomes, and compact claim mutations. It does
+  not collapse unlike counts into one source total.
+- Session list, replay, and summary are read-only and never log themselves.
+  Named replay/summary surfaces malformed lines as partial/failed read errors
+  instead of silently undercounting them.
+
+**Current owners:** `filmot/commands/search.py`, `filmot/commands/library.py`,
+`filmot/ledger.py`, `filmot/schemas.py`
+
+### Strict claims and evidence
+
+- `claims add`, `cite`, `assess`, and `show` all support `--raw`.
+- Evidence relations are `supports`, `contradicts`, `qualifies`, `context`,
+  `origin`, and `mentions`.
+- Video IDs and finite non-negative timestamps are valid only for evidence
+  classified as source kind `video`; `--source` and `--video` are mutually
+  exclusive and each evidence event names one source. `--video` requires an
+  exact 11-character `[A-Za-z0-9_-]{11}` YouTube ID rather than a URL and is
+  validated before persistence.
+- Default IDs record `utf8-ascii-whitespace/v1`, preserving exact UTF-8
+  code points/case and avoiding runtime Unicode-database drift.
+- Evidence and assessment events record `canonical-json-array/v2`; evidence
+  IDs cover every persisted identity/provenance input rather than an informal
+  generic content hash, and reads verify both IDs and the assessment
+  supersedes chain rather than accepting forks or dangling predecessors.
+- Human verdicts are `open`, `supported`, `contradicted`, and `mixed`;
+  confidence is `unknown`, `low`, `medium`, or `high`.
+- Claim events are strict append-only JSON files under
+  `.filmot_data/claims/TOPIC/`. Persistence failures are command failures;
+  per-topic OS locks serialize complete read/check/append transactions, and
+  events are schema-validated before publication.
+- Newly written `filmot.claim/v2` events have contiguous per-topic sequences.
+  Sequence-less `filmot.claim/v1` histories are replayed in memory without
+  rewriting their files and remain appendable only through newly added v2
+  events.
+- Mutation logs contain compact identifiers/classifications, not claim text or
+  source excerpts. `claims show` is read-only and does not log.
+
+**Current owners:** `filmot/claims.py`, `filmot/commands/claims.py`,
+`filmot/schemas.py`
+
+### Segment-aware transcript records and local citations
+
+- New library records preserve available timestamped source-caption segments
+  alongside complete text and normalized source/acquisition metadata.
+- Legacy records are normalized to the current shape in memory, with an empty
+  segment list when none was stored; reads do not rewrite them.
+- Saves validate records, write strict JSON to a same-directory temporary,
+  flush and `fsync`, then atomically replace the destination; a pre-replace
+  failure preserves the existing record.
+- `library search --raw` and `library compare --raw` expose citation-ready
+  excerpt details, including timestamp and deep link when stored segments make
+  those values knowable.
+- Presentation chunks from `transcript --chunk` remain distinct from stored
+  source-caption segments. When combined with `--timestamps`, chunking takes
+  precedence for terminal/plain-text presentation without replacing the
+  segments retained in raw/JSON output or library storage.
+
+**Current owners:** `filmot/library.py`, `filmot/commands/transcript.py`,
+`filmot/commands/search.py`, `filmot/commands/research.py`
+
+### Reproducible echo analysis and read-only inspection
+
+- `library echoes TOPIC` compares full saved transcripts with a deterministic,
+  Unicode-aware word n-gram Jaccard method (`--ngram 5`, `--threshold 0.5`).
+  Method v2 pins extended Han, Kana, Bopomofo, and Hangul tokenization ranges
+  and records the runtime Unicode database used for normalization/case folding.
+- Clusters are advisory reuse/common-lineage candidates, not proof of copying,
+  dependence, credibility, falsity, or truth.
+- `--persist` writes a content-addressed, non-overwriting artifact at
+  `.filmot_data/analysis/TOPIC/echoes-HASH.json`; the stored content is hashed
+  canonically and existing artifacts are verified before reuse. Echo analysis
+  never logs.
+- Corpus loading for echo analysis is strict: one unreadable, malformed, or
+  incomplete transcript record fails the analysis instead of shrinking it.
+- Pair scoring derives union cardinality arithmetically and retains only the
+  five smallest representative shingles, avoiding redundant large allocations.
+- Human rendering caps the table at the 25 strongest matching pairs; raw JSON
+  and persisted artifacts preserve the complete pair set.
+- `library list`, `search`, `compare`, and `stats`, plus stdout-only `context`,
+  are read-only and do not log. Context file writes log.
+- `library list`, `search`, and `compare` support `--raw`; raw mode does not
+  change persistence semantics.
+- The shared raw boundary rejects non-standard numeric values and emits Unicode
+  through ASCII JSON escapes; `main.py` propagates the returned CLI status via
+  `SystemExit`.
+
+**Current owners:** `filmot/analysis.py`, `filmot/commands/library.py`,
+`filmot/library.py`, `filmot/schemas.py`
 
 ---
 
@@ -179,11 +296,12 @@
 | 5 | `filmot research` | DONE | Single compound command for full workflow |
 | 6 | Deduplication | DONE | `--dedupe` flag on search and research commands |
 | 7 | Structured context | DONE | `--format structured` outputs markdown |
-| 8 | Pipeline/stdin | DONE | `filmot download --stdin` reads from pipe |
+| 8 | Pipeline/stdin | DONE | `filmot download` reads a piped raw search value |
 | 9 | `--title` operators | DONE | Confirmed working, documented in README |
 | 10 | Speaker labels | NOT POSSIBLE | youtube-transcript-api only provides text/start/duration |
 
-All 77 existing tests pass after changes.
+The suite has expanded substantially since this plan was written. Run the
+current test suite rather than relying on a frozen test count.
 
 ## Post-Review Fixes (from BCI research session)
 

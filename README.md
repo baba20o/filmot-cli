@@ -35,7 +35,7 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 ## Features
 
 ### Core Features
-- **Subtitle Search** — Find videos by transcript/subtitle content with 24 filter options
+- **Subtitle Search** — Find videos by transcript/subtitle content with precise scope, ranking, and output controls
 - **Video Metadata** — Get comprehensive details for any YouTube video
 - **Channel Discovery** — Search and explore YouTube channels by name or handle
 - **Transcript Download** — Fetch full YouTube transcripts for deep content analysis
@@ -46,8 +46,11 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 ### Research & Analysis
 - **Compound Research** — `filmot research` orchestrates search → filter → download → summary in one command
 - **Cross-Source Concordance** — `filmot library compare` locates matching passages across saved sources
+- **Claim & Evidence Register** — Record atomic claims, classified citations, contradictions, and human assessments in a strict append-only store
+- **Echo Analysis** — Compare full saved transcripts for reproducible shared-phrasing and possible-lineage clusters
+- **Named Sessions** — Route follow-up searches to an investigation and derive a summary without replaying every event
 - **Density Scoring** — Matches-per-minute metric reveals the most focused content
-- **Deduplication** — Skip duplicate/near-duplicate transcripts during bulk download
+- **Deduplication** — Skip transcripts with the same first-500-character fingerprint during bulk download
 - **Word-Boundary Search** — Library search with smart fallback for plurals/inflections
 - **Structured Export** — Markdown output with full metadata headers for LLM context
 - **Pipeline Mode** — Pipe search results into download for custom workflows
@@ -115,7 +118,7 @@ state:
 
 | Kind | Default location | Override |
 | --- | --- | --- |
-| Transcripts, research libraries, watchlists, and session ledgers | `<current directory>/.filmot_data` | `FILMOT_DATA_DIR` |
+| Transcripts, research libraries, claim events, echo-analysis artifacts, watchlists, and session ledgers | `<current directory>/.filmot_data` | `FILMOT_DATA_DIR` |
 | Per-user configuration and proxy credentials | Windows `%APPDATA%\filmot`; macOS `~/Library/Application Support/filmot`; Linux `${XDG_CONFIG_HOME:-~/.config}/filmot` | `FILMOT_CONFIG_DIR` |
 | Per-user mutable state, including proxy health and rate limiting | Windows `%LOCALAPPDATA%\filmot`; macOS `~/Library/Application Support/filmot`; Linux `${XDG_STATE_HOME:-~/.local/state}/filmot` | `FILMOT_STATE_DIR` |
 | Response cache | Native per-user cache directory (`%LOCALAPPDATA%`, `~/Library/Caches`, or `${XDG_CACHE_HOME:-~/.cache}`) under `filmot` | `FILMOT_CACHE_DIR` |
@@ -125,6 +128,12 @@ Configuration precedence is: existing process environment, per-user
 per-user file can be redirected with `FILMOT_CONFIG_FILE`. Filmot does not
 search parent directories for `.env`, so editable and packaged installs behave
 the same way.
+
+For `filmot search`, the session used for activity logging is selected in this
+order: explicit `--session`, `FILMOT_SESSION`, the TOPIC from
+`--bulk-download TOPIC[:N]`, then the current date. A session changes where the
+activity event is recorded; it does not alter the search query or library
+destination.
 
 Proxy credential inventories are stored in the per-user configuration
 directory with owner-only permissions where the platform supports them.
@@ -183,6 +192,9 @@ filmot search "tutorial" --channel "programming" --channel-count 5
 
 # Fetch three candidate pages, display 20 videos, at most 5 hits each
 filmot search "AI" --pages 3 --sort density --limit 20 --max-hits 5
+
+# Route this follow-up query to a named investigation
+filmot search '"AMD" NEAR/15 "drug discovery"' --session robin-ai-scientist
 
 # Bulk download with deduplication
 filmot search "deep sea mining" --bulk-download deep-sea:10 --dedupe
@@ -318,11 +330,12 @@ filmot search "cobalt" --title 'deep sea (mining | extraction)'
 | `--full` | Show all non-duplicate hit snippets returned for displayed videos on fetched candidate pages; duplicate segments may be collapsed and no extra pages are fetched | `--full` |
 | `--limit`, `--top` | Maximum video results to display/output | `--limit 20` |
 | `--max-hits` | Maximum hit details displayed per video | `--max-hits 5` |
-| `--raw` | Emit exactly one JSON value on stdout, including JSON errors | `--raw` |
+| `--raw` | Emit one JSON value after parsing on normal completion, including runtime/API errors | `--raw` |
 | `--min-matches` | Only show videos with N+ subtitle matches | `--min-matches 3` |
 | `--bulk-download` | Download top N transcripts to TOPIC | `--bulk-download topic:10` |
+| `--session` | Log this search to a named research session; overrides `FILMOT_SESSION` and bulk-topic inference | `--session topic-investigation` |
 | `--fallback` | Use AWS Transcribe fallback for bulk download | `--fallback` |
-| `--dedupe` | Skip duplicate transcripts during bulk download | `--dedupe` |
+| `--dedupe` | Skip matching first-500-character transcript fingerprints during bulk download | `--dedupe` |
 
 ### Multilingual Search
 
@@ -410,6 +423,22 @@ filmot transcript VIDEO_ID --full --save-to my-topic
 filmot transcript VIDEO_ID --fallback --full
 ```
 
+Library saves retain the complete text plus any source caption segments and
+their timestamps. Filmot also normalizes citation-ready source metadata such
+as the video ID, URL, title, channel, publication date, views, and acquisition
+source when those fields are available. Older text-only records are normalized
+to the current read shape in memory, with an empty segment list; they are not
+rewritten merely because they were read. When `--chunk` and `--timestamps` are
+combined, `--chunk` takes precedence for human presentation and plain-text
+export. The original caption segments remain present in raw/JSON output and
+are what `--save-to`, bulk download, pipeline download, and research preserve.
+
+Library saves validate the record and segments before publication, serialize
+strict JSON to a unique same-directory temporary file, flush and `fsync` that
+file, and then atomically replace the destination. A validation,
+serialization, write, or pre-replace failure therefore leaves an existing
+record intact; leftover temporary files are cleaned up best-effort.
+
 ### Search Within Transcripts
 
 Find specific terms within a video's transcript with context:
@@ -451,8 +480,14 @@ filmot library list
 # List transcripts in a topic
 filmot library list deep-sea-mining
 
+# Machine-readable topic inventory
+filmot library list deep-sea-mining --raw
+
 # Search across all saved transcripts (word-boundary matching by default)
 filmot library search "dark oxygen"
+
+# Raw search rows include citation-ready excerpt details when timestamps exist
+filmot library search "dark oxygen" --topic deep-sea-mining --raw
 
 # Force substring matching (catches plurals automatically via fallback)
 filmot library search "patent" --substring
@@ -460,6 +495,14 @@ filmot library search "patent" --substring
 # Find passages where different sources use the same term or phrase
 filmot library compare "cobalt" --sort density
 filmot library compare "moratorium" --context 200 --topic deep-sea-mining
+filmot library compare "moratorium" --topic deep-sea-mining --raw
+
+# Compare full saved transcripts for shared phrasing (read-only by default)
+filmot library echoes deep-sea-mining
+filmot library echoes deep-sea-mining --ngram 5 --threshold 0.5 --raw
+
+# Persist the same deterministic analysis as a content-addressed artifact
+filmot library echoes deep-sea-mining --persist
 
 # Get combined text for LLM context
 filmot library context deep-sea-mining
@@ -481,11 +524,135 @@ filmot library delete VIDEO_ID
 filmot library delete topic-name --all
 ```
 
+`library list`, `search`, `compare`, and `stats` are read-only and never append
+session events. `library context` is also read-only when it prints to stdout;
+writing context to a file, including the auto-save performed by structured
+format, logs the write. Raw `search` and `compare` rows include excerpt text,
+character offsets, and, for records with saved caption segments, timestamps
+and YouTube deep links. Legacy records remain searchable but cannot acquire a
+source timestamp that was never stored. Missing, invalid, incomplete, or
+text-misaligned segment timing stays explicitly untimed.
+
+`library echoes` computes Unicode-normalized word n-gram Jaccard similarity
+over each source's **full saved transcript**. Defaults are `--ngram 5` and
+`--threshold 0.5`. Pair scores and deterministic single-linkage clusters are
+advisory evidence of possible reuse or common lineage—not proof of copying,
+dependence, credibility, falsity, or truth. Method metadata records the runtime
+Unicode database version. Method v2 also pins the extended Han, Kana,
+Bopomofo, and Hangul character ranges used for script-aware tokenization, so
+those ranges do not depend on the runtime regex tables. Corpus loading fails
+closed if any record is unreadable, malformed, or missing required
+identity/text. The command never logs. Without `--persist` it is entirely
+read-only; with `--persist` it writes a reproducible, content-addressed artifact to
+`.filmot_data/analysis/TOPIC/echoes-HASH.json`. The SHA-256 digest covers the
+canonical stored payload, including its normalized topic and excluding only
+the self-describing hash field. Existing artifacts are content-verified and
+never overwritten.
+
+Human output shows at most the 25 strongest threshold-matching pairs to keep a
+large corpus readable. `--raw` and persisted artifacts retain every pair.
+
 `migrate-topic` moves an entire legacy directory; it cannot infer which files
 belong to which original topic or partition a directory that old versions
 merged. Review the displayed source and destination paths, and confirm only
 when every source file belongs to the requested topic. Existing destination
 conflicts remain in the legacy directory rather than being overwritten.
+
+Topic slug v1 uses Python's bundled Unicode database for NFKC normalization,
+case folding, and character categories. Pin the Python minor version for one
+shared data directory and inspect topic routing before upgrading it: Unicode
+table changes can move unusual or newly assigned code points. Filmot preserves
+this behavior to avoid silently relocating existing topic directories; the
+legacy migration command does not repair Unicode-version drift.
+
+### Claims and Evidence
+
+Claims are exact, human-authored statements. Citations record an explicit
+relationship to the statement; Filmot does not infer stance, independence,
+confidence, or truth.
+
+```bash
+# Declare an atomic claim; omit --id for a stable text-derived ID
+filmot claims add robin-ai-scientist \
+  "Robin nominated ripasudil for testing in an AMD model"
+
+# Attach timestamped video evidence
+filmot claims cite robin-ai-scientist c-CLAIMID \
+  --video VIDEO_ID --at 312 --relation supports \
+  --excerpt "short exact source passage" --secondary
+
+# Attach a primary document with a precise locator and separate analyst note
+filmot claims cite robin-ai-scientist c-CLAIMID \
+  --source "https://example.org/paper" --source-kind paper \
+  --relation qualifies --locator "Figure 2" \
+  --excerpt "short exact source passage" --note "Limits the model claim" \
+  --primary --independence independent
+
+# Append a human assessment; it supersedes the prior assessment
+filmot claims assess robin-ai-scientist c-CLAIMID \
+  --verdict mixed --confidence medium --note "Preclinical evidence only"
+
+# Show the topic register or one claim
+filmot claims show robin-ai-scientist
+filmot claims show robin-ai-scientist c-CLAIMID --raw
+```
+
+Every `claims add`, `cite`, `assess`, and `show` command supports `--raw`.
+Evidence relations are `supports`, `contradicts`, `qualifies`, `context`,
+`origin`, and `mentions`. Verdicts are `open`, `supported`, `contradicted`, and
+`mixed`; confidence is `unknown`, `low`, `medium`, or `high`. Evidence can
+also be marked `--independence independent|echo` and assigned a
+`--lineage-group`. `--at` is a finite, non-negative video timestamp and cannot
+be attached to a non-video source. Likewise, `--video` requires source kind
+`video`; `--source` and `--video` are mutually exclusive because one evidence
+event represents one source. `--video` accepts only an exact 11-character
+YouTube ID matching `[A-Za-z0-9_-]{11}` (not a URL) and supplies its canonical
+YouTube URL; malformed values are rejected before persistence.
+
+Omitted claim IDs use `utf8-ascii-whitespace/v1`: SHA-256 over exact UTF-8 code
+points after folding only ASCII whitespace. Case and all non-ASCII code points
+are preserved, so IDs do not drift with Python's Unicode database. The method
+is stored with each declaration; explicit IDs record `explicit`. Evidence and
+assessment IDs use `canonical-json-array/v2`, hashing unambiguous canonical
+JSON field vectors rather than delimiter-joined text. A v2 evidence ID covers
+all persisted identity and provenance inputs—including the claim/relation,
+source and source kind, video/timestamp or document locator, excerpt, note,
+primary/independence/lineage classifications, title, channel, and research run.
+The video deep link is derived from and checked against the video/timestamp.
+Strict reads validate IDs and require each assessment to supersede the actual
+current one.
+
+Claim data is strict, append-only project data under
+`.filmot_data/claims/TOPIC/*.json`: a persistence error fails the command, and
+new assessments do not erase earlier events. Per-topic OS locks serialize the
+whole read/check/append transaction, preventing concurrent assessment forks;
+complete events are schema-validated before publication. Every newly written
+event uses `filmot.claim/v2` and a contiguous per-topic sequence. Legacy
+`filmot.claim/v1` histories without stored sequences remain readable: replay
+assigns their order in memory, never rewrites those v1 files, and can continue
+the history by appending v2 events beginning after the legacy count. Thus v1
+records themselves are read-only compatibility data, while a valid v1 history
+remains appendable through new v2 events. The three mutation commands add
+compact session events containing identifiers and classifications, not claim
+text or excerpts. `claims show` is read-only and does not log.
+
+### Research Sessions
+
+```bash
+# Replay events or derive a non-conflating summary
+filmot sessions robin-ai-scientist
+filmot sessions robin-ai-scientist --summary
+filmot sessions robin-ai-scientist --summary --raw
+```
+
+The summary keeps standalone search universes, each staged research-search
+universe, selected-download outcomes, probe outcomes, unique saved transcripts,
+failed attempts, and claim mutations distinct. Listing, replaying, and
+summarizing sessions are read-only and do not log the inspection. A malformed
+ledger line makes a summary `partial` (or `failed` when nothing is readable),
+with line-level diagnostics rather than a silently reduced event count. A
+Ctrl-C before a search result is logged records an `interrupted` breadcrumb in
+the resolved named/date session so the investigation remains resumable.
 
 ### Search Channels
 
@@ -611,13 +778,16 @@ filmot-cli/
     ├── api_contract.py     # Recorded-response structural validation
     ├── cli.py              # Root group and command registration
     ├── cli_support.py      # Shared raw/human/error presentation boundary
-    ├── schemas.py          # Versioned result and ledger-event contracts
+    ├── schemas.py          # Versioned result, event, claim, and analysis contracts
     ├── ledger.py           # Project-local append-only research events
+    ├── claims.py           # Strict append-only claim/evidence event store
+    ├── analysis.py         # Deterministic full-transcript echo analysis
     ├── commands/
     │   ├── search.py       # Search, metadata, export, and scout commands
     │   ├── research.py     # Staged research workflow
     │   ├── transcript.py   # Transcript and channel-corpus commands
-    │   ├── library.py      # Library and session commands
+    │   ├── library.py      # Library, echo-analysis, and session commands
+    │   ├── claims.py       # Claim, evidence, and assessment commands
     │   └── proxy.py        # Machine-global proxy operations
     ├── _process.py         # Killable JSON subprocess boundary
     ├── _transcript_worker.py # Isolated transcript route worker
@@ -626,7 +796,7 @@ filmot-cli/
     ├── cache.py            # File-based response caching with auto-purge
     ├── rate_limiter.py     # Token bucket rate limiter
     ├── channel_dl.py       # Channel corpus downloader: parallel download, resume, proximity search
-    ├── library.py          # Transcript library: storage, search, compare
+    ├── library.py          # Segment-aware transcript storage, search, compare
     ├── export.py           # JSON/CSV export functionality
     ├── watchlist.py        # Local video watchlist management
     ├── batch.py            # Batch query processing
@@ -923,22 +1093,37 @@ filmot research "your topic" --depth 12 --dedupe --min-matches 2
 # 2. Navigate matching passages across sources, then verify the claims
 filmot library compare "specific claim" --sort density
 
-# 3. Export structured context for deep analysis
+# 3. Audit possible source-lineage echoes in full saved transcripts
+filmot library echoes your-topic --raw
+
+# 4. Record exact evidence relationships and a human assessment
+filmot claims add your-topic "One exact, falsifiable statement"
+filmot claims cite your-topic c-CLAIMID --video VIDEO_ID --at 90 --relation supports
+filmot claims assess your-topic c-CLAIMID --verdict supported --confidence medium
+
+# 5. Export structured context for deep analysis
 filmot library context your-topic --format structured
+
+# 6. Resume from a summary that keeps unlike count universes separate
+filmot sessions your-topic --summary
 ```
 
 ### Key Agent Features
 
 - **`filmot research`** — Single compound command that orchestrates search → filter → download → summary
 - **`filmot library compare`** — Lexical cross-source concordance for locating matching passages
+- **`filmot library echoes`** — Reproducible full-transcript similarity analysis for advisory lineage review
+- **`filmot claims`** — Append-only claims, classified evidence, and explicit human assessments
+- **`filmot sessions NAME --summary`** — Derived investigation totals without conflating candidate, source, and failure universes
+- **`filmot search --session NAME`** — Route manual follow-up searches into the intended investigation
 - **`--sort density`** — Sort fetched candidates by matches-per-minute to find focused text coverage; this is not a credibility score
 - **`--min-matches N`** — Filter out videos with only passing mentions
-- **`--dedupe`** — Skip duplicate transcripts during bulk download
+- **`--dedupe`** — Skip matching first-500-character transcript fingerprints during bulk download
 - **`--format structured`** — Markdown export with metadata headers, auto-saved to file
 - **`--full`** — Expand non-duplicate hit snippets for displayed videos on fetched candidate pages; it does not widen the page scope
 - **`--pages` / `--candidate-pool`** — Widen the candidates considered by client-side ranking
 - **`--limit` / `--max-hits`** — Bound video and per-video hit output separately
-- **`--raw`** — Exactly one JSON value on stdout for programmatic access
+- **`--raw`** — One JSON value after parsing and normal completion
 - **Word-boundary search** — Library search prevents false positives, auto-falls back to substring for plurals
 
 ### Expanded Hit Output
@@ -966,17 +1151,37 @@ filmot search "tutorial" --raw | jq '.result[0].hits'
 ```
 
 Raw mode suppresses interactive progress and keeps any remaining diagnostics
-off stdout. Stdout contains one JSON value on success and one JSON error value
-with a nonzero exit status on operational failure. Every raw command result
-uses the `filmot.result/v1` contract. Mapping payloads retain their useful
-top-level domain keys and add `_filmot` metadata containing `schema`,
-`command`, `status`, `errors`, and `warnings`. For `search`, the payload is the
-processed response after channel validation, client-side filtering/ranking,
-`--limit`, and `--max-hits`, with explicit scope metadata; it is not an
+off stdout. Once Click accepts the command line, stdout contains one JSON value
+on success and one JSON error value with a nonzero exit status on operational
+failure. Parser-detected invalid syntax, options, and values, plus explicit
+Click usage errors, use Click's normal text usage response and exit status 2
+before raw mode runs. Semantic validation after parsing uses the versioned JSON
+error result. An external user interrupt or broken stdout pipe can terminate
+the process before a complete value is written; those process-control events
+are outside the result contract.
+
+For commands that write a session event, raw serialization is preflighted
+before logging, so stdout and the durable event cannot disagree about success.
+Raw serialization rejects non-standard values such as `NaN`/`Infinity` and
+uses ASCII JSON escaping; non-ASCII content appears as JSON Unicode escapes and
+decodes back to the original text. `main.py` raises `SystemExit(main())`, so the
+status returned by the CLI reaches shell scripts instead of being discarded.
+
+Every raw command result uses the `filmot.result/v1` contract. Mapping payloads
+retain their useful top-level domain keys and add `_filmot` metadata containing
+`schema`, `command`, `status`, `errors`, and `warnings`. For `search`, the
+payload is the processed response after channel validation, client-side
+filtering/ranking, `--limit`, and `--max-hits`, with explicit scope metadata; it is not an
 untouched copy of the upstream API payload. `video` uses `videos`, `channels`
-uses `channels`, and `filmot sessions NAME --raw` uses `events`. Every session
-entry is itself a `filmot.event/v1` record with the same
-command/status/data/errors/warnings vocabulary.
+uses `channels`, and library inspection commands use `rows`. `library echoes`
+also exposes `clusters`, `method`, and `artifact_hash`. Local library search
+and compare rows include citation details, with timestamps and deep links when
+saved segments make them available. Claim commands use `rows`, and all four
+claim subcommands support `--raw`. `filmot sessions NAME --raw` uses `events`,
+while `filmot sessions NAME --summary --raw` uses `summary`. Every replayed
+session entry is itself a `filmot.event/v1` record with the same
+command/status/data/errors/warnings vocabulary. Raw mode does not change a
+command's persistence or logging behavior.
 
 ### Example Agent Workflow (Python)
 
