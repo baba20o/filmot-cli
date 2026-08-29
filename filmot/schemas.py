@@ -31,6 +31,9 @@ from typing import (
 
 RESULT_SCHEMA = "filmot.result/v1"
 EVENT_SCHEMA = "filmot.event/v1"
+LEGACY_CLAIM_SCHEMA = "filmot.claim/v1"
+CLAIM_SCHEMA = "filmot.claim/v2"
+ECHO_ANALYSIS_SCHEMA = "filmot.echo-analysis/v1"
 
 JSONScalar = Union[str, int, float, bool, None]
 JSONValue = Union[
@@ -134,6 +137,72 @@ class SessionResultData(TypedDict, total=False):
     name: str
     rows: List[Dict[str, Any]]
     events: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+
+
+class ClaimEvidenceData(TypedDict, total=False):
+    """One human-authored relationship between a claim and a source."""
+
+    claim_id: str
+    evidence_id: str
+    id_method: str
+    relation: str
+    source: str
+    source_kind: str
+    deep_link: str
+    video_id: str
+    start_seconds: float
+    locator: str
+    excerpt: str
+    note: str
+    primary: Optional[bool]
+    independence: str
+    lineage_group: str
+    title: str
+    channel: str
+    research_run_id: str
+    created_at: str
+
+
+class ClaimData(TypedDict, total=False):
+    """Folded current state of one durable research claim."""
+
+    claim_id: str
+    id_method: str
+    text: str
+    topic: str
+    created_at: str
+    verdict: str
+    confidence: str
+    assessment_note: str
+    assessment_id: str
+    assessed_at: str
+    evidence: List[ClaimEvidenceData]
+    summary: Dict[str, Any]
+
+
+class ClaimResultData(TypedDict, total=False):
+    """Typed payload emitted by the top-level ``claims`` commands."""
+
+    claim_schema: str
+    topic: str
+    claim_id: str
+    created: bool
+    rows: List[ClaimData]
+    summary: Dict[str, Any]
+
+
+class EchoAnalysisResultData(TypedDict, total=False):
+    """Deterministic full-transcript echo-analysis payload."""
+
+    analysis_schema: str
+    topic: str
+    rows: List[Dict[str, Any]]
+    clusters: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+    method: Dict[str, Any]
+    artifact: str
+    artifact_hash: str
 
 
 class ResearchResultData(TypedDict, total=False):
@@ -444,16 +513,50 @@ def normalize_event_dict(payload: Mapping[str, Any]) -> Dict[str, Any]:
     appends always use ``filmot.event/v1``.
     """
     if payload.get("schema") == EVENT_SCHEMA:
+        required_text = ("ts", "kind", "command")
+        for field_name in required_text:
+            if not isinstance(payload.get(field_name), str) or not payload[field_name]:
+                raise ValueError(
+                    "Event envelope requires non-empty '{}'".format(field_name)
+                )
+        _status_value(payload.get("status"))
         data = payload.get("data")
         if not isinstance(data, Mapping):
-            data = {}
+            raise ValueError("Event envelope data must be an object")
+        errors = payload.get("errors")
+        if not isinstance(errors, list) or not all(
+            isinstance(item, Mapping) for item in errors
+        ):
+            raise ValueError("Event envelope errors must be a list of objects")
+        for error in errors:
+            if not isinstance(error.get("type"), str) or not error["type"]:
+                raise ValueError("Event error requires a non-empty type")
+            if not isinstance(error.get("message"), str):
+                raise ValueError("Event error requires a message string")
+            if error.get("stage") is not None and not isinstance(
+                error.get("stage"), str
+            ):
+                raise ValueError("Event error stage must be a string or null")
+            if error.get("details") is not None and not isinstance(
+                error.get("details"), Mapping
+            ):
+                raise ValueError("Event error details must be an object")
+        warnings = payload.get("warnings")
+        if not isinstance(warnings, list) or not all(
+            isinstance(item, str) for item in warnings
+        ):
+            raise ValueError("Event envelope warnings must be a list of strings")
+        topic = payload.get("topic")
+        if topic is not None and not isinstance(topic, str):
+            raise ValueError("Event envelope topic must be a string or null")
         normalized = dict(payload)
         normalized["data"] = dict(data)
-        normalized.setdefault("errors", [])
-        normalized.setdefault("warnings", [])
-        normalized.setdefault("command", str(payload.get("kind") or "unknown"))
-        normalized.setdefault("status", ResultStatus.COMPLETED.value)
         return normalized
+
+    if payload.get("schema") is not None:
+        raise ValueError(
+            "Unsupported event schema: {}".format(payload.get("schema"))
+        )
 
     ts = str(payload.get("ts") or "")
     kind = str(payload.get("kind") or "unknown")

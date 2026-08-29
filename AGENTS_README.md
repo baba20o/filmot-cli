@@ -17,6 +17,9 @@ Filmot CLI searches **YouTube transcripts** (not titles, not descriptions—the 
 3. You can download full transcripts for deep analysis
 4. You can build curated knowledge bases and locate claim-bearing passages across sources
 5. Date filtering lets you research current events in near-real-time
+6. You can compare full saved transcripts for possible shared lineage
+7. You can keep a strict claim/evidence register with explicit human assessments
+8. You can route follow-up searches into named, resumable investigation sessions
 
 **Think of it as:** Google for what people *say* in YouTube videos.
 
@@ -82,8 +85,19 @@ filmot library compare "tritium" --sort density
 # Search for specific terms across all saved transcripts
 filmot library search "tokamak"
 
+# Audit possible common lineage before counting sources as independent
+filmot library echoes nuclear-fusion-energy --raw
+
+# Record one exact claim and its classified source relationship
+filmot claims add nuclear-fusion-energy "One exact, falsifiable statement"
+filmot claims cite nuclear-fusion-energy c-CLAIMID \
+  --video VIDEO_ID --at 180 --relation supports
+
 # Export everything as structured markdown for deep analysis
 filmot library context nuclear-fusion-energy --format structured
+
+# Summarize the investigation later without conflating unlike counts
+filmot sessions nuclear-fusion-energy --summary
 ```
 
 ---
@@ -102,7 +116,7 @@ filmot research "your topic" [OPTIONS]
 | `--min-views N` | Minimum view count filter | None |
 | `-l, --lang` | Language code | en |
 | `--fallback` | Use AWS Transcribe when captions unavailable | Off |
-| `--dedupe` | Skip duplicate/near-duplicate transcripts | Off |
+| `--dedupe` | Skip transcripts with the same first-500-character fingerprint | Off |
 | `--min-matches N` | Only download videos with N+ subtitle matches (0 to disable) | 2 |
 | `--sort [balanced\|density\|source-prior\|viewcount]` | Rank fetched candidates; source-prior is an unverified audience/engagement heuristic | balanced |
 | `--candidate-pages N` | Filmot pages fetched before client-side ranking | 3 |
@@ -187,7 +201,7 @@ it does not fetch additional pages. Add `--lang en` for English videos.
 | `--sort density` | Sort fetched candidates by matches-per-minute (client-side; not a global credibility score) | `--sort density` |
 | `--pages N` / `--candidate-pool N` | Widen or cap the candidates considered by client-side ranking | `--pages 3 --candidate-pool 120` |
 | `--limit N` / `--max-hits N` | Bound displayed videos and per-video hit details independently | `--limit 20 --max-hits 5` |
-| `--dedupe` | Skip duplicates during bulk download | `--dedupe` |
+| `--dedupe` | Skip matching first-500-character transcript fingerprints during bulk download | `--dedupe` |
 | `--title TEXT` | Filter by video title (supports operators) | `--title "fusion energy"` |
 | `--min-views N` | Minimum view count | `--min-views 10000` |
 | `--bulk-download TOPIC:N` | Download top N transcripts to library | `--bulk-download fusion:10` |
@@ -195,6 +209,12 @@ it does not fetch additional pages. Add `--lang en` for English videos.
 | `--sort` | Sort: `viewcount`, `likecount`, `uploaddate`, `duration`, `chanrank`, `id`, `density` | `--sort viewcount` |
 | `--context N` | Characters of context per side in snippets (raise for fuller quotes) | `--context 120` |
 | `--channel TEXT` | Resolve and display matching channel IDs; fail closed if none resolve | `--channel "Primary Lab"` |
+| `--session NAME` | Route this search event to a named investigation | `--session robin-ai-scientist` |
+
+Search-session routing precedence is explicit `--session`, then
+`FILMOT_SESSION`, then the TOPIC parsed from `--bulk-download TOPIC[:N]`, then
+the current date. The session only chooses the activity ledger; it does not
+change query scope or the transcript-library topic.
 
 ### Reading the results (signals built into the display)
 
@@ -202,7 +222,7 @@ Every result surfaces navigation and heuristic signals inline, so you can triage
 
 - **Timestamped deep links** — the `Video:` URL and every match link jump straight to the moment (`&t=312s`), not 0:00. Click the hit, land on the sentence.
 - **Engagement ratio** — `Engagement: 0.7%` (likes/views) next to the view count. It can help prioritize inspection, but does not establish expertise, independence, credibility, or truth.
-- **Echo warning** — if results share near-identical phrasing, they're tagged `[echo#N]` and a warning prints up top. That's the convergence-vs-echo test (guide §3) automated: echo = copied script / AI-slop; genuine convergence uses different words and is *not* flagged.
+- **Echo warning** — if result snippets share near-identical phrasing, they're tagged `[echo#N]` and a warning prints up top. This is an advisory reuse/common-lineage signal, not proof of copying, dependence, credibility, falsity, or truth. Use `library echoes` on the full saved transcripts before making an independence judgment.
 - **Freshness note** — when your date window reaches the last few days, the tool reminds you Filmot lags ~24-48h and prints the exact `yt-search` command to catch launch-day coverage (guide Trap 5/7).
 
 ### Density Scoring
@@ -273,6 +293,17 @@ This closes the search → download → grep loop inside the tool: find a promis
 filmot transcript VIDEO_ID --full --save-to prompt-injection
 ```
 
+The save retains the complete text, any available timestamped source-caption
+segments, and normalized source metadata for local citations. Older text-only
+records are normalized in memory with an empty segment list and are not
+rewritten on read. If `--chunk` and `--timestamps` are both present, chunked
+presentation wins for the terminal and plain-text export; raw/JSON output and
+library saves still retain the original source segments. Bulk, pipeline, and
+research library saves use the same record shape. Each save validates its
+record, writes strict JSON to a unique same-directory temporary, flushes and
+`fsync`s it, and atomically replaces the destination, so a failure before that
+replace preserves any existing record.
+
 ### Bulk Download from Search
 
 ```bash
@@ -293,12 +324,20 @@ filmot library list
 
 # List transcripts in a topic
 filmot library list prompt-injection
+filmot library list prompt-injection --raw
 
 # Search across all saved transcripts (word-boundary by default)
 filmot library search "attack vector"
+filmot library search "attack vector" --topic prompt-injection --raw
 
 # Cross-source concordance — locate passages that use the same term
 filmot library compare "dark oxygen" --topic deep-sea-mining
+filmot library compare "dark oxygen" --topic deep-sea-mining --raw
+
+# Advisory full-transcript shared-phrasing analysis
+filmot library echoes deep-sea-mining
+filmot library echoes deep-sea-mining --ngram 5 --threshold 0.5 --raw
+filmot library echoes deep-sea-mining --persist
 
 # Get combined text for LLM context
 filmot library context prompt-injection
@@ -321,6 +360,12 @@ filmot library delete VIDEO_ID
 # Delete entire topic
 filmot library delete topic-name --all
 ```
+
+Inspection is deliberately quiet: `library list`, `search`, `compare`, and
+`stats` never append session events. `library context` also remains read-only
+when it prints to stdout; a context file write, including the structured
+format's automatic save, is logged. `library echoes` never logs, even with
+`--persist`. Raw mode does not alter these rules.
 
 ### Library Search: Word-Boundary Matching
 
@@ -361,6 +406,32 @@ filmot library compare "tritium" --sort density
 
 **Tip:** Prefer specific phrases over generic words that also occur in idioms. Use `--sort density` to find sources that use the text most intensely, then read the passages and verify factual claims against primary sources.
 
+Raw local `search` and `compare` rows carry citation-ready excerpt details:
+text and character offsets for every record, plus timestamps and YouTube deep
+links when source-caption segments were saved. A legacy text-only record
+remains searchable, but Filmot does not invent a timestamp it never stored;
+invalid, incomplete, or text-misaligned segment timing stays untimed.
+
+### Library Echoes: Advisory Lineage Analysis
+
+`library echoes TOPIC` compares the complete saved transcript for every source
+in that topic using Unicode-normalized word n-gram Jaccard similarity. It
+defaults to 5-word shingles and a `0.5` threshold, returns every pair score,
+and builds deterministic single-linkage clusters for pairs that meet the
+threshold. Method v2 pins its extended Han, Kana, Bopomofo, and Hangul
+tokenization ranges; metadata also records the runtime Unicode database used
+for NFKC normalization and case folding.
+
+Clusters identify phrasing worth investigating. They do not establish which
+source came first, whether one copied another, whether sources are independent,
+or whether a claim is true. Without `--persist`, the command is read-only.
+`--persist` writes a content-addressed, non-overwriting artifact at
+`.filmot_data/analysis/TOPIC/echoes-HASH.json`; its SHA-256 covers the canonical
+stored payload except the self-describing hash field, and an existing file is
+verified before reuse. The command still does not log.
+Human rendering is capped at the 25 strongest matching pairs; `--raw` and the
+artifact retain the complete pair matrix.
+
 ### Structured Context Export
 
 For deep LLM analysis, export your library as structured markdown:
@@ -386,9 +457,85 @@ This auto-saves to `{topic}-context.md` with full metadata headers:
 
 ---
 
+## Claims and Evidence
+
+Use the claim register after locating passages, not as an automatic fact
+checker. A claim is an exact statement; every citation has a human-selected
+relationship, and every verdict is an explicit human assessment.
+
+```bash
+# Add an atomic statement (default ID is stable and text-derived)
+filmot claims add robin-ai-scientist \
+  "Robin nominated ripasudil for testing in an AMD model"
+
+# Cite a saved or external video at an exact moment
+filmot claims cite robin-ai-scientist c-CLAIMID \
+  --video VIDEO_ID --at 312 --relation supports \
+  --excerpt "short exact source text" --secondary
+
+# Cite a primary document and keep source text separate from analyst notes
+filmot claims cite robin-ai-scientist c-CLAIMID \
+  --source "https://example.org/paper" --source-kind paper \
+  --relation qualifies --locator "Methods, p. 4" \
+  --excerpt "short exact source text" --note "Scope limitation" \
+  --primary --independence independent
+
+# Record or supersede a human assessment
+filmot claims assess robin-ai-scientist c-CLAIMID \
+  --verdict mixed --confidence medium --note "Preclinical result only"
+
+# Inspect the register or one claim
+filmot claims show robin-ai-scientist
+filmot claims show robin-ai-scientist c-CLAIMID --raw
+```
+
+All four subcommands accept `--raw`. Relations are `supports`, `contradicts`,
+`qualifies`, `context`, `origin`, and `mentions`. Verdicts are `open`,
+`supported`, `contradicted`, and `mixed`; confidence is `unknown`, `low`,
+`medium`, or `high`. Use `--independence independent|echo` and
+`--lineage-group` only when you have made that lineage judgment; Filmot does
+not infer it from an echo cluster. `--at` requires a video and accepts only a
+finite, non-negative number of seconds. `--video` cannot be paired with a
+non-video `--source-kind` or with `--source`; one evidence event always
+describes one source. `--video` accepts exactly 11 YouTube-ID characters
+matching `[A-Za-z0-9_-]{11}`, not a URL, and malformed values fail before
+persistence; a valid ID supplies its canonical YouTube URL.
+
+Text-derived IDs use the recorded `utf8-ascii-whitespace/v1` method: exact
+UTF-8 code points and case are preserved while ASCII whitespace is folded.
+This avoids Python/Unicode-database-dependent IDs; manual IDs record `explicit`.
+Evidence and assessment IDs record `canonical-json-array/v2`, which hashes an
+unambiguous canonical JSON field vector. For evidence, v2 covers every
+persisted identity/provenance input: claim and relation; source/kind;
+video/time or document locator; excerpt and note; primary, independence, and
+lineage classifications; plus title, channel, and research run. The derived
+video deep link is validated separately. Strict replay validates those IDs and
+the linear assessment-supersedes chain.
+
+Claim events are strict, append-only files under
+`.filmot_data/claims/TOPIC/*.json`. Persistence failures fail the command, and
+a later assessment supersedes rather than erases history. Per-topic OS locks
+cover each full read/check/append transaction, and every event is validated
+before publication, so concurrent mutations cannot fork an assessment chain.
+New events use `filmot.claim/v2` with contiguous per-topic sequence numbers.
+Sequence-less `filmot.claim/v1` histories are accepted for compatibility,
+ordered in memory, and never rewritten; a valid legacy history can be
+continued by appending v2 events after its in-memory sequence. The v1 records
+remain read-only even though the topic history remains appendable.
+`add`, `cite`, and `assess` append compact session events containing IDs and
+classifications but not the claim text or excerpts. `show` is read-only, does
+not log, and does not create claim storage when the topic is absent.
+
+---
+
 ## Session Ledger (resuming an investigation)
 
-Search, transcript saves, bulk/research downloads, library operations, and other research-facing commands log to `.filmot_data/sessions/`. This matters for agents: a fresh instance with no memory of yesterday can read the ledger and pick up an investigation instead of re-deriving it from scratch.
+Searches, research phases, transcript/download writes, channel work, context
+file writes, and compact claim mutations log to `.filmot_data/sessions/`.
+Library `list`, `search`, `compare`, `stats`, stdout-only `context`, and every
+`echoes` run do not log. This matters for agents: a fresh instance with no
+memory of yesterday can read the ledger and resume an investigation without
+polluting it merely by inspecting existing state.
 
 `.filmot_data` is resolved from the invocation directory, so it belongs to the
 active research project; set `FILMOT_DATA_DIR` when an agent must use a
@@ -399,11 +546,31 @@ credential-free health and leases live in the per-user state directory.
 ```bash
 filmot sessions                    # list all sessions (newest activity first)
 filmot sessions fable-5-mythos     # replay a topic-scoped research session
+filmot sessions fable-5-mythos --summary
+filmot sessions fable-5-mythos --summary --raw
 filmot sessions 2026-06-10         # replay a day's ad-hoc search queries
 filmot sessions 2026-06-10 --raw   # one result with an events array
 ```
 
-`research <topic>` logs a run ID, `research_start`, phase checkpoints, every selected/downloaded item, and `research_end` with completed, failed, or interrupted status to `<topic>.jsonl`. Ad-hoc commands use the current date unless a topic is explicit. Partial runs therefore retain enough state to inspect completed work and resume deliberately.
+`research <topic>` logs a run ID, `research_start`, phase checkpoints, every
+selected/downloaded item, and `research_end` with completed, failed, or
+interrupted status to `<topic>.jsonl`. Search routing is explicit `--session`,
+then `FILMOT_SESSION`, then the TOPIC from `--bulk-download TOPIC[:N]`, then
+the current date. A search interrupted before its final outcome records one
+`interrupted` event; interruption after that outcome does not duplicate it.
+Partial runs therefore retain enough state to inspect completed work and resume
+deliberately.
+
+`--summary` folds one named session while keeping unlike universes separate:
+standalone-search API/fetched/post-filter counts, staged research-search counts
+after their explicit gates, selected-download and probe outcomes, unique saved
+transcripts, failed attempts and unique failed videos, and claim mutations. It does not
+reinterpret those numbers as one source count. Listing, replaying, or
+summarizing sessions is read-only, never logs the inspection, and does not
+create project storage on an empty workspace. Malformed/unreadable ledger
+records are surfaced as typed read errors: a partly readable replay/summary is
+`partial`, while a session with no readable events is `failed`, never silently
+reported as complete or empty.
 
 Legacy versions collapsed non-Latin names into `uncategorized` and could strip
 Unicode from mixed-script topics. Filmot never assigns those ambiguous
@@ -413,8 +580,17 @@ Review the displayed source and destination slugs, and confirm only when every
 source file belongs to that topic. Existing destination conflicts remain in
 the legacy directory and are never overwritten.
 
+Current topic slug v1 routing uses Python's bundled Unicode database for NFKC,
+case folding, and character categories. Pin the Python minor version for a
+shared `.filmot_data` directory and inspect routing before upgrading it:
+changes to Unicode tables can move unusual or newly assigned code points. This
+behavior remains for compatibility, and `migrate-topic` does not repair such
+Unicode-version drift.
+
 `sessions NAME --raw` emits one `filmot.result/v1` object, so use
 `jq '.events[]'` when you want to stream individual `filmot.event/v1` records.
+`sessions NAME --summary --raw` instead exposes the derived object in
+`summary`.
 The `.filmot_data/sessions/*.jsonl` storage files remain newline-delimited
 internally. Proxy status, refresh, and probe activity is machine state and is
 therefore deliberately absent from this project ledger.
@@ -630,8 +806,11 @@ filmot research "人工知能" --lang ja --depth 10 --dedupe --sort density
 
 ## Practical Tips
 
-### Tip 1: Always Use `--dedupe` for Bulk Operations
-Many YouTube channels repackage the same content. `--dedupe` hashes the first 500 characters of each transcript and skips duplicates.
+### Tip 1: Use `--dedupe` When Repackaging Is Likely
+Many YouTube channels repackage the same content. `--dedupe` hashes the first
+500 characters of each transcript and skips matching fingerprints. It is an
+exact prefix check, not semantic near-duplicate or lineage analysis; use
+`library echoes` separately when shared phrasing matters.
 
 ### Tip 2: `--sort density` Over `--sort viewcount`
 Default sort is by views, which biases toward popular channels over focused content. `--sort density` (matches per minute) finds the videos most intensely focused on your topic.
@@ -831,15 +1010,29 @@ use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
 - Configuration, API, and total transport failures exit nonzero.
 - Commands that permit partial item success print and log the partial counts;
   total item failure exits nonzero.
-- `--raw` emits exactly one JSON value on stdout. Interactive route progress is
-  suppressed and other diagnostics stay off stdout; JSON error output still
-  carries a nonzero exit. Search JSON reflects client-side filters, ranking,
-  limits, and scope metadata rather than an untouched upstream response.
+- Once Click accepts the command line, `--raw` emits exactly one JSON value on
+  stdout. Interactive route progress is suppressed and other diagnostics stay
+  off stdout; JSON error output still carries a nonzero exit. Invalid CLI
+  syntax/options use Click's text usage error and exit 2 before raw mode runs.
+  External user interruption and a broken stdout pipe can stop the process
+  before a complete value is written and are outside this result contract.
+  Search JSON reflects client-side filters, ranking, limits, and scope metadata
+  rather than an untouched upstream response.
+- Strict raw serialization rejects `NaN`/`Infinity` and emits ASCII-escaped
+  JSON. Unicode strings therefore appear with JSON escapes on the wire but
+  decode to the original code points. `main.py` propagates `main()`'s return
+  through `SystemExit`, so automation receives the documented status.
 - Raw command results use `filmot.result/v1`. Object payloads keep their domain
   keys and add `_filmot` metadata (`schema`, `command`, `status`, `errors`,
-  `warnings`). `sessions NAME --raw` exposes its replay in `events`; every
-  entry uses the durable `filmot.event/v1` envelope with the same outcome
-  vocabulary.
+  `warnings`). Library list/search/compare use `rows`; local search and compare
+  rows include citation details, with timestamps and deep links when saved
+  segments exist. `library echoes` adds `clusters`, `method`, and
+  `artifact_hash`. Claim commands use `rows`, and all four accept `--raw`.
+  `sessions NAME --raw` exposes its replay in `events`, while
+  `sessions NAME --summary --raw` uses `summary`; every replayed event uses the
+  durable `filmot.event/v1` envelope with the same outcome vocabulary.
+- Raw mode affects presentation only. It does not make a read-only command log
+  or make a mutating command read-only.
 
 ### Very long transcripts
 For 2+ hour videos, use `Select-Object -First N` or save to file:
@@ -857,7 +1050,11 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Deep discovery research** | `filmot research "topic" --probe --depth 12 --dedupe` |
 | **Breaking news research** | `filmot research "topic" --scout-days 3 --depth 10` |
 | **Search latest YouTube uploads** | `filmot yt-search "topic" --days 7 --order relevance` |
+| **Named follow-up search** | `filmot search "query" --session TOPIC` |
 | **Locate a phrase across sources** | `filmot library compare "claim phrase" --sort density` |
+| **Raw local citations** | `filmot library compare "claim phrase" --topic TOPIC --raw` |
+| **Audit shared phrasing** | `filmot library echoes TOPIC --ngram 5 --threshold 0.5` |
+| **Persist echo analysis** | `filmot library echoes TOPIC --persist --raw` |
 | **Search library** | `filmot library search "term"` |
 | **Structured export** | `filmot library context TOPIC --format structured` |
 | **Basic search** | `filmot search "query" --full --lang en` |
@@ -874,6 +1071,12 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Pipeline download** | `filmot search "query" --raw \| filmot download -t TOPIC --dedupe` |
 | **List library** | `filmot library list` |
 | **Library stats** | `filmot library stats` |
+| **Add a claim** | `filmot claims add TOPIC "exact statement"` |
+| **Cite claim evidence** | `filmot claims cite TOPIC CLAIM_ID --source URL --relation supports` |
+| **Assess a claim** | `filmot claims assess TOPIC CLAIM_ID --verdict supported --confidence medium` |
+| **Show claims** | `filmot claims show TOPIC [CLAIM_ID] --raw` |
+| **Replay a session** | `filmot sessions TOPIC` |
+| **Summarize a session** | `filmot sessions TOPIC --summary --raw` |
 | **Search non-English** | `filmot search "人工知能" --lang ja --full` |
 | **Search Hebrew** | `filmot search "בינה מלאכותית" --lang iw --full` |
 | **Search Chinese (no lang)** | `filmot search "人工智能" --full` |

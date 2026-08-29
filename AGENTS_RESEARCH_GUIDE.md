@@ -97,26 +97,49 @@ those judgments only after reading the passages and checking primary sources.
 
 ### The Triangle Test
 
-For any claim, find at least three independent sources saying the same thing:
+For any material claim, seek multiple sources with genuinely independent
+reporting or evidence. Three is a useful investigation target, not an
+automatic truth threshold: one authoritative primary record can outweigh many
+derivative retellings, while ten outlets can trace to one press release.
 
 ```bash
 # Source 1: Search transcripts for the claim
-filmot search '"claim keyword" NEAR/15 "related context"' --sort density --min-matches 2
+filmot search '"claim keyword" NEAR/15 "related context"' \
+  --sort density --min-matches 2 --session topic-investigation
 
 # Source 2: Scout for recent YouTube coverage
 filmot yt-search "topic claim" --days 30
 
 # Source 3: Search with different keywords for the same event
-filmot search '"alternative phrasing" NEAR/15 "same context"' --sort density
+filmot search '"alternative phrasing" NEAR/15 "same context"' \
+  --sort density --session topic-investigation
+
+# Audit whether saved sources share unusually similar full-transcript phrasing
+filmot library echoes topic-investigation --raw
 ```
 
 ### Convergence vs. Echo
 
 **Convergence** (trustworthy): Multiple independent journalists/scientists arrive at the same conclusion from different angles. Different channels, different countries, different perspectives — same core facts.
 
-**Echo** (suspicious): Multiple channels repeating the exact same script or numbers. This often means one source (possibly AI-generated) got copied across content farms.
+**Echo** (requires lineage review): Multiple channels repeat unusually similar
+phrasing or numbers. This may reflect a copied script, a common press release,
+licensed material, quotation, or coincidence.
 
-**How to tell the difference**: Read the actual transcripts. Convergent sources use different words, different examples, and add their own analysis. Echo sources have suspiciously similar phrasing.
+**How to tell the difference**: Read the actual transcripts and trace their
+citations. `library echoes` compares full transcripts with Unicode-normalized
+word n-gram Jaccard similarity (5-word shingles and a `0.5` threshold by
+default). Its deterministic single-linkage clusters are advisory candidates,
+not proof of copying, dependence, credibility, falsity, or truth. Record an
+`echo` independence judgment or shared `lineage-group` in claim evidence only
+after the human review. `--persist` writes a content-addressed artifact without
+logging the inspection; the canonical stored content is hashed and any existing
+artifact is verified before reuse. The method records the runtime Unicode
+database version; method v2 pins the extended Han, Kana, Bopomofo, and Hangul
+ranges used for script-aware tokenization. One unreadable/incomplete transcript
+fails the corpus analysis instead of being silently skipped. Human output
+shows only the 25 strongest matches; raw output and artifacts retain every
+pair.
 
 ### The Density + Views + Date Triangle
 
@@ -145,7 +168,7 @@ Searching in other languages is a superpower for breaking echo chambers.
 
 - **Verifying claims originating from a specific country**: Korean superconductor claims → search in Korean (초전도체)
 - **Finding local reporting on global events**: Russia-Ukraine → search in Ukrainian, Russian
-- **Testing if a "worldwide breakthrough" is actually known globally**: If only English-language AI-slop channels report it, it's probably fake
+- **Testing whether a "worldwide breakthrough" has independent global coverage**: English-only derivative coverage is a reason to inspect origin and primary sources, not by itself proof of fabrication
 
 ### What We Learned
 
@@ -169,7 +192,10 @@ filmot research "상온 초전도체" --lang ko --depth 10 --dedupe
 filmot yt-search "상온 초전도체 2025" --days 180
 ```
 
-**Key insight**: When a claim originates from Country X but nobody in Country X is talking about it anymore, the claim is likely dead. The local community always knows first when their own breakthroughs get debunked.
+**Key insight**: Silence in the language of origin is useful negative evidence,
+but it is not dispositive. Index lag, terminology, platform choice, access, and
+publication norms can all hide real activity. Treat a null result as a prompt
+to check primary literature and local institutional sources.
 
 ---
 
@@ -204,20 +230,34 @@ Use `--channel` when you want a named source. The name is resolved to displayed
 channel IDs and the command fails closed when resolution is empty or Filmot
 returns candidates outside the selected IDs.
 
+Before treating the downloaded videos as independent sources, run
+`filmot library echoes "your topic" --raw` and inspect the strongest pairs.
+Use `--persist` only when you need a reproducible artifact under
+`.filmot_data/analysis/TOPIC/`; echo analysis never appends a session event.
+
 ### Phase 2: NEAR/N Surgical Probes (5-10 minutes)
 
 Based on what you learn in Phase 1, go deeper on specific claims:
 
 ```bash
 # Find the specific moment two concepts connect
-filmot search '"person" NEAR/15 "specific claim"' --sort density --min-matches 2
+filmot search '"person" NEAR/15 "specific claim"' \
+  --sort density --min-matches 2 --session "your topic"
 
 # Narrow by date if investigating a specific event
-filmot search '"event" NEAR/10 "detail"' --start-date 2025-01-01 --sort density
+filmot search '"event" NEAR/10 "detail"' \
+  --start-date 2025-01-01 --sort density --session "your topic"
 
 # If you need OR, group it explicitly on either side of NEAR/N
-filmot search '("memory" | "context") NEAR/20 "production"' --sort density
+filmot search '("memory" | "context") NEAR/20 "production"' \
+  --sort density --session "your topic"
 ```
+
+For search activity, routing precedence is explicit `--session`, then
+`FILMOT_SESSION`, then a bulk-download TOPIC, then the current date.
+`filmot sessions "your topic" --summary` keeps manual search events and the
+fallback stages inside `research` in separate scope tables, so repeated
+candidates across stages are not presented as one corpus count.
 
 **If you have a channel corpus downloaded**, you can run the same proximity operators offline:
 
@@ -232,10 +272,15 @@ filmot channel-search chat-with-traders '"blew up account"~5'
 
 For each major claim you want to report:
 
-1. **Count independent sources** — need 2+ credible (Tier 1-2) sources
+1. **Trace source independence** — seek multiple credible sources, but do not
+   substitute a count for an inspectable primary record
 2. **Check for named experts** — anonymous claims are weak
 3. **Look for the counter-narrative** — search for "debunked", "criticism", "fraud"
 4. **Test in another language** if claim is country-specific
+5. **Close on the primary source** when the claim points to a paper, filing,
+   patent, announcement, dataset, or other inspectable original
+6. **Record the evidence relation and assessment explicitly** rather than
+   treating concordance counts as a verdict
 
 ```bash
 # Always check for the counter-narrative
@@ -243,6 +288,50 @@ filmot search '"topic" NEAR/15 "debunked"' --sort density
 filmot search '"topic" NEAR/15 "criticism"' --sort density
 filmot search '"topic" NEAR/15 "fraud"' --sort density
 ```
+
+Use the durable claim register to keep exact source text, analyst notes, and
+judgments separate:
+
+```bash
+# Declare one atomic, falsifiable statement
+filmot claims add "your topic" "One exact claim statement"
+
+# Add supporting, contradictory, qualifying, contextual, origin, or mention evidence
+filmot claims cite "your topic" c-CLAIMID \
+  --source "https://example.org/primary-document" \
+  --source-kind official --relation qualifies --locator "Section 4" \
+  --excerpt "short exact source passage" --note "Analyst interpretation" \
+  --primary --independence independent
+
+# Append a human assessment after reviewing the evidence
+filmot claims assess "your topic" c-CLAIMID \
+  --verdict mixed --confidence medium --note "Why this assessment follows"
+
+# Inspect without changing or logging the claim register
+filmot claims show "your topic" c-CLAIMID --raw
+```
+
+Relations are `supports`, `contradicts`, `qualifies`, `context`, `origin`, and
+`mentions`. `library compare` hits do not become evidence merely because they
+match lexically; the analyst must choose and record the relationship. Claim
+events are strict and append-only, while their session mutation logs contain
+only compact IDs and classifications. A timestamp/`--video` locator belongs
+only to source kind `video`; `--source` and `--video` are mutually exclusive,
+and `--video` requires an exact 11-character YouTube ID matching
+`[A-Za-z0-9_-]{11}`, not a URL; malformed values fail before persistence. Cite
+a paper or patent as a separate evidence item. Derived claim IDs use
+the runtime-independent `utf8-ascii-whitespace/v1` method recorded on the claim.
+Evidence and assessment IDs use the recorded `canonical-json-array/v2` method.
+For evidence, v2 covers all persisted identity/provenance inputs, including
+source locators, quoted text and analyst note, classifications, title/channel,
+and research run; a video deep link is derived and validated separately.
+Strict replay verifies those IDs and the assessment supersedes chain.
+Topic-wide transaction locks prevent simultaneous writers from forking that
+chain, and complete events are validated before they become visible. New
+events use `filmot.claim/v2` with contiguous per-topic sequences. Valid
+sequence-less `filmot.claim/v1` histories remain readable and can be continued
+with v2 events, but the legacy files are ordered only in memory and never
+rewritten.
 
 ### Phase 4: Probe for Connections (optional, 5 minutes)
 
@@ -280,7 +369,10 @@ High views can mean quality OR clickbait. Low views can mean obscure OR niche ex
 **Fix**: Combine view count with channel credentials. A 500-view video from a university physics department > a 500K-view video from "AMAZING SCIENCE FACTS."
 
 ### Trap 3: The "Accidental Discovery" Frame
-Many AI-slop videos use the frame "Scientists ACCIDENTALLY discovered..." because it's clickbait gold. Sometimes it's real (the Caltech superconductor state genuinely was unexpected). Usually it's fabricated.
+Many low-quality videos use the frame "Scientists ACCIDENTALLY discovered..."
+because it is clickbait gold. Sometimes the underlying surprise is real; the
+framing alone cannot establish fabrication. Trace the named result to its
+primary source and compare the source's actual agency and scope claims.
 
 **Fix**: Check if the "accidental" discovery has a paper, named researchers, and institutional backing.
 
@@ -305,7 +397,12 @@ YouTube transcripts tell you what *the world is saying* about a thing — fast, 
 - **The negative-space heuristic inverts on release day.** "If a big claim had real backing, someone credible would be covering it" is a good fake-detector — *except* in the first 24-48 hours after an official announcement, when even true claims haven't echoed yet. A press-release claim with thin organic coverage is not suspicious; it's just new. Don't file it as fabricated.
 - **YouTube inflates agency.** Creators systematically upgrade "the tool assisted experts" into "the tool autonomously beat the experts." Capability claims survive cross-referencing; *agency* claims often don't. Check the primary source for who-did-what.
 
-**Fix**: For any claim that traces to a specific document (paper, announcement, model card, filing, court record), **close on the primary source** before you assign final confidence. Use the tool to find *who is talking and what they emphasize*; use the original document to nail *what is actually true*. A finding isn't "Confirmed" until you've either seen the primary source or triangulated 3+ independent credible reporters who clearly read it themselves.
+**Fix**: For any claim that traces to a specific document (paper,
+announcement, model card, filing, court record), **close on the primary source**
+before you assign final confidence. Use the tool to find *who is talking and
+what they emphasize*; use the original document to nail *what it actually
+says*. Multiple independent reporters can raise confidence, but a count does
+not substitute for a primary source when the original is inspectable.
 
 ---
 
@@ -330,17 +427,28 @@ Always attribute. The user should be able to verify anything you claim:
 - **Good**: "The DARPA germanium claim (Sci Factor, 43 views) shows multiple red flags: misspelled terms, fabricated institutional reports..."
 - **Bad**: "Some sources are less credible"
 
-### Confidence Levels
+### Verdict and Confidence
 
-Be explicit about your confidence:
+Keep the direction of the evidence separate from how certain you are. These
+are the same controlled values accepted by `filmot claims assess`:
 
-| Level | Meaning | Example |
-|-------|---------|---------|
-| **Confirmed** | 3+ independent credible sources agree | "The 2025 Nobel went to Clark, Devoret, Martinis" |
-| **Likely** | 1-2 credible sources, no contradictions | "Caltech discovered Cooper Pair Density Modulation" |
-| **Claimed** | Single source, not yet verified | "The professor says this is a step toward room-temp" |
-| **Disputed** | Sources disagree | "LK-99 claims were contested and ultimately debunked" |
-| **Fabricated** | Clear red flags, no credible backing | "The DARPA germanium video is AI-generated misinformation" |
+| Verdict | Meaning |
+|---------|---------|
+| **open** | Evidence has not yet justified a directional assessment |
+| **supported** | Reviewed evidence supports the exact statement as written |
+| **contradicted** | Reviewed evidence contradicts the exact statement as written |
+| **mixed** | Material supporting and contradicting/qualifying evidence remains |
+
+| Confidence | Meaning |
+|------------|---------|
+| **unknown** | Not assessed or insufficiently inspected |
+| **low** | Tentative; major evidence or independence gaps remain |
+| **medium** | Material evidence reviewed, with explicit limitations |
+| **high** | Strong claim-specific evidence, primary-source closeout where applicable, and serious alternatives addressed |
+
+Source counts are a research heuristic, not an automatic confidence formula.
+Document the rationale in `--note`; Filmot never computes the verdict or
+confidence from citations, popularity, density, or echo clusters.
 
 ---
 
@@ -376,15 +484,19 @@ The tool's real power isn't finding information — any search engine does that.
 ```
 Before reporting any claim:
 [ ] Found 2+ independent credible sources?
+[ ] Checked full-transcript echo/lineage candidates before counting independence?
 [ ] Named researchers/experts involved?
 [ ] Checked for counter-narrative (debunked/criticism)?
 [ ] Verified institutional claims exist?
+[ ] Closed on the primary document when it is inspectable?
 [ ] Checked view count vs. claim magnitude?
 [ ] Tested in language of origin (if applicable)?
-[ ] Separated confirmed facts from single-source claims?
-[ ] Flagged anything that smells like AI-slop?
+[ ] Separated exact source excerpt/locator from analyst note?
+[ ] Recorded supporting, contradictory, and qualifying evidence explicitly?
+[ ] Kept lexical mentions separate from evidence relationships?
+[ ] Assigned a human verdict and confidence with rationale?
 [ ] Attributed every claim to its source?
-[ ] Stated confidence level for each finding?
+[ ] Preserved timestamp/deep-link details when saved segments provide them?
 ```
 
 ---

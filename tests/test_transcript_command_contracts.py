@@ -56,7 +56,9 @@ def test_transcript_human_branches_share_logged_outcome(
         "segment_count": 1,
         "segments": [{"start": 0, "text": "hello", "duration": 1}],
         "full_text": "hello",
-        "chunks": [{"start_formatted": "00:00", "text": "hello"}],
+        "chunks": [
+            {"start": 0, "start_formatted": "00:00", "text": "hello"}
+        ],
         "chunk_minutes": 2.0,
         "route": "direct",
         "routes_tried": ["direct"],

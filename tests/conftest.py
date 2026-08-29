@@ -18,7 +18,11 @@ import filmot.transcript as transcript_module
 
 @pytest.fixture(autouse=True)
 def _isolated_proxy_state(monkeypatch, tmp_path):
-    """Keep machine-global runtime state inside each test's temp directory."""
+    """Keep machine-global and project-local state inside each test's temp directory."""
+    # Project-local research data (including legacy proxy state such as
+    # ``.filmot_data/webshare_pool_file.json``) resolves from the working
+    # directory, so a developer checkout must never leak into a test.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("FILMOT_CONFIG_DIR", str(tmp_path / "user-config"))
     monkeypatch.setenv("FILMOT_STATE_DIR", str(tmp_path / "user-state"))
     monkeypatch.setenv("FILMOT_CACHE_DIR", str(tmp_path / "user-cache"))

@@ -562,6 +562,15 @@ def _render_research_result(
         f'  filmot library compare "claim" --topic {data["topic"]}'
     )
     console.print(
+        f'  filmot library echoes {data["topic"]}'
+    )
+    console.print(
+        f'  filmot claims add {data["topic"]} "exact claim statement"'
+    )
+    console.print(
+        f'  filmot sessions {data["topic"]} --summary'
+    )
+    console.print(
         f'  filmot library context {data["topic"]} -o context.txt'
     )
 
@@ -1128,6 +1137,8 @@ def research(
                 "title": scout_video.get("title", ""),
                 "description": scout_video.get("description", ""),
                 "channelname": scout_video.get("channel_title", ""),
+                "channelid": scout_video.get("channel_id", ""),
+                "uploaddate": scout_video.get("published_at", ""),
                 "viewcount": scout_video.get("views", 0),
                 "duration": 0,
                 "hits": [],
@@ -1393,6 +1404,9 @@ def research(
                 metadata = {
                     "title": title_text,
                     "channel": channel_name,
+                    "channel_id": video.get("channelid"),
+                    "published_at": video.get("uploaddate"),
+                    "source": transcript_result.get("source", "youtube"),
                     "language": transcript_result.get("language"),
                     "is_generated": transcript_result.get("is_generated"),
                     "duration_seconds": transcript_result.get("duration_seconds"),
@@ -1402,12 +1416,14 @@ def research(
                     "selection_stage": source,
                     "selection_signals": selection,
                     "route": transcript_result.get("route"),
+                    "routes_tried": transcript_result.get("routes_tried"),
                 }
                 library.save(
                     video_id=video_id,
                     topic=normalized_topic,
                     transcript_text=full_text,
                     metadata=metadata,
+                    segments=transcript_result.get("segments", []),
                 )
                 success_count += 1
                 total_chars += len(full_text)
@@ -1717,6 +1733,9 @@ def research(
                             metadata={
                                 "title": title_text,
                                 "channel": channel_name,
+                                "channel_id": video.get("channelid"),
+                                "published_at": video.get("uploaddate"),
+                                "source": transcript_result.get("source", "youtube"),
                                 "language": transcript_result.get("language"),
                                 "is_generated": transcript_result.get("is_generated"),
                                 "duration_seconds": transcript_result.get("duration_seconds"),
@@ -1726,7 +1745,9 @@ def research(
                                 "selection_stage": "probe",
                                 "selection_signals": video.get("_selection"),
                                 "route": transcript_result.get("route"),
+                                "routes_tried": transcript_result.get("routes_tried"),
                             },
+                            segments=transcript_result.get("segments", []),
                         )
                         probe_success += 1
                         probe_chars += len(full_text)

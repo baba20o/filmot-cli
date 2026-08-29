@@ -107,6 +107,162 @@ def test_ledger_skips_none_fields(tmp_path):
     assert ev["data"]["results"] == 3
 
 
+def test_session_summary_keeps_count_universes_separate():
+    events = [
+        {
+            "ts": "2026-01-01T00:00:00",
+            "kind": "search",
+            "status": "completed",
+            "data": {
+                "query": "alpha",
+                "api_total": 24,
+                "page_count": 20,
+                "post_filter_count": 15,
+            },
+        },
+        {
+            "ts": "2026-01-01T00:01:00",
+            "kind": "search",
+            "status": "completed",
+            "data": {
+                "query": "alpha variant",
+                "api_total": 10,
+                "page_count": 10,
+                "post_filter_count": 10,
+            },
+        },
+        {
+            "ts": "2026-01-01T00:02:00",
+            "kind": "research_checkpoint",
+            "status": "started",
+            "data": {
+                "run_id": "run-1",
+                "phase": "search",
+                "stage": "exact_phrase",
+                "query": '"alpha beta"',
+            },
+        },
+        {
+            "ts": "2026-01-01T00:03:00",
+            "kind": "research_checkpoint",
+            "status": "completed",
+            "data": {
+                "run_id": "run-1",
+                "phase": "search",
+                "stage": "exact_phrase",
+                "query": '"alpha beta"',
+                "api_total": 100,
+                "candidates": 40,
+                "pages": 2,
+            },
+        },
+        {
+            "kind": "research_checkpoint",
+            "status": "completed",
+            "data": {
+                "run_id": "run-1",
+                "phase": "search_filter",
+                "stage": "exact_phrase",
+                "candidates": 40,
+                "eligible": 18,
+            },
+        },
+        {
+            "kind": "research_checkpoint",
+            "status": "completed",
+            "data": {
+                "run_id": "run-1",
+                "phase": "relationship_gate",
+                "stage": "exact_phrase",
+                "candidates_before": 18,
+                "candidates_after": 7,
+            },
+        },
+        {"kind": "transcript_save", "status": "completed", "data": {"video_id": "a"}},
+        {"kind": "transcript_save", "status": "completed", "data": {"video_id": "b"}},
+        {"kind": "transcript_save", "status": "failed", "data": {"video_id": "x"}},
+        {"kind": "transcript", "status": "failed", "data": {"video_id": "x"}},
+        {"kind": "transcript", "status": "failed", "data": {"video_id": "x"}},
+        {"kind": "transcript", "status": "failed", "data": {"video_id": "y"}},
+        {
+            "kind": "research_checkpoint",
+            "status": "completed",
+            "data": {
+                "phase": "download_item",
+                "detail_status": "saved",
+                "video_id": "c",
+            },
+        },
+        {
+            "kind": "research_checkpoint",
+            "status": "failed",
+            "data": {"phase": "probe_download", "video_id": "y"},
+        },
+        {
+            "kind": "research_end",
+            "status": "completed",
+            "data": {
+                "run_id": "run-1",
+                "saved": 3,
+                "failed": 1,
+                "probe": 99,
+                "probe_failed": 99,
+            },
+        },
+        {
+            "kind": "research",
+            "status": "completed",
+            "data": {
+                "run_id": "run-1",
+                "selected": 7,
+                "saved": 3,
+                "skipped": 2,
+                "failed": 1,
+                "deduped": 1,
+                "probe_saved": 2,
+                "probe_download_failed": 1,
+                "probe_query_failed": 3,
+            },
+        },
+        {
+            "kind": "claims_add",
+            "status": "completed",
+            "data": {"claim_id": "c-one"},
+        },
+        {
+            "kind": "claims_add",
+            "status": "skipped",
+            "data": {"claim_id": "c-one"},
+        },
+    ]
+
+    summary = ledger.summarize_events("trip", events)
+
+    assert summary["searches"]["candidate_fetches"] == 30
+    assert summary["searches"]["post_filter_results"] == 25
+    assert [row["api_total"] for row in summary["searches"]["scope_rows"]] == [24, 10]
+    assert summary["research_searches"]["stages"] == 1
+    assert summary["research_searches"]["candidate_fetches"] == 40
+    assert summary["research_searches"]["post_filter_results"] == 7
+    assert [
+        step["phase"]
+        for step in summary["research_searches"]["scope_rows"][0]["filter_steps"]
+    ] == ["search_filter", "relationship_gate"]
+    assert summary["transcripts"]["saved_unique"] == 3
+    assert summary["transcripts"]["failed_attempts"] == 5
+    assert summary["transcripts"]["failed_unique"] == 2
+    assert summary["research"]["runs"] == 1
+    assert summary["research"]["saved_reported"] == 3
+    assert summary["research"]["skipped_reported"] == 2
+    assert summary["research"]["deduped_reported"] == 1
+    assert summary["research"]["probe_saved_reported"] == 2
+    assert summary["research"]["probe_download_failed_reported"] == 1
+    assert summary["research"]["probe_query_failed_reported"] == 3
+    assert summary["research"]["total_saved_reported"] == 5
+    assert summary["claims"]["mutation_events"] == 1
+    assert summary["claims"]["unique_claim_ids"] == ["c-one"]
+
+
 def test_ledger_uses_same_unicode_slug_as_library(tmp_path):
     d = str(tmp_path / ".filmot_data")
     topics = ["人工知能", "초전도체", "искусственный интеллект", "الذكاء الاصطناعي"]

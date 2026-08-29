@@ -63,6 +63,54 @@ def redact_diagnostic(value: Any) -> Any:
     return value
 
 
+def emit_raw_result(
+    outcome: CommandResult,
+    *,
+    indent: Optional[int] = None,
+) -> CommandResult:
+    """Emit one standards-compliant JSON result or a typed serialization error."""
+    emitted = prepare_raw_result(outcome)
+    rendered = json.dumps(
+        emitted.to_raw_dict(),
+        indent=indent,
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    click.echo(rendered)
+    if not emitted.ok:
+        raise click.exceptions.Exit(1)
+    return emitted
+
+
+def prepare_raw_result(outcome: CommandResult) -> CommandResult:
+    """Return the exact JSON-safe outcome that raw output will emit.
+
+    Logged commands call this before ``log_result`` so a serialization failure
+    cannot be reported as completed in the durable session ledger and failed on
+    stdout.
+    """
+    try:
+        json.dumps(
+            outcome.to_raw_dict(),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        message = "Result is not valid JSON: {}".format(
+            redact_diagnostic(error)
+        )
+        return CommandResult.failed(
+            outcome.command,
+            {"error": message},
+            ErrorDetail(
+                type="InvalidJSONValue",
+                message=message,
+                stage="serialize-result",
+            ),
+        )
+    return outcome
+
+
 def command_error(
     message: str,
     *,
@@ -97,7 +145,7 @@ def command_error(
                 stage=stage,
             ),
         )
-        click.echo(json.dumps(result.to_raw_dict(), indent=2, ensure_ascii=False))
+        emit_raw_result(result, indent=2)
         raise click.exceptions.Exit(1)
     raise click.ClickException(safe_message)
 

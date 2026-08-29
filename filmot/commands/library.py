@@ -1,5 +1,6 @@
 """Transcript-library and research-session commands."""
 
+from contextlib import nullcontext
 import json as json_mod
 from typing import Optional
 
@@ -7,9 +8,15 @@ import click
 from rich.panel import Panel
 from rich.table import Table
 
-from ..cli_support import command_error as _command_error, console
+from ..cli_support import (
+    command_error as _command_error,
+    console,
+    emit_raw_result as _emit_raw_result,
+)
 from ..schemas import (
     CommandResult,
+    ECHO_ANALYSIS_SCHEMA,
+    EchoAnalysisResultData,
     ErrorDetail,
     LibraryResultData,
     ResultStatus,
@@ -18,10 +25,14 @@ from ..schemas import (
 from .search import _format_duration
 
 
+ECHO_HUMAN_PAIR_LIMIT = 25
+
+
 def _render_library_list(
     outcome: CommandResult[LibraryResultData],
 ) -> None:
     """Render a typed library inventory."""
+    _render_library_failure(outcome, "Library listing failed")
     data = outcome.data
     rows = data.get("rows") or []
     topic = data.get("topic")
@@ -130,9 +141,30 @@ def _render_library_search(
             f"{row.get('title', 'Unknown')} - "
             f"{row.get('channel', 'Unknown')}"
         )
-        for match in row.get("matches", [])[:2]:
-            console.print(f"  [dim]...{match}[/dim]")
+        details = row.get("match_details") or []
+        if details:
+            for match in details[:2]:
+                locator = ""
+                if match.get("timestamp") and match.get("url"):
+                    locator = "[[link={url}]{timestamp}[/link]] ".format(
+                        url=match["url"],
+                        timestamp=match["timestamp"],
+                    )
+                console.print(
+                    "  [dim]{}{}[/dim]".format(
+                        locator,
+                        match.get("excerpt", ""),
+                    )
+                )
+        else:
+            for match in row.get("matches", [])[:2]:
+                console.print(f"  [dim]...{match}[/dim]")
         console.print()
+
+
+def _emit_library_raw(outcome: CommandResult[LibraryResultData]) -> None:
+    """Write the same typed outcome used by the human renderer."""
+    _emit_raw_result(outcome)
 
 
 @click.group()
@@ -148,6 +180,8 @@ def library():
         filmot library list                    # List all topics
         filmot library list prompt-injection   # List transcripts in topic
         filmot library search "attack"         # Search across all transcripts
+        filmot library search "claim" --raw    # Timestamped local citations
+        filmot library echoes prompt-injection  # Advisory full-text lineage scan
         filmot library context prompt-injection # Get all text for LLM context
         filmot library stats                   # Show library statistics
     """
@@ -156,85 +190,108 @@ def library():
 
 @library.command("list")
 @click.argument("topic", required=False)
-def library_list(topic: str):
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def library_list(topic: str, raw: bool):
     """List topics or transcripts in a topic.
 
     Without arguments, lists all topics.
-    With a topic name, lists all transcripts in that topic.
+    With a topic name, lists all transcripts in that topic. This is a
+    read-only inspection: it does not create storage or append a session event.
     """
-    from ..library import get_library
-    from ..ledger import log_result
-    lib = get_library()
+    try:
+        from ..library import get_library
+        lib = get_library()
 
-    if topic:
-        # List transcripts in topic
-        transcripts = lib.list_transcripts(topic)
-        data: LibraryResultData = {
-            "topic": topic,
-            "rows": transcripts,
-            "summary": {"transcripts": len(transcripts)},
-        }
-        outcome = CommandResult(
-            command="library-list",
-            status=(
-                ResultStatus.COMPLETED
-                if transcripts
-                else ResultStatus.EMPTY
-            ),
-            data=data,
-        )
-        log_result(
-            "library_list",
-            outcome,
-            topic=topic,
-            data={"scope": "topic", "transcripts": len(transcripts)},
-        )
-    else:
-        # List all topics
-        topics = lib.list_topics()
-        total = sum(int(row.get("count", 0)) for row in topics)
+        if topic:
+            # List transcripts in topic
+            transcripts = lib.list_transcripts(topic)
+            data: LibraryResultData = {
+                "topic": topic,
+                "rows": transcripts,
+                "summary": {"transcripts": len(transcripts)},
+            }
+            outcome = CommandResult(
+                command="library-list",
+                status=(
+                    ResultStatus.COMPLETED
+                    if transcripts
+                    else ResultStatus.EMPTY
+                ),
+                data=data,
+            )
+        else:
+            # List all topics
+            topics = lib.list_topics()
+            total = sum(int(row.get("count", 0)) for row in topics)
+            data = {
+                "rows": topics,
+                "summary": {
+                    "topics": len(topics),
+                    "transcripts": total,
+                },
+            }
+            outcome = CommandResult(
+                command="library-list",
+                status=(
+                    ResultStatus.COMPLETED
+                    if topics
+                    else ResultStatus.EMPTY
+                ),
+                data=data,
+            )
+    except Exception as error:
         data = {
-            "rows": topics,
-            "summary": {
-                "topics": len(topics),
-                "transcripts": total,
-            },
+            "topic": topic,
+            "rows": [],
+            "summary": {"topics": 0, "transcripts": 0},
         }
-        outcome = CommandResult(
-            command="library-list",
-            status=(
-                ResultStatus.COMPLETED
-                if topics
-                else ResultStatus.EMPTY
+        outcome = CommandResult.failed(
+            "library-list",
+            data,
+            ErrorDetail.from_exception(
+                error,
+                stage="list",
+                details={"topic": topic},
             ),
-            data=data,
         )
-        log_result(
-            "library_list",
-            outcome,
-            data={"scope": "all", "topics": len(topics)},
-        )
-    _render_library_list(outcome)
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_library_list(outcome)
+        raise click.exceptions.Exit(1)
+
+    if raw:
+        _emit_library_raw(outcome)
+    else:
+        _render_library_list(outcome)
 
 
 @library.command("search")
 @click.argument("query")
 @click.option("--topic", "-t", default=None, help="Limit search to specific topic")
 @click.option("--substring", is_flag=True, help="Use substring matching instead of word-boundary matching")
-def library_search(query: str, topic: str, substring: bool):
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def library_search(query: str, topic: str, substring: bool, raw: bool):
     """Search for text across saved transcripts.
 
     Uses word-boundary matching by default (searching "ore" won't match "more").
-    Use --substring for the old behavior.
+    Use --substring for the old behavior. Timestamped saved segments produce
+    citation-ready locators in --raw output. This command never logs or mutates
+    the project library.
     """
-    from ..library import get_library
-    from ..ledger import log_result
-    lib = get_library()
-
     used_substring = substring
     fallback_used = False
+    stage = "open-library"
     try:
-        with console.status(f"Searching library for '{query}'..."):
+        from ..library import get_library
+        lib = get_library()
+        stage = "search"
+        status = (
+            nullcontext()
+            if raw
+            else console.status(f"Searching library for '{query}'...")
+        )
+        with status:
             results = lib.search(
                 query,
                 topic=topic,
@@ -247,6 +304,35 @@ def library_search(query: str, topic: str, substring: bool):
             if results:
                 used_substring = True
                 fallback_used = True
+        stage = "build-result"
+        if not isinstance(results, list):
+            raise TypeError("Library search results must be a list")
+        total_matches = sum(int(row["match_count"]) for row in results)
+        data = {
+            "topic": topic,
+            "query": query,
+            "rows": results,
+            "summary": {
+                "substring": used_substring,
+                "fallback_used": fallback_used,
+                "sources": len(results),
+                "matches": total_matches,
+            },
+        }
+        outcome = CommandResult(
+            command="library-search",
+            status=(
+                ResultStatus.COMPLETED
+                if results
+                else ResultStatus.EMPTY
+            ),
+            data=data,
+            warnings=(
+                ["Used substring fallback after word-boundary search was empty."]
+                if fallback_used
+                else []
+            ),
+        )
     except Exception as error:
         data: LibraryResultData = {
             "topic": topic,
@@ -264,62 +350,19 @@ def library_search(query: str, topic: str, substring: bool):
             data,
             ErrorDetail.from_exception(
                 error,
-                stage="search",
+                stage=stage,
                 details={"topic": topic, "substring": used_substring},
             ),
         )
-        log_result(
-            "library_search",
-            outcome,
-            topic=topic,
-            data={
-                "query": query,
-                "substring": used_substring,
-                "sources": 0,
-                "matches": 0,
-            },
-        )
-        _render_library_search(outcome)
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_library_search(outcome)
         raise click.exceptions.Exit(1)
-
-    total_matches = sum(int(row["match_count"]) for row in results)
-    data = {
-        "topic": topic,
-        "query": query,
-        "rows": results,
-        "summary": {
-            "substring": used_substring,
-            "fallback_used": fallback_used,
-            "sources": len(results),
-            "matches": total_matches,
-        },
-    }
-    outcome = CommandResult(
-        command="library-search",
-        status=(
-            ResultStatus.COMPLETED
-            if results
-            else ResultStatus.EMPTY
-        ),
-        data=data,
-        warnings=(
-            ["Used substring fallback after word-boundary search was empty."]
-            if fallback_used
-            else []
-        ),
-    )
-    log_result(
-        "library_search",
-        outcome,
-        topic=topic,
-        data={
-            "query": query,
-            "substring": used_substring,
-            "sources": len(results),
-            "matches": total_matches,
-        },
-    )
-    _render_library_search(outcome)
+    if raw:
+        _emit_library_raw(outcome)
+    else:
+        _render_library_search(outcome)
 
 
 def _render_library_context(
@@ -370,6 +413,8 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
     with headers separating each video.
 
     Use --format structured for markdown with full metadata headers.
+    Printing context is read-only and does not log. Writing --output (including
+    the structured default output) records the materialized artifact event.
     """
     from ..library import get_library
     from ..ledger import log_result
@@ -401,17 +446,6 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
                 details={"topic": topic, "format": fmt},
             ),
         )
-        log_result(
-            "library_context",
-            outcome,
-            topic=topic,
-            data={
-                "format": fmt,
-                "max_chars": max_chars,
-                "chars": 0,
-                "delivery": "failed",
-            },
-        )
         _render_library_context(outcome)
         raise click.exceptions.Exit(1)
 
@@ -430,17 +464,6 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
             command="library-context",
             status=ResultStatus.EMPTY,
             data=data,
-        )
-        log_result(
-            "library_context",
-            outcome,
-            topic=topic,
-            data={
-                "format": fmt,
-                "max_chars": max_chars,
-                "chars": 0,
-                "delivery": "empty",
-            },
         )
         _render_library_context(outcome)
         return
@@ -505,18 +528,19 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
     if output:
         data["output"] = output
     outcome = CommandResult.completed("library-context", data)
-    log_result(
-        "library_context",
-        outcome,
-        topic=topic,
-        data={
-            "format": fmt,
-            "max_chars": max_chars,
-            "chars": len(context),
-            "output": output,
-            "delivery": delivery,
-        },
-    )
+    if output:
+        log_result(
+            "library_context",
+            outcome,
+            topic=topic,
+            data={
+                "format": fmt,
+                "max_chars": max_chars,
+                "chars": len(context),
+                "output": output,
+                "delivery": delivery,
+            },
+        )
     _render_library_context(outcome)
 
 
@@ -592,9 +616,8 @@ def _render_library_stats(
 
 @library.command("stats")
 def library_stats():
-    """Show library statistics."""
+    """Show library statistics without logging or writing project state."""
     from ..library import get_library
-    from ..ledger import log_result
     lib = get_library()
 
     try:
@@ -613,15 +636,6 @@ def library_stats():
             "library-stats",
             data,
             ErrorDetail.from_exception(error, stage="statistics"),
-        )
-        log_result(
-            "library_stats",
-            outcome,
-            data={
-                "topics": 0,
-                "transcripts": 0,
-                "size_bytes": 0,
-            },
         )
         _render_library_stats(outcome)
         raise click.exceptions.Exit(1)
@@ -646,15 +660,6 @@ def library_stats():
             else ResultStatus.EMPTY
         ),
         data=data,
-    )
-    log_result(
-        "library_stats",
-        outcome,
-        data={
-            "topics": data["summary"]["total_topics"],
-            "transcripts": data["summary"]["total_transcripts"],
-            "size_bytes": data["summary"]["total_size_bytes"],
-        },
     )
     _render_library_stats(outcome)
 
@@ -1149,8 +1154,11 @@ def _render_library_compare(
             f"  [dim]Video:[/dim] "
             f"https://youtube.com/watch?v={row.get('video_id', '')}"
         )
-        for match in row.get("excerpts", [])[:3]:
-            highlighted = str(match)
+        details = row.get("excerpt_details") or [
+            {"excerpt": match} for match in row.get("excerpts", [])[:3]
+        ]
+        for match in details[:3]:
+            highlighted = str(match.get("excerpt", ""))
             for variant in (
                 query,
                 query.lower(),
@@ -1161,7 +1169,13 @@ def _render_library_compare(
                     variant,
                     f"[bold yellow]{variant}[/bold yellow]",
                 )
-            console.print(f"  [dim]{highlighted}[/dim]")
+            locator = ""
+            if match.get("timestamp") and match.get("url"):
+                locator = "[[link={url}]{timestamp}[/link]] ".format(
+                    url=match["url"],
+                    timestamp=match["timestamp"],
+                )
+            console.print(f"  [dim]{locator}{highlighted}[/dim]")
 
     console.print(
         f"\n[dim]Sources sorted by {summary.get('sort_label')} "
@@ -1174,11 +1188,20 @@ def _render_library_compare(
 @click.option("--topic", "-t", default=None, help="Limit to specific topic")
 @click.option("--context", "-c", "context_chars", default=300, type=click.IntRange(0), help="Characters of context around matches (default: 300)")
 @click.option("--sort", "sort_by", default="mentions", type=click.Choice(["mentions", "density"]), help="Sort by mention count (default) or density (mentions/min)")
-def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def library_compare(
+    query: str,
+    topic: str,
+    context_chars: int,
+    sort_by: str,
+    raw: bool,
+):
     """Build a lexical concordance across sources for a term or phrase.
 
     This counts text matches and shows excerpts. It does not determine source
     independence, stance, agreement, contradiction, credibility, or truth.
+    Timestamped saved segments produce deep-linked excerpt locators in --raw
+    output. The command is read-only and never appends a session event.
 
     Examples:
 
@@ -1186,14 +1209,18 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
         filmot library compare "dark oxygen" --topic deep-sea-mining
         filmot library compare "moratorium" --context 200
     """
-    from ..library import get_library
-    from ..ledger import log_result
-    lib = get_library()
-
     used_substring = False
-    stage = "search"
+    stage = "open-library"
     try:
-        with console.status(f"Comparing '{query}' across sources..."):
+        from ..library import get_library
+        lib = get_library()
+        stage = "search"
+        status = (
+            nullcontext()
+            if raw
+            else console.status(f"Comparing '{query}' across sources...")
+        )
+        with status:
             results = lib.search(query, topic=topic)
 
         # Auto-fallback catches plurals/inflections.
@@ -1206,12 +1233,13 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
         import re as _re
 
         pattern = (
-            _re.compile(_re.escape(query.lower()))
+            _re.compile(_re.escape(query), flags=_re.IGNORECASE)
             if used_substring
             else _re.compile(
                 r"(?<!\w)"
-                + _re.escape(query.lower())
-                + r"(?!\w)"
+                + _re.escape(query)
+                + r"(?!\w)",
+                flags=_re.IGNORECASE,
             )
         )
         rows = []
@@ -1233,13 +1261,15 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
                 if duration and duration > 0
                 else None
             )
-            excerpts = (
-                lib._find_matches(
+            excerpt_details = (
+                lib._find_match_details(
                     transcript_data.get("transcript", ""),
-                    query.lower(),
+                    query,
                     context_chars=context_chars,
                     pattern=pattern,
                     min_gap=context_chars,
+                    segments=transcript_data.get("segments") or [],
+                    video_id=str(result["video_id"]),
                 )
                 if transcript_data
                 else []
@@ -1252,7 +1282,10 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
                     "channel": result.get("channel", "Unknown"),
                     "match_count": int(result["match_count"]),
                     "density": density,
-                    "excerpts": excerpts[:3],
+                    "excerpts": [
+                        item["excerpt"] for item in excerpt_details[:3]
+                    ],
+                    "excerpt_details": excerpt_details[:3],
                 }
             )
         if sort_by == "density":
@@ -1260,6 +1293,45 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
                 key=lambda row: float(row.get("density") or 0),
                 reverse=True,
             )
+        stage = "build-result"
+        total_mentions = sum(int(row["match_count"]) for row in rows)
+        sort_label = (
+            "density (mentions/min)"
+            if sort_by == "density"
+            else "mention count"
+        )
+        data = {
+            "topic": topic,
+            "query": query,
+            "rows": rows,
+            "summary": {
+                "sort": sort_by,
+                "sort_label": sort_label,
+                "context": context_chars,
+                "match_mode": (
+                    "substring"
+                    if used_substring
+                    else "word_boundary"
+                ),
+                "fallback_used": used_substring,
+                "sources": len(rows),
+                "matches": total_mentions,
+            },
+        }
+        outcome = CommandResult(
+            command="library-compare",
+            status=(
+                ResultStatus.COMPLETED
+                if rows
+                else ResultStatus.EMPTY
+            ),
+            data=data,
+            warnings=(
+                ["Used substring fallback after word-boundary search was empty."]
+                if used_substring
+                else []
+            ),
+        )
     except Exception as error:
         data: LibraryResultData = {
             "topic": topic,
@@ -1296,78 +1368,175 @@ def library_compare(query: str, topic: str, context_chars: int, sort_by: str):
                 },
             ),
         )
-        log_result(
-            "library_compare",
-            outcome,
-            topic=topic,
-            data={
-                "query": query,
-                "sort": sort_by,
-                "context": context_chars,
-                "match_mode": (
-                    "substring"
-                    if used_substring
-                    else "word_boundary"
-                ),
-                "sources": 0,
-                "matches": 0,
-            },
-        )
-        _render_library_compare(outcome)
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_library_compare(outcome)
         raise click.exceptions.Exit(1)
 
-    total_mentions = sum(int(row["match_count"]) for row in rows)
-    sort_label = (
-        "density (mentions/min)"
-        if sort_by == "density"
-        else "mention count"
-    )
-    data = {
-        "topic": topic,
-        "query": query,
-        "rows": rows,
-        "summary": {
-            "sort": sort_by,
-            "sort_label": sort_label,
-            "context": context_chars,
-            "match_mode": (
-                "substring"
-                if used_substring
-                else "word_boundary"
+    if raw:
+        _emit_library_raw(outcome)
+    else:
+        _render_library_compare(outcome)
+
+
+def _render_library_echoes(
+    outcome: CommandResult[EchoAnalysisResultData],
+) -> None:
+    data = outcome.data
+    summary = data.get("summary") or {}
+    console.print(
+        Panel(
+            "Compared {sources} full transcripts across {pairs} pairs; "
+            "{matched} pairs met the threshold and formed {clusters} clusters.".format(
+                sources=summary.get("sources", 0),
+                pairs=summary.get("pairs", 0),
+                matched=summary.get("matched_pairs", 0),
+                clusters=summary.get("clusters", 0),
             ),
-            "fallback_used": used_substring,
-            "sources": len(rows),
-            "matches": total_mentions,
-        },
-    }
-    outcome = CommandResult(
-        command="library-compare",
-        status=(
-            ResultStatus.COMPLETED
-            if rows
-            else ResultStatus.EMPTY
-        ),
-        data=data,
-        warnings=(
-            ["Used substring fallback after word-boundary search was empty."]
-            if used_substring
-            else []
+            title="Echo Analysis: {}".format(data.get("topic", "")),
+        )
+    )
+    matched_rows = sorted(
+        (row for row in data.get("rows") or [] if row.get("matched")),
+        key=lambda row: (
+            -float(row.get("score") or 0),
+            -int(row.get("shared_shingles") or 0),
+            str(row.get("source_a") or ""),
+            str(row.get("source_b") or ""),
         ),
     )
-    log_result(
-        "library_compare",
-        outcome,
-        topic=topic,
-        data={
-            "query": query,
-            "sort": sort_by,
-            "context": context_chars,
-            "match_mode": data["summary"]["match_mode"],
-            "sources": len(rows),
-            "matches": total_mentions,
-        },
+    if matched_rows:
+        table = Table(title="Strongest shared-phrasing lineage candidates")
+        table.add_column("Source A", style="cyan")
+        table.add_column("Source B", style="cyan")
+        table.add_column("Jaccard", justify="right")
+        table.add_column("Shared n-grams", justify="right")
+        for row in matched_rows[:ECHO_HUMAN_PAIR_LIMIT]:
+            table.add_row(
+                str(row.get("source_a", "")),
+                str(row.get("source_b", "")),
+                "{:.3f}".format(float(row.get("score") or 0)),
+                str(row.get("shared_shingles", 0)),
+            )
+        console.print(table)
+        if len(matched_rows) > ECHO_HUMAN_PAIR_LIMIT:
+            console.print(
+                "[dim]Showing {} of {} matched pairs; use --raw or --persist "
+                "for the complete pair set.[/dim]".format(
+                    ECHO_HUMAN_PAIR_LIMIT,
+                    len(matched_rows),
+                )
+            )
+    else:
+        console.print("[dim]No source pair met the configured threshold.[/dim]")
+    method = data.get("method") or {}
+    console.print(
+        "[dim]Advisory only: shared phrasing can suggest reuse or common "
+        "lineage; it does not establish copying, independence, credibility, "
+        "falsity, or truth. Method: {name}/v{version}, {ngram}-grams, "
+        "threshold {threshold}.[/dim]".format(
+            name=method.get("name", ""),
+            version=method.get("version", ""),
+            ngram=method.get("ngram", ""),
+            threshold=method.get("threshold", ""),
+        )
     )
-    _render_library_compare(outcome)
+    if data.get("artifact"):
+        console.print("[green]Saved reproducible artifact: {}[/green]".format(data["artifact"]))
+
+
+@library.command("echoes")
+@click.argument("topic")
+@click.option("--ngram", default=5, type=click.IntRange(1), show_default=True, help="Word n-gram size")
+@click.option(
+    "--threshold",
+    default=0.5,
+    type=click.FloatRange(min=0.0, max=1.0, min_open=True),
+    show_default=True,
+    help="Minimum Jaccard score for a pair to form a cluster",
+)
+@click.option("--persist", is_flag=True, help="Write a content-addressed analysis artifact")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def library_echoes(
+    topic: str,
+    ngram: int,
+    threshold: float,
+    persist: bool,
+    raw: bool,
+):
+    """Compare full saved transcripts for advisory shared-phrasing clusters.
+
+    The default command is read-only and never logs. --persist writes a
+    content-addressed JSON artifact under .filmot_data/analysis/TOPIC/.
+    Clusters indicate possible reuse or shared lineage, not proof of copying,
+    dependence, credibility, falsity, or truth.
+    """
+    from ..analysis import analyze_echoes, persist_echo_analysis
+    from ..library import get_library
+
+    sources = []
+    stage = "open-library"
+    try:
+        lib = get_library()
+        stage = "read-corpus"
+        for item in lib.read_topic_records(topic):
+            metadata = item.get("metadata") or {}
+            sources.append({
+                "source_id": str(item["video_id"]),
+                "title": str(metadata.get("title") or ""),
+                "channel": str(metadata.get("channel") or ""),
+                "url": str((item.get("source") or {}).get("url") or ""),
+                "language": str(metadata.get("language") or ""),
+                "transcript_source": str(metadata.get("source") or ""),
+                "saved_at": str(item.get("saved_at") or ""),
+                "text": str(item.get("transcript") or ""),
+            })
+        stage = "analyze-transcripts"
+        analysis = analyze_echoes(
+            sources,
+            ngram=ngram,
+            threshold=threshold,
+            topic=topic,
+        )
+        artifact = None
+        if persist:
+            stage = "persist-analysis"
+            artifact = persist_echo_analysis(topic, analysis)
+        stage = "build-result"
+        data: EchoAnalysisResultData = {
+            "analysis_schema": ECHO_ANALYSIS_SCHEMA,
+            "topic": topic,
+            "rows": list(analysis["pairs"]),
+            "clusters": list(analysis["clusters"]),
+            "summary": dict(analysis["summary"]),
+            "method": dict(analysis["method"]),
+            "artifact_hash": str(analysis["artifact_hash"]),
+        }
+        if artifact is not None:
+            data["artifact"] = str(artifact)
+        outcome = CommandResult(
+            command="library-echoes",
+            status=(
+                ResultStatus.COMPLETED
+                if analysis["summary"]["pairs"]
+                else ResultStatus.EMPTY
+            ),
+            data=data,
+        )
+    except Exception as error:
+        _command_error(
+            str(error),
+            command="library-echoes",
+            raw=raw,
+            error_type=type(error).__name__,
+            stage=stage,
+        )
+
+    if raw:
+        _emit_raw_result(outcome)
+    else:
+        _render_library_echoes(outcome)
 
 
 
@@ -1375,6 +1544,19 @@ def _render_sessions(
     outcome: CommandResult[SessionResultData],
 ) -> None:
     """Render a session inventory or replay from one typed result."""
+    if outcome.status_value == ResultStatus.FAILED.value:
+        message = (
+            outcome.errors[0].message
+            if outcome.errors
+            else "session ledger could not be read"
+        )
+        _command_error("Session read failed: {}".format(message))
+    for error in outcome.errors:
+        console.print(
+            "[yellow]Incomplete session ledger:[/yellow] {}".format(
+                error.message
+            )
+        )
     data = outcome.data
     name = data.get("name")
     if not name:
@@ -1398,6 +1580,89 @@ def _render_sessions(
         console.print(table)
         console.print(
             "\n[dim]Replay one with: filmot sessions <name>[/dim]"
+        )
+        return
+
+    summary = data.get("summary")
+    if isinstance(summary, dict):
+        searches = summary.get("searches") or {}
+        research_searches = summary.get("research_searches") or {}
+        transcripts = summary.get("transcripts") or {}
+        research = summary.get("research") or {}
+        claims = summary.get("claims") or {}
+        console.print(
+            Panel(
+                "Events: {events}\n"
+                "Standalone searches: {searches} ({queries} unique queries)\n"
+                "Research search stages: {research_stages}\n"
+                "Saved transcripts: {saved} unique\n"
+                "Transcript failures: {attempts} attempts / {failed} unique videos\n"
+                "Research runs: {runs}\n"
+                "  Selected downloads: {reported} saved / {research_skipped} skipped / "
+                "{research_failed} failed / {research_deduped} deduped\n"
+                "  Probes: {probe_saved} saved / {probe_failed} download failures / "
+                "{probe_query_failed} query failures\n"
+                "Claim mutations: {claim_events} ({claim_ids} claim IDs)".format(
+                    events=summary.get("event_count", 0),
+                    searches=searches.get("events", 0),
+                    queries=len(searches.get("unique_queries") or []),
+                    research_stages=research_searches.get("stages", 0),
+                    saved=transcripts.get("saved_unique", 0),
+                    attempts=transcripts.get("failed_attempts", 0),
+                    failed=transcripts.get("failed_unique", 0),
+                    runs=research.get("runs", 0),
+                    reported=research.get("saved_reported", 0),
+                    research_skipped=research.get("skipped_reported", 0),
+                    research_failed=research.get("failed_reported", 0),
+                    research_deduped=research.get("deduped_reported", 0),
+                    probe_saved=research.get("probe_saved_reported", 0),
+                    probe_failed=research.get("probe_download_failed_reported", 0),
+                    probe_query_failed=research.get("probe_query_failed_reported", 0),
+                    claim_events=claims.get("mutation_events", 0),
+                    claim_ids=len(claims.get("unique_claim_ids") or []),
+                ),
+                title="Session Summary: {}".format(name),
+            )
+        )
+        scope_rows = searches.get("scope_rows") or []
+        if scope_rows:
+            table = Table(title="Standalone search universes")
+            table.add_column("Query")
+            table.add_column("API total", justify="right")
+            table.add_column("Fetched", justify="right")
+            table.add_column("Post-filter", justify="right")
+            table.add_column("Status")
+            for row in scope_rows:
+                table.add_row(
+                    str(row.get("query", "")),
+                    str(row.get("api_total", 0)),
+                    str(row.get("candidates_fetched", 0)),
+                    str(row.get("post_filter_count", 0)),
+                    str(row.get("status", "")),
+                )
+            console.print(table)
+        research_scope_rows = research_searches.get("scope_rows") or []
+        if research_scope_rows:
+            table = Table(title="Research search universes (kept by stage)")
+            table.add_column("Stage")
+            table.add_column("Query")
+            table.add_column("API total", justify="right")
+            table.add_column("Fetched", justify="right")
+            table.add_column("After gates", justify="right")
+            table.add_column("Status")
+            for row in research_scope_rows:
+                table.add_row(
+                    str(row.get("stage", "")),
+                    str(row.get("query", "")),
+                    str(row.get("api_total", 0)),
+                    str(row.get("candidates_fetched", 0)),
+                    str(row.get("post_filter_count", 0)),
+                    str(row.get("status", "")),
+                )
+            console.print(table)
+        console.print(
+            "[dim]Standalone and research-stage counts are separate event totals; "
+            "saved and failed video counts are unique IDs.[/dim]"
         )
         return
 
@@ -1456,48 +1721,119 @@ def _render_sessions(
 
 @click.command("sessions")
 @click.argument("name", required=False, default=None)
+@click.option(
+    "--summary",
+    "show_summary",
+    is_flag=True,
+    help="Fold one session into separate standalone/research search universes",
+)
 @click.option("--raw", is_flag=True, help="Output one versioned JSON result")
-def sessions(name: str, raw: bool):
+def sessions(name: str, show_summary: bool, raw: bool):
     """Show the research session ledger so you can resume prior investigations.
 
     Every search, research run, and channel-search is logged to
     .filmot_data/sessions/. Without NAME, lists all sessions. With a NAME
-    (topic slug or YYYY-MM-DD date), replays that session's events.
+    (topic slug or YYYY-MM-DD date), replays that session's events. Use
+    --summary to keep standalone and staged-research candidate universes, final
+    research totals, unique saved transcripts, and failed attempts separate.
 
     \b
     Examples:
         filmot sessions                       # list all sessions
         filmot sessions fable-5-mythos        # replay a topic session
+        filmot sessions fable-5-mythos --summary
         filmot sessions 2026-06-10            # replay a day's ad-hoc queries
         filmot sessions 2026-06-10 --raw      # versioned JSON for piping
     """
-    from ..ledger import list_sessions, read_events
+    from ..ledger import list_sessions, read_events, summarize_events
 
-    if not name:
-        rows = list_sessions()
-        result_data: SessionResultData = {"rows": rows}
-    else:
-        events = read_events(name)
-        result_data = {
-            "name": name,
-            "events": events,
-        }
+    read_diagnostics = []
+    read_failure = None
+    stage = "list-sessions" if not name else "read-session"
+
+    try:
+        if not name:
+            if show_summary:
+                raise click.UsageError("--summary requires a session NAME")
+            rows = list_sessions(diagnostics=read_diagnostics)
+            result_data: SessionResultData = {"rows": rows}
+        else:
+            events = read_events(name, diagnostics=read_diagnostics)
+            if show_summary:
+                stage = "summarize-session"
+                summary = summarize_events(name, events)
+                if read_diagnostics:
+                    summary["read_diagnostics"] = len(read_diagnostics)
+                result_data = {
+                    "name": name,
+                    "summary": summary,
+                }
+            else:
+                result_data = {
+                    "name": name,
+                    "events": events,
+                }
+    except click.UsageError:
+        raise
+    except Exception as error:
+        read_failure = ErrorDetail.from_exception(error, stage=stage)
+        result_data = (
+            {
+                "name": name,
+                "summary": {
+                    "name": name,
+                    "event_count": 0,
+                    "read_diagnostics": len(read_diagnostics) + 1,
+                },
+            }
+            if name and show_summary
+            else {"name": name, "events": []}
+            if name
+            else {"rows": []}
+        )
+    errors = [
+        ErrorDetail(
+            type=str(item.get("type") or "LedgerReadError"),
+            message=str(item.get("message") or "Unreadable ledger record"),
+            stage="read-session",
+            details={
+                key: value
+                for key, value in item.items()
+                if key not in {"type", "message"}
+            },
+        )
+        for item in read_diagnostics
+    ]
+    if read_failure is not None:
+        errors.append(read_failure)
+    has_content = bool(
+        result_data.get("rows")
+        or result_data.get("events")
+        or (
+            isinstance(result_data.get("summary"), dict)
+            and result_data["summary"].get("event_count")
+        )
+    )
     outcome = CommandResult(
         command="sessions",
         status=(
-            ResultStatus.COMPLETED
-            if (result_data.get("rows") or result_data.get("events"))
+            ResultStatus.FAILED
+            if read_failure is not None
+            else ResultStatus.PARTIAL
+            if read_diagnostics and has_content
+            else ResultStatus.FAILED
+            if read_diagnostics
+            else ResultStatus.COMPLETED
+            if has_content
             else ResultStatus.EMPTY
         ),
         data=result_data,
+        errors=errors,
     )
     if raw:
-        click.echo(
-            json_mod.dumps(
-                outcome.to_raw_dict(),
-                ensure_ascii=False,
-            )
-        )
+        _emit_raw_result(outcome)
+        if outcome.status_value == ResultStatus.FAILED.value:
+            raise click.exceptions.Exit(1)
         return
     _render_sessions(outcome)
 

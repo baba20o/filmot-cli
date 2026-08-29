@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from filmot.cache import Cache
 from filmot.channel_dl import ChannelDownloader
@@ -34,6 +35,7 @@ from filmot.proxy_pool import (
     reset_pool,
 )
 from filmot.watchlist import Watchlist
+from filmot.cli import cli
 
 
 def _assert_owner_only_when_supported(path: Path) -> None:
@@ -96,6 +98,30 @@ def test_project_and_machine_roots_have_distinct_dynamic_scopes(
     explicit = tmp_path / "shared-project-data"
     monkeypatch.setenv("FILMOT_DATA_DIR", str(explicit))
     assert project_data_dir() == explicit
+
+
+def test_read_only_research_inspection_does_not_create_project_state(
+    monkeypatch, tmp_path
+):
+    project = tmp_path / "empty-project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    runner = CliRunner()
+
+    invocations = [
+        ["library", "list", "--raw"],
+        ["library", "search", "alpha", "--raw"],
+        ["library", "compare", "alpha", "--raw"],
+        ["library", "echoes", "empty", "--raw"],
+        ["sessions", "--raw"],
+        ["claims", "show", "empty", "--raw"],
+    ]
+    for arguments in invocations:
+        result = runner.invoke(cli, arguments)
+        assert result.exit_code == 0, result.output
+        json.loads(result.stdout)
+
+    assert not (project / ".filmot_data").exists()
 
 
 def test_configuration_precedence_and_no_parent_dotenv_search(

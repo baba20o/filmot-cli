@@ -15,6 +15,7 @@ def test_top_level_command_topology_is_stable():
         "channel-search",
         "channel-status",
         "channels",
+        "claims",
         "config",
         "download",
         "export",
@@ -35,6 +36,7 @@ def test_top_level_command_topology_is_stable():
         "compare",
         "context",
         "delete",
+        "echoes",
         "list",
         "migrate-topic",
         "search",
@@ -44,6 +46,12 @@ def test_top_level_command_topology_is_stable():
         "refresh",
         "status",
         "test",
+    }
+    assert set(cli.commands["claims"].commands) == {
+        "add",
+        "assess",
+        "cite",
+        "show",
     }
     assert set(cli.commands["watchlist"].commands) == {
         "add",
@@ -61,6 +69,7 @@ def test_major_commands_are_owned_by_domain_modules():
         "research": "filmot.commands.research",
         "transcript": "filmot.commands.transcript",
         "download": "filmot.commands.transcript",
+        "claims": "filmot.commands.claims",
         "library": "filmot.commands.library",
         "sessions": "filmot.commands.library",
         "proxy": "filmot.commands.proxy",

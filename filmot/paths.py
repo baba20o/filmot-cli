@@ -8,9 +8,11 @@ modules from quietly falling back to a relative ``.filmot_data`` path.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import shutil
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Optional, Union
@@ -164,8 +166,147 @@ def restrict_private_file(path: Path) -> None:
             pass
 
 
+def _publication_guard_path(destination: Path) -> Path:
+    """Return the persistent inode used for crash-releasing publication locks."""
+    return destination.parent / ".filmot-publish.guard"
+
+
+@contextmanager
+def exclusive_file_guard(
+    guard_path: Path,
+    *,
+    timeout: float = 30.0,
+    mode: int = 0o600,
+):
+    """Hold an OS-backed exclusive lock that is released on process exit.
+
+    The small guard file intentionally remains on disk. Lock ownership lives in
+    the kernel rather than in the file's existence, so a killed publisher never
+    leaves a stale lock that future commands must guess how to recover.
+    """
+    descriptor = os.open(
+        guard_path,
+        os.O_RDWR | os.O_CREAT,
+        mode,
+    )
+    deadline = time.monotonic() + timeout
+    acquired = False
+    try:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            while True:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "Timed out waiting for exclusive file lock: {}".format(
+                                guard_path
+                            )
+                        )
+                    time.sleep(0.01)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "Timed out waiting for exclusive file lock: {}".format(
+                                guard_path
+                            )
+                        )
+                    time.sleep(0.01)
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":  # pragma: no cover - exercised on Windows
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+@contextmanager
+def _publication_guard(
+    destination: Path,
+    *,
+    timeout: float = 30.0,
+    mode: int = 0o600,
+):
+    """Serialize publishers of files within one destination directory."""
+    with exclusive_file_guard(
+        _publication_guard_path(destination),
+        timeout=timeout,
+        mode=mode,
+    ):
+        yield
+
+
+def publish_file_exclusive(
+    source: Path,
+    destination: Path,
+    *,
+    mode: int = 0o600,
+) -> bool:
+    """Publish a complete file without overwriting a concurrent destination.
+
+    A same-directory hard link is atomic. Filesystems without hard-link support
+    atomically rename the already-complete source while holding a crash-
+    releasing OS lock. ``True`` means this call published the file; ``False``
+    means the destination already existed. Callers supply a private temporary
+    source in the destination directory.
+    """
+    with _publication_guard(destination, mode=mode):
+        if destination.exists():
+            return False
+        try:
+            os.link(source, destination)
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            # ``source`` is complete and fsynced before this call. Rename keeps
+            # the destination absent until the whole file is visible, avoiding
+            # the partial-file window of an O_EXCL copy fallback.
+            try:
+                os.replace(source, destination)
+            except FileExistsError:
+                return False
+            return True
+
+
+def wait_for_file_publication(
+    destination: Path,
+    *,
+    timeout: float = 30.0,
+) -> None:
+    """Wait until any active publisher releases its crash-safe OS lock."""
+    if not destination.parent.exists():
+        return
+    with _publication_guard(destination, timeout=timeout):
+        return
+
+
 def secure_copy(source: Path, destination: Path) -> Path:
     """Copy a legacy credential file without overwriting a global target."""
+    wait_for_file_publication(destination)
     if destination.exists():
         return destination
     ensure_private_dir(destination.parent)
@@ -185,40 +326,7 @@ def secure_copy(source: Path, destination: Path) -> Path:
             target.flush()
             os.fsync(target.fileno())
         restrict_private_file(temporary)
-        try:
-            # A same-directory hard link publishes the fully written file
-            # atomically and, unlike Path.replace(), never overwrites a target
-            # created concurrently by another Filmot process.
-            os.link(temporary, destination)
-        except FileExistsError:
-            pass
-        except OSError:
-            # Some filesystems do not permit hard links. The exclusive create
-            # fallback still preserves the no-overwrite contract; on a failed
-            # copy we remove only the destination created by this process.
-            try:
-                destination_descriptor = os.open(
-                    destination,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                )
-            except FileExistsError:
-                pass
-            else:
-                try:
-                    with os.fdopen(
-                        destination_descriptor,
-                        "wb",
-                    ) as target, temporary.open("rb") as source_file:
-                        shutil.copyfileobj(source_file, target)
-                        target.flush()
-                        os.fsync(target.fileno())
-                except BaseException:
-                    try:
-                        destination.unlink()
-                    except OSError:
-                        pass
-                    raise
+        publish_file_exclusive(temporary, destination)
     finally:
         if temporary.exists():
             try:

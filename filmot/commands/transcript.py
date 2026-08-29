@@ -1,6 +1,7 @@
 """Transcript retrieval, pipeline download, and channel-corpus commands."""
 
 import json as json_mod
+import math
 import os
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,8 @@ from ..cli_support import (
     command_error as _command_error,
     console,
     diagnostic as _diagnostic,
+    emit_raw_result as _emit_raw_result,
+    prepare_raw_result as _prepare_raw_result,
     redact_diagnostic as _redact_diagnostic,
     status_context as _search_status,
     stderr_console,
@@ -26,6 +29,118 @@ from .search import (
     _bulk_download_transcripts,
     _grep_transcript,
 )
+
+
+def _validate_transcript_response(
+    result: object,
+    *,
+    expected_video_id: str,
+    expected_chunks: bool = False,
+) -> dict:
+    """Validate the successful backend shape before logging or side effects."""
+    if not isinstance(result, dict):
+        raise TypeError("Transcript backend returned a non-object response")
+    if "error" in result:
+        return result
+    video_id = result.get("video_id")
+    if not isinstance(video_id, str) or not video_id:
+        raise ValueError("Transcript response requires a non-empty video_id")
+    if video_id != expected_video_id:
+        raise ValueError(
+            "Transcript response video_id does not match the requested video"
+        )
+    if not isinstance(result.get("language"), str) or not result["language"]:
+        raise ValueError("Transcript response requires a non-empty language")
+    if (
+        not isinstance(result.get("full_text"), str)
+        or not result["full_text"].strip()
+    ):
+        raise ValueError("Transcript response full_text must be non-empty text")
+    segments = result.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("Transcript response segments must be a list")
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError("Transcript segment {} must be an object".format(index))
+        if not isinstance(segment.get("text"), str):
+            raise ValueError("Transcript segment {} text must be text".format(index))
+        for field_name in ("start", "duration"):
+            value = segment.get(field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    "Transcript segment {} {} must be numeric".format(
+                        index,
+                        field_name,
+                    )
+                )
+            if not math.isfinite(float(value)) or value < 0:
+                raise ValueError(
+                    "Transcript segment {} {} must be finite and non-negative".format(
+                        index,
+                        field_name,
+                    )
+                )
+    duration = result.get("duration_seconds")
+    if duration is not None and (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(duration))
+        or duration < 0
+    ):
+        raise ValueError(
+            "Transcript response duration_seconds must be finite and non-negative"
+        )
+    segment_count = result.get("segment_count")
+    if segment_count is not None and (
+        isinstance(segment_count, bool)
+        or not isinstance(segment_count, int)
+        or segment_count < 0
+    ):
+        raise ValueError(
+            "Transcript response segment_count must be a non-negative integer"
+        )
+    if segment_count is not None and segment_count != len(segments):
+        raise ValueError("Transcript response segment_count does not match segments")
+    chunks = result.get("chunks")
+    if expected_chunks and chunks is None:
+        raise ValueError("Chunked transcript response requires chunks")
+    if chunks is not None:
+        if not isinstance(chunks, list):
+            raise ValueError("Transcript response chunks must be a list")
+        chunk_minutes = result.get("chunk_minutes")
+        if (
+            isinstance(chunk_minutes, bool)
+            or not isinstance(chunk_minutes, (int, float))
+            or not math.isfinite(float(chunk_minutes))
+            or chunk_minutes <= 0
+        ):
+            raise ValueError(
+                "Transcript response chunk_minutes must be finite and positive"
+            )
+        for index, item in enumerate(chunks):
+            if not isinstance(item, dict):
+                raise ValueError("Transcript chunk {} must be an object".format(index))
+            if not isinstance(item.get("text"), str) or not isinstance(
+                item.get("start_formatted"), str
+            ):
+                raise ValueError(
+                    "Transcript chunk {} requires text and start_formatted".format(
+                        index
+                    )
+                )
+            start = item.get("start")
+            if (
+                isinstance(start, bool)
+                or not isinstance(start, (int, float))
+                or not math.isfinite(float(start))
+                or start < 0
+            ):
+                raise ValueError(
+                    "Transcript chunk {} start must be finite and non-negative".format(
+                        index
+                    )
+                )
+    return result
 
 def _transcript_failure_detail(result: dict, *, verbose: bool) -> str:
     """Render a redacted transcript failure with optional route diagnostics."""
@@ -163,21 +278,6 @@ def _render_transcript(
             console.print(f"\n{data['full_text']}")
         return
 
-    if timestamps and "segments" in data:
-        console.print(Panel(
-            f"[bold]Video ID:[/bold] {data['video_id']}\n"
-            f"[bold]Language:[/bold] {data['language']} "
-            f"{'(auto-generated)' if data.get('is_generated') else '(manual)'}\n"
-            f"[bold]Duration:[/bold] "
-            f"{format_timestamp(data.get('duration_seconds', 0))}\n"
-            f"[bold]Segments:[/bold] {data.get('segment_count', 0)}",
-            title="Transcript",
-        ))
-        for segment in data["segments"]:
-            timestamp = format_timestamp(segment["start"])
-            console.print(f"[dim][{timestamp}][/dim] {segment['text']}")
-        return
-
     if chunk and "chunks" in data:
         console.print(Panel(
             f"[bold]Video ID:[/bold] {data['video_id']}\n"
@@ -192,6 +292,21 @@ def _render_transcript(
             )
             text = item["text"]
             console.print(text[:500] + "..." if len(text) > 500 else text)
+        return
+
+    if timestamps and "segments" in data:
+        console.print(Panel(
+            f"[bold]Video ID:[/bold] {data['video_id']}\n"
+            f"[bold]Language:[/bold] {data['language']} "
+            f"{'(auto-generated)' if data.get('is_generated') else '(manual)'}\n"
+            f"[bold]Duration:[/bold] "
+            f"{format_timestamp(data.get('duration_seconds', 0))}\n"
+            f"[bold]Segments:[/bold] {data.get('segment_count', 0)}",
+            title="Transcript",
+        ))
+        for segment in data["segments"]:
+            timestamp = format_timestamp(segment["start"])
+            console.print(f"[dim][{timestamp}][/dim] {segment['text']}")
         return
 
     console.print(Panel(
@@ -417,7 +532,7 @@ def _render_download(outcome: CommandResult[dict]) -> None:
 @click.option("--lang", "-l", default=None, help="Preferred language code (e.g., en, es, de)")
 @click.option("--timestamps", "-t", is_flag=True, help="Include timestamps for each segment")
 @click.option("--chunk", "-c", default=None, type=click.FloatRange(min=0, min_open=True), help="Chunk transcript into N-minute segments")
-@click.option("--raw", is_flag=True, help="Output raw JSON response")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
 @click.option("--output", "-o", default=None, help="Save transcript to file")
 @click.option("--full", is_flag=True, help="Output complete transcript text (for AI processing)")
 @click.option("--proxy", default=None, help="HTTP/HTTPS proxy URL (e.g., http://user:pass@host:port)")
@@ -432,7 +547,10 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
     This command fetches the complete transcript of a YouTube video,
     enabling AI agents to go beyond search snippets and truly understand
-    video content.
+    video content. --save-to preserves the source caption segments and
+    normalized acquisition/source metadata for timestamped local citations.
+    Legacy text-only library records remain readable. --chunk controls output
+    presentation and does not replace the preserved source segmentation.
 
     VIDEO_ID can be:
 
@@ -440,7 +558,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
       - Just the ID: dQw4w9WgXcQ
       - Full URL: https://youtube.com/watch?v=dQw4w9WgXcQ
       - Short URL: https://youtu.be/dQw4w9WgXcQ
-      - IDs starting with dash: -O1bjFPgRQM (just use it directly)
+      - IDs starting with dash: put options first, then ``--`` and the ID
 
     If you get IP blocked, you can:
 
@@ -464,6 +582,8 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
     \b
         filmot transcript dQw4w9WgXcQ
 
+        filmot transcript --raw -- -O1bjFPgRQM
+
         filmot transcript "https://youtube.com/watch?v=VIDEO_ID" --full
 
         filmot transcript VIDEO_ID --timestamps --chunk 5
@@ -474,12 +594,15 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
         filmot transcript VIDEO_ID --raw > data.json
 
+        filmot transcript VIDEO_ID --save-to my-investigation
+
         filmot transcript VIDEO_ID --fallback  # AWS fallback if no captions
     """
     from ..transcript import (
         configure_proxy,
         describe_routing_plan,
         disable_proxy,
+        extract_video_id,
         format_timestamp,
         get_transcript,
         get_transcript_with_fallback,
@@ -499,6 +622,14 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         raise click.UsageError(
             "--grep cannot be combined with --save-to, --output, --full, "
             "--timestamps, --chunk, or --fallback"
+        )
+    if chunk is not None and (not math.isfinite(chunk) or chunk <= 0):
+        _command_error(
+            "--chunk must be a finite number greater than zero",
+            command="transcript",
+            raw=raw,
+            error_type="InvalidOptionValue",
+            stage="validate-options",
         )
 
     # Handle proxy configuration (status messages go to stderr to avoid polluting --raw)
@@ -571,6 +702,35 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         )
         _command_error(detail, raw=raw)
 
+    try:
+        result = _validate_transcript_response(
+            result,
+            expected_video_id=extract_video_id(video_id),
+            expected_chunks=chunk is not None,
+        )
+    except (TypeError, ValueError) as error:
+        from ..ledger import log_event
+
+        message = str(error)
+        log_event(
+            "transcript",
+            topic=save_to,
+            video_id=video_id,
+            grep=grep,
+            save_to=save_to,
+            status="failed",
+            failure_stage="validate-response",
+            error=message,
+            error_type=type(error).__name__,
+        )
+        _command_error(
+            message,
+            command="transcript",
+            raw=raw,
+            error_type="InvalidResponse",
+            stage="validate-response",
+        )
+
     if "error" in result:
         err_str = str(result.get('error', ''))
         err_low = err_str.lower()
@@ -624,27 +784,24 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
     # Show source if using fallback
     source = result.get('source', 'youtube')
     outcome = CommandResult.completed("transcript", result)
-    transcript_data = outcome.data
+    if raw:
+        outcome = _prepare_raw_result(outcome)
+    transcript_data = result
+    deferred_diagnostics = []
     if source == 'aws_transcribe':
-        _diagnostic(
+        deferred_diagnostics.append(
             f"[cyan]Transcribed via AWS Transcribe "
-            f"(language: {transcript_data.get('language', 'unknown')})[/cyan]",
-            raw=raw,
+            f"(language: {transcript_data.get('language', 'unknown')})[/cyan]"
         )
         if timestamps:
-            _diagnostic(
+            deferred_diagnostics.append(
                 "[yellow]AWS fallback does not provide segment timestamps; "
-                "showing transcript text instead.[/yellow]",
-                raw=raw,
+                "showing transcript text instead.[/yellow]"
             )
             timestamps = False
 
     from ..ledger import log_event, log_result
-    log_result(
-        "transcript",
-        outcome,
-        topic=save_to,
-        data={
+    ledger_data = {
             "video_id": transcript_data.get("video_id", video_id),
             "grep": grep,
             "save_to": save_to,
@@ -660,11 +817,26 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             "route": transcript_data.get("route"),
             "routes_tried": transcript_data.get("routes_tried"),
             "routing_plan": route_plan,
-        },
-    )
+        }
+
+    def log_final(final_outcome: CommandResult) -> None:
+        log_result(
+            "transcript",
+            final_outcome,
+            topic=save_to,
+            data=ledger_data,
+        )
+
+    if raw and not outcome.ok:
+        log_final(outcome)
+        _emit_raw_result(outcome, indent=2)
+        return
 
     # Grep mode: search within the transcript and print timestamped matches, then stop
     if grep:
+        log_final(outcome)
+        for message in deferred_diagnostics:
+            _diagnostic(message, raw=raw)
         if not _grep_transcript(transcript_data, grep):
             raise click.exceptions.Exit(2)
         return
@@ -677,10 +849,9 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
             # Check if already cached
             if library.exists(transcript_data['video_id'], save_to):
-                _diagnostic(
+                deferred_diagnostics.append(
                     f"[yellow]Already in library: "
-                    f"{save_to}/{transcript_data['video_id']}[/yellow]",
-                    raw=raw,
+                    f"{save_to}/{transcript_data['video_id']}[/yellow]"
                 )
                 log_event(
                     "transcript_save",
@@ -693,20 +864,23 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                 # Fetch video metadata so library entries have title/channel
                 video_title = "Unknown"
                 video_channel = "Unknown"
+                video_metadata = {}
                 try:
                     client = FilmotClient()
                     video_info = client.get_videos(transcript_data['video_id'])
                     if isinstance(video_info, list) and video_info:
-                        video_title = video_info[0].get("title", "Unknown")
-                        video_channel = video_info[0].get(
+                        video_metadata = dict(video_info[0])
+                        video_title = video_metadata.get("title", "Unknown")
+                        video_channel = video_metadata.get(
                             "channelname", "Unknown"
                         )
                     elif (
                         isinstance(video_info, dict)
                         and "error" not in video_info
                     ):
-                        video_title = video_info.get("title", "Unknown")
-                        video_channel = video_info.get(
+                        video_metadata = dict(video_info)
+                        video_title = video_metadata.get("title", "Unknown")
+                        video_channel = video_metadata.get(
                             "channelname", "Unknown"
                         )
                 except Exception:
@@ -715,6 +889,13 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                 metadata = {
                     "title": video_title,
                     "channel": video_channel,
+                    "channel_id": video_metadata.get("channelid"),
+                    "published_at": (
+                        video_metadata.get("uploaddate")
+                        or video_metadata.get("published_at")
+                    ),
+                    "views": video_metadata.get("viewcount"),
+                    "source": source,
                     "language": transcript_data.get("language"),
                     "is_generated": transcript_data.get("is_generated"),
                     "duration_seconds": transcript_data.get("duration_seconds"),
@@ -727,6 +908,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                     topic=save_to,
                     transcript_text=transcript_data.get('full_text', ''),
                     metadata=metadata,
+                    segments=transcript_data.get("segments", []),
                 )
                 log_event(
                     "transcript_save",
@@ -739,13 +921,16 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                     route=transcript_data.get("route"),
                     routes_tried=transcript_data.get("routes_tried"),
                 )
-                _diagnostic(
+                deferred_diagnostics.append(
                     f"[green]✓ Saved to library: "
-                    f"{save_to}/{transcript_data['video_id']}[/green]",
-                    raw=raw,
+                    f"{save_to}/{transcript_data['video_id']}[/green]"
                 )
         except Exception as error:
-            detail = f"{type(error).__name__}: {error}"
+            detail = str(
+                _redact_diagnostic(
+                    f"{type(error).__name__}: {error}"
+                )
+            )
             log_event(
                 "transcript_save",
                 topic=save_to,
@@ -754,23 +939,24 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                 error=detail,
                 route=transcript_data.get("route"),
             )
-            _command_error(
-                f"Could not save transcript to library: {detail}",
-                raw=raw,
+            message = "Could not save transcript to library: {}".format(detail)
+            failed_outcome = CommandResult.failed(
+                "transcript",
+                {"error": message},
+                ErrorDetail(
+                    type=type(error).__name__,
+                    message=message,
+                    stage="save-library",
+                ),
             )
-
-    # Raw JSON output
-    if raw:
-        click.echo(
-            json_mod.dumps(
-                outcome.to_raw_dict(),
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
-        return
+            log_final(failed_outcome)
+            if raw:
+                _emit_raw_result(failed_outcome, indent=2)
+                return
+            raise click.ClickException(message)
 
     # Save to file
+    output_message = None
     if output:
         try:
             with open(output, 'w', encoding='utf-8') as f:
@@ -778,16 +964,47 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                     json_mod.dump(transcript_data, f, indent=2)
                 else:
                     # Plain text output
-                    if timestamps and 'segments' in transcript_data:
+                    if chunk and "chunks" in transcript_data:
+                        for item in transcript_data["chunks"]:
+                            f.write(
+                                "[{}] {}\n".format(
+                                    item["start_formatted"],
+                                    item["text"],
+                                )
+                            )
+                    elif timestamps and 'segments' in transcript_data:
                         for seg in transcript_data['segments']:
                             ts = format_timestamp(seg['start'])
                             f.write(f"[{ts}] {seg['text']}\n")
                     else:
                         f.write(transcript_data['full_text'])
-            console.print(f"[green]✓ Saved transcript to: {output}[/green]")
-            return
+            output_message = f"[green]✓ Saved transcript to: {output}[/green]"
         except Exception as e:
-            _command_error(f"Error saving file: {e}", raw=raw)
+            message = str(_redact_diagnostic(f"Error saving file: {e}"))
+            failed_outcome = CommandResult.failed(
+                "transcript",
+                {"error": message},
+                ErrorDetail(
+                    type=type(e).__name__,
+                    message=message,
+                    stage="write-output",
+                ),
+            )
+            log_final(failed_outcome)
+            raise click.ClickException(message)
+
+    log_final(outcome)
+    for message in deferred_diagnostics:
+        _diagnostic(message, raw=raw)
+
+    # Raw JSON output
+    if raw:
+        _emit_raw_result(outcome, indent=2)
+        return
+
+    if output_message:
+        console.print(output_message)
+        return
 
     _render_transcript(
         outcome,
