@@ -1,5 +1,6 @@
 """Typed result contracts for transcript-family CLI commands."""
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,380 @@ def _route_plan():
         "read_timeout_s": 15.0,
         "route_timeout_s": 30.0,
     }
+
+
+def _save_grep_record(
+    library,
+    *,
+    topic,
+    video_id="abc12345678",
+    language="en",
+    segments=None,
+):
+    segments = segments or [{
+        "start": 9.0,
+        "duration": 3.0,
+        "text": "alpha evidence",
+    }]
+    library.save(
+        video_id=video_id,
+        topic=topic,
+        transcript_text=" ".join(item["text"] for item in segments),
+        metadata={"language": language, "duration_seconds": 75.0},
+        segments=segments,
+    )
+
+
+def _fetched_grep_transcript(video_id="abc12345678", language="en"):
+    return {
+        "video_id": video_id,
+        "language": language,
+        "full_text": "alpha evidence",
+        "segments": [{
+            "start": 9.0,
+            "duration": 3.0,
+            "text": "alpha evidence",
+        }],
+        "duration_seconds": 12.0,
+        "segment_count": 1,
+        "route": "direct",
+        "routes_tried": ["direct"],
+    }
+
+
+def test_transcript_grep_local_hit_links_and_routes_to_source_topic(runner):
+    from filmot.library import get_library
+
+    video_id = "abc12345678"
+    _save_grep_record(
+        get_library(),
+        topic="active-inference",
+        video_id=video_id,
+        segments=[
+            {"start": 0.0, "duration": 5.0, "text": "opening context"},
+            {
+                "start": 65.0,
+                "duration": 10.0,
+                "text": "expected free energy selects policies",
+            },
+        ],
+    )
+    with (
+        patch("filmot.transcript.get_transcript") as fetch,
+        patch("filmot.transcript.routing_plan") as routing_plan,
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", video_id, "--grep", "expected free energy"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Transcript source: library/active-inference" in result.output
+    assert "[1:05]" in result.output
+    assert f"https://youtube.com/watch?v={video_id}&t=65s" in result.output
+    fetch.assert_not_called()
+    routing_plan.assert_not_called()
+    log_result.assert_called_once()
+    outcome = log_result.call_args.args[1]
+    assert outcome.status_value == ResultStatus.COMPLETED.value
+    assert log_result.call_args.kwargs["topic"] == "active-inference"
+    assert log_result.call_args.kwargs["data"]["library_topic"] == (
+        "active-inference"
+    )
+
+
+def test_transcript_grep_filters_language_before_ambiguity(runner):
+    from filmot.library import get_library
+
+    library = get_library()
+    _save_grep_record(library, topic="english", language="en")
+    _save_grep_record(
+        library,
+        topic="french",
+        language="fr",
+        segments=[{
+            "start": 11.0,
+            "duration": 3.0,
+            "text": "alpha preuve",
+        }],
+    )
+    with (
+        patch("filmot.transcript.get_transcript") as fetch,
+        patch("filmot.transcript.routing_plan") as routing_plan,
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "abc12345678", "--lang", "fr", "--grep", "preuve"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "library/french" in result.output
+    fetch.assert_not_called()
+    routing_plan.assert_not_called()
+    assert log_result.call_args.kwargs["topic"] == "french"
+
+
+def test_transcript_grep_deduplicates_equivalent_saved_copies(runner):
+    from filmot.library import get_library
+
+    library = get_library()
+    _save_grep_record(library, topic="topic-one")
+    _save_grep_record(library, topic="topic-two")
+    with (
+        patch("filmot.transcript.get_transcript") as fetch,
+        patch("filmot.transcript.routing_plan") as routing_plan,
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "abc12345678", "--grep", "alpha"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Transcript source: library (no external fetch)" in result.output
+    fetch.assert_not_called()
+    routing_plan.assert_not_called()
+    outcome = log_result.call_args.args[1]
+    assert outcome.data["library_copy_count"] == 2
+    assert "library_topic" not in outcome.data
+    assert log_result.call_args.kwargs["topic"] is None
+
+
+def test_transcript_grep_distinct_saved_records_explain_external_fallback(runner):
+    from filmot.library import get_library
+
+    library = get_library()
+    _save_grep_record(library, topic="topic-one")
+    _save_grep_record(
+        library,
+        topic="topic-two",
+        segments=[{
+            "start": 12.0,
+            "duration": 3.0,
+            "text": "alpha alternative",
+        }],
+    )
+    fetched = _fetched_grep_transcript()
+    with (
+        patch("filmot.transcript.get_transcript", return_value=fetched) as fetch,
+        patch("filmot.transcript.routing_plan", return_value=_route_plan()),
+        patch("filmot.transcript.describe_routing_plan", return_value="direct"),
+        patch("filmot.ledger.log_result"),
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "abc12345678", "--grep", "alpha"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "multiple distinct usable transcripts" in result.output
+    fetch.assert_called_once()
+
+
+def test_transcript_grep_rejects_nonmonotonic_local_segment_times(runner):
+    from filmot.library import get_library
+
+    _save_grep_record(
+        get_library(),
+        topic="broken-times",
+        segments=[
+            {"start": 10.0, "duration": 2.0, "text": "alpha"},
+            {"start": 5.0, "duration": 2.0, "text": "evidence"},
+        ],
+    )
+    fetched = _fetched_grep_transcript()
+    with (
+        patch("filmot.transcript.get_transcript", return_value=fetched) as fetch,
+        patch("filmot.transcript.routing_plan", return_value=_route_plan()),
+        patch("filmot.transcript.describe_routing_plan", return_value="direct"),
+        patch("filmot.ledger.log_result"),
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "abc12345678", "--grep", "alpha"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "lacks trustworthy timestamp segments" in result.output
+    fetch.assert_called_once()
+
+
+def test_transcript_grep_filters_invalid_copy_before_ambiguity(runner):
+    from filmot.library import get_library
+
+    library = get_library()
+    _save_grep_record(library, topic="valid-times")
+    _save_grep_record(
+        library,
+        topic="broken-times",
+        segments=[
+            {"start": 10.0, "duration": 2.0, "text": "alpha"},
+            {"start": 5.0, "duration": 2.0, "text": "evidence"},
+        ],
+    )
+    with (
+        patch("filmot.transcript.get_transcript") as fetch,
+        patch("filmot.transcript.routing_plan") as routing_plan,
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "abc12345678", "--grep", "alpha"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "library/valid-times" in result.output
+    fetch.assert_not_called()
+    routing_plan.assert_not_called()
+    assert log_result.call_args.kwargs["topic"] == "valid-times"
+
+
+def test_transcript_grep_raw_cache_fallback_reason_stays_on_stderr(runner):
+    from filmot.library import get_library
+
+    _save_grep_record(
+        get_library(),
+        topic="broken-times",
+        segments=[
+            {"start": 10.0, "duration": 2.0, "text": "alpha"},
+            {"start": 5.0, "duration": 2.0, "text": "evidence"},
+        ],
+    )
+    fetched = _fetched_grep_transcript()
+    with (
+        patch("filmot.transcript.get_transcript", return_value=fetched),
+        patch("filmot.transcript.routing_plan", return_value=_route_plan()),
+        patch("filmot.ledger.log_result"),
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "abc12345678", "--grep", "alpha", "--raw"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "lacks trustworthy timestamp segments" in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["match_count"] == 1
+    assert "trustworthy timestamp" not in result.stdout
+
+
+def test_transcript_grep_raw_has_stable_match_rows(runner):
+    from filmot.library import get_library
+
+    _save_grep_record(get_library(), topic="raw-topic")
+    with (
+        patch("filmot.transcript.get_transcript") as fetch,
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = runner.invoke(
+            cli,
+            ["transcript", "abc12345678", "--grep", "alpha", "--raw"],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["query"] == "alpha"
+    assert payload["match_count"] == 1
+    assert payload["matches"] == [{
+        "seconds": 9.0,
+        "timestamp": "0:09",
+        "deep_link": "https://youtube.com/watch?v=abc12345678&t=9s",
+        "excerpt": "alpha evidence",
+    }]
+    assert payload["_filmot"]["status"] == "completed"
+    fetch.assert_not_called()
+    assert log_result.call_args.args[1].to_raw_dict() == payload
+
+
+def test_transcript_grep_raw_no_match_is_typed_empty(runner):
+    from filmot.library import get_library
+
+    _save_grep_record(get_library(), topic="raw-topic")
+    with patch("filmot.ledger.log_result") as log_result:
+        result = runner.invoke(
+            cli,
+            ["transcript", "abc12345678", "--grep", "omega", "--raw"],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["query"] == "omega"
+    assert payload["match_count"] == 0
+    assert payload["matches"] == []
+    assert payload["_filmot"]["status"] == "empty"
+    assert log_result.call_args.args[1].status_value == ResultStatus.EMPTY.value
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_transcript_grep_malformed_query_logs_actual_failure(runner, raw):
+    arguments = [
+        "transcript",
+        "abc12345678",
+        "--grep",
+        '\"alpha\" NEAR/5 beta',
+    ]
+    if raw:
+        arguments.append("--raw")
+    with (
+        patch("filmot.ledger.log_result") as log_result,
+        patch("filmot.transcript.get_transcript") as fetch,
+        patch(
+            "filmot.commands.transcript._saved_transcript_for_grep"
+        ) as local_lookup,
+    ):
+        result = runner.invoke(cli, arguments)
+
+    assert result.exit_code == (1 if raw else 2), result.output
+    log_result.assert_called_once()
+    logged = log_result.call_args.args[1]
+    assert logged.status_value == ResultStatus.FAILED.value
+    assert logged.errors[0].type == "InvalidGrepQuery"
+    assert logged.errors[0].stage == "parse-query"
+    assert log_result.call_args.kwargs["topic"] is None
+    fetch.assert_not_called()
+    local_lookup.assert_not_called()
+    if raw:
+        payload = json.loads(result.stdout)
+        assert payload["query"] == '\"alpha\" NEAR/5 beta'
+        assert payload["matches"] == []
+        assert payload["_filmot"]["errors"][0]["type"] == "InvalidGrepQuery"
+        assert logged.to_raw_dict() == payload
+    else:
+        assert "could not be parsed" in result.output
+        assert "NEAR/N" in result.output
+        assert '"a b"~N' in result.output
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_transcript_blank_grep_is_rejected_before_lookup_or_fetch(runner, raw):
+    arguments = ["transcript", "abc12345678", "--grep", ""]
+    if raw:
+        arguments.append("--raw")
+    with (
+        patch("filmot.ledger.log_result") as log_result,
+        patch("filmot.transcript.get_transcript") as fetch,
+        patch(
+            "filmot.commands.transcript._saved_transcript_for_grep"
+        ) as local_lookup,
+    ):
+        result = runner.invoke(cli, arguments)
+
+    assert result.exit_code == (1 if raw else 2), result.output
+    logged = log_result.call_args.args[1]
+    assert logged.status_value == ResultStatus.FAILED.value
+    assert logged.errors[0].type == "InvalidGrepQuery"
+    assert logged.errors[0].stage == "parse-query"
+    fetch.assert_not_called()
+    local_lookup.assert_not_called()
+    if raw:
+        payload = json.loads(result.stdout)
+        assert payload["query"] == ""
+        assert payload["matches"] == []
+        assert logged.to_raw_dict() == payload
+    else:
+        assert "must contain non-whitespace text" in result.output
 
 
 @pytest.mark.parametrize(

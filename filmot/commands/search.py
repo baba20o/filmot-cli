@@ -74,6 +74,7 @@ class YouTubeSearchResultData(TypedDict, total=False):
     query: str
     videos: List[Dict[str, Any]]
     days: int
+    max_results: int
     order: str
     filters: Dict[str, Any]
     transcript: bool
@@ -942,28 +943,47 @@ def _format_count(count: int) -> str:
         return str(count)
 
 
-def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> bool:
-    """Run a proximity/plain query against a fetched transcript and print matches.
-
-    Reuses the local proximity engine from channel_dl (NEAR/N, OR-groups, ~N tilde,
-    plain substring) so the same operators work on a single transcript — closing the
-    search → download → grep loop inside the tool. Match snippets carry timestamped
-    deep links derived from the transcript's own segments.
-    """
+def _evaluate_transcript_grep(
+    result: dict,
+    query: str,
+    context_chars: int = 160,
+) -> CommandResult[dict]:
+    """Return one typed grep outcome for both human and raw presentation."""
     from ..channel_dl import (
         _parse_proximity_query,
         _looks_like_proximity,
         _find_grouped_near_matches,
         _find_tilde_matches,
-        _phrase_occurrences,
     )
 
     video_id = result.get("video_id", "")
     text = result.get("full_text", "")
     segments = result.get("segments", [])
-    if not text:
-        console.print("[yellow]No transcript text to search.[/yellow]")
-        return False
+    data = {
+        "video_id": video_id,
+        "language": result.get("language"),
+        "query": query,
+        "match_count": 0,
+        "matches": [],
+        "source": result.get("source", "youtube"),
+        "route": result.get("route"),
+        "routes_tried": result.get("routes_tried"),
+    }
+    for key in ("library_topic", "library_copy_count"):
+        if result.get(key) is not None:
+            data[key] = result[key]
+
+    if not isinstance(query, str) or not query.strip():
+        message = "grep query must contain non-whitespace text"
+        return CommandResult.failed(
+            "transcript",
+            data,
+            ErrorDetail(
+                type="InvalidGrepQuery",
+                message=message,
+                stage="parse-query",
+            ),
+        )
 
     # Build a char-offset → segment-start-time index matching how full_text was joined
     offsets = []  # (start_char, seg_start_seconds)
@@ -985,12 +1005,25 @@ def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> bool
         return best
 
     parsed = _parse_proximity_query(query)
-    if parsed[0] == "plain" and _looks_like_proximity(query):
-        console.print(
-            "[red]Error:[/red] query has proximity operators but couldn't be parsed. "
-            'Use \'"a" NEAR/N "b"\', \'("a"|"b") NEAR/N "c"\', or \'"a b"~N\'.'
+    proximity_marker = bool(
+        re.search(r'\bNEAR\s*/|"\s*~', query, re.IGNORECASE)
+    )
+    if parsed[0] == "plain" and (
+        _looks_like_proximity(query) or proximity_marker
+    ):
+        message = (
+            "query has proximity operators but could not be parsed; use "
+            '\'"a" NEAR/N "b"\', \'("a"|"b") NEAR/N "c"\', or \'"a b"~N\''
         )
-        return False
+        return CommandResult.failed(
+            "transcript",
+            data,
+            ErrorDetail(
+                type="InvalidGrepQuery",
+                message=message,
+                stage="parse-query",
+            ),
+        )
 
     text_lower = text.lower()
     if parsed[0] == "near":
@@ -1003,11 +1036,7 @@ def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> bool
         q = parsed[1].lower()
         spans = [(m, m + len(q)) for m in _all_substring_positions(text_lower, q)]
 
-    if not spans:
-        console.print(f"[dim]No matches for '{query}' in transcript.[/dim]")
-        return True
-
-    console.print(f"[bold]{len(spans)} match(es) for '{query}':[/bold]\n")
+    rows = []
     for start_c, end_c in spans:
         ts = _time_at(start_c)
         link = _deep_link(video_id, ts) if video_id else ""
@@ -1018,9 +1047,55 @@ def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> bool
             snippet = "..." + snippet
         if e < len(text):
             snippet = snippet + "..."
-        loc = f"[link={link}]{_format_timestamp(ts)}[/link]" if link else _format_timestamp(ts)
-        console.print(f"  [[cyan]{loc}[/cyan]] {snippet}\n")
-    return True
+        rows.append({
+            "seconds": float(ts),
+            "timestamp": _format_timestamp(ts),
+            "deep_link": link,
+            "excerpt": snippet,
+        })
+    data["match_count"] = len(rows)
+    data["matches"] = rows
+    return CommandResult(
+        command="transcript",
+        status=ResultStatus.COMPLETED if rows else ResultStatus.EMPTY,
+        data=data,
+    )
+
+
+def _render_transcript_grep(outcome: CommandResult[dict]) -> None:
+    """Render the typed grep result without re-parsing or re-evaluating it."""
+    if not outcome.ok:
+        message = (
+            outcome.errors[0].message
+            if outcome.errors
+            else "transcript grep failed"
+        )
+        console.print(f"[red]Error:[/red] {message}")
+        return
+    query = outcome.data.get("query", "")
+    rows = outcome.data.get("matches", [])
+    if not rows:
+        console.print(f"[dim]No matches for '{query}' in transcript.[/dim]")
+        return
+    console.print(f"[bold]{len(rows)} match(es) for '{query}':[/bold]\n")
+    for row in rows:
+        timestamp = row["timestamp"]
+        link = row["deep_link"]
+        excerpt = row["excerpt"]
+        if link:
+            console.print(
+                f"  [[cyan]{timestamp}[/cyan]] "
+                f"[link={link}]{link}[/link] {excerpt}\n"
+            )
+        else:
+            console.print(f"  [[cyan]{timestamp}[/cyan]] {excerpt}\n")
+
+
+def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> bool:
+    """Backward-compatible human wrapper around the typed grep path."""
+    outcome = _evaluate_transcript_grep(result, query, context_chars)
+    _render_transcript_grep(outcome)
+    return outcome.ok
 
 
 def _all_substring_positions(haystack: str, needle: str) -> list:
@@ -2273,33 +2348,109 @@ def _render_yt_search_result(
             console.print(f"   [dim]{description}[/dim]")
 
         if data.get("transcript"):
-            from ..transcript import search_in_transcript
-
-            search_term = data.get("transcript_query") or query
-            with console.status("   Fetching transcript..."):
-                try:
-                    result = search_in_transcript(
-                        str(video["video_id"]),
-                        str(search_term),
+            transcript_result = video.get("transcript_search") or {}
+            search_term = transcript_result.get("query") or (
+                data.get("transcript_query") or query
+            )
+            if transcript_result.get("status") == "failed":
+                error = transcript_result.get("error") or {}
+                error_type = error.get("type") or "TranscriptError"
+                console.print(
+                    f"   [dim]Transcript unavailable ({error_type})[/dim]"
+                )
+            elif transcript_result.get("match_count", 0) > 0:
+                console.print(
+                    f"   [bold green]✓ Found "
+                    f"{transcript_result['match_count']} transcript matches "
+                    f"for '{search_term}'[/bold green]"
+                )
+                for match in transcript_result.get("matches", [])[:3]:
+                    console.print(
+                        f"      [{match.get('timestamp', '?')}] ..."
+                        f"{str(match.get('context', ''))[:100]}..."
                     )
-                    if result.get("match_count", 0) > 0:
-                        console.print(
-                            f"   [bold green]✓ Found "
-                            f"{result['match_count']} transcript matches for "
-                            f"'{search_term}'[/bold green]"
-                        )
-                        for match in result["matches"][:3]:
-                            console.print(
-                                f"      [{match['timestamp']}] ..."
-                                f"{match['context'][:100]}..."
-                            )
-                    else:
-                        console.print(
-                            f"   [dim]No transcript matches for "
-                            f"'{search_term}'[/dim]"
-                        )
-                except Exception:
-                    console.print("   [dim]Transcript unavailable[/dim]")
+            else:
+                console.print(
+                    f"   [dim]No transcript matches for "
+                    f"'{search_term}'[/dim]"
+                )
+
+
+def _evaluate_yt_search_transcripts(
+    videos: List[Dict[str, Any]],
+    search_term: str,
+    *,
+    raw: bool,
+) -> tuple[List[Dict[str, Any]], List[ErrorDetail]]:
+    """Attach the same bounded transcript-search result for both renderers."""
+    from ..transcript import search_in_transcript
+
+    enriched = []
+    errors = []
+    for video in videos:
+        item = dict(video)
+        video_id = str(item.get("video_id") or "")
+        transcript_data: Dict[str, Any] = {
+            "query": search_term,
+            "status": ResultStatus.EMPTY.value,
+            "match_count": 0,
+            "matches": [],
+        }
+        try:
+            with _search_status(
+                f"Fetching transcript for {video_id}...",
+                raw=raw,
+            ):
+                result = search_in_transcript(video_id, search_term)
+            if not isinstance(result, dict):
+                raise TypeError("transcript search returned a non-object result")
+            if result.get("error"):
+                error_type = str(
+                    result.get("error_type") or "TranscriptUnavailable"
+                )
+                message = _whole_word_summary(result.get("error"), 500)
+                transcript_data.update({
+                    "status": ResultStatus.FAILED.value,
+                    "error": {"type": error_type, "message": message},
+                })
+                errors.append(ErrorDetail(
+                    type=error_type,
+                    message=message,
+                    stage="transcript-search",
+                    details={"video_id": video_id},
+                ))
+            else:
+                matches = result.get("matches")
+                if not isinstance(matches, list):
+                    raise TypeError("transcript search matches must be a list")
+                match_rows = [dict(match) for match in matches if isinstance(match, dict)]
+                transcript_data.update({
+                    "status": (
+                        ResultStatus.COMPLETED.value
+                        if match_rows
+                        else ResultStatus.EMPTY.value
+                    ),
+                    "match_count": len(match_rows),
+                    "matches": match_rows,
+                    "language": result.get("language"),
+                    "is_generated": result.get("is_generated"),
+                })
+        except Exception as error:
+            error_type = type(error).__name__
+            message = _whole_word_summary(error, 500)
+            transcript_data.update({
+                "status": ResultStatus.FAILED.value,
+                "error": {"type": error_type, "message": message},
+            })
+            errors.append(ErrorDetail(
+                type=error_type,
+                message=message,
+                stage="transcript-search",
+                details={"video_id": video_id},
+            ))
+        item["transcript_search"] = transcript_data
+        enriched.append(item)
+    return enriched, errors
 
 
 @click.command("yt-search")
@@ -2347,6 +2498,7 @@ def _render_yt_search_result(
 @click.option("--transcript", "-t", is_flag=True, help="Also fetch and search transcript content")
 @click.option("--transcript-query", default=None, help="Different query for transcript search")
 @click.option("--show-description", is_flag=True, help="Show video descriptions")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
 def yt_search(query: str, days: int, max_results: int, order: str,
               published_after: str, published_before: str, channel_id: str,
               region: str, lang: str, safe_search: str, caption: str,
@@ -2354,7 +2506,7 @@ def yt_search(query: str, days: int, max_results: int, order: str,
               embeddable: bool, video_license: str, syndicated: bool,
               video_type: str, event_type: str, location: str,
               location_radius: str, topic_id: str, transcript: bool,
-              transcript_query: str, show_description: bool):
+              transcript_query: str, show_description: bool, raw: bool):
     """Search YouTube directly for recent videos (bypasses Filmot).
 
     Use this when searching for very recent content that Filmot
@@ -2411,6 +2563,7 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         **filters,
         "transcript": transcript,
         "transcript_query": transcript_query,
+        "raw": raw,
     }
 
     try:
@@ -2425,9 +2578,10 @@ def yt_search(query: str, days: int, max_results: int, order: str,
             if published_before
             else None
         )
-        with console.status(
+        with _search_status(
             f"[bold green]Searching YouTube for '{query}' "
-            f"(last {days} days)..."
+            f"(last {days} days)...",
+            raw=raw,
         ):
             results = search_recent(
                 query=query,
@@ -2464,7 +2618,10 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         )
         _command_error(
             f"Configuration error: {error}. Add YOUTUBE_API_KEY to your "
-            ".env file."
+            ".env file.",
+            raw=raw,
+            error_type=type(error).__name__,
+            stage="configuration",
         )
     except Exception as error:
         log_event(
@@ -2474,12 +2631,27 @@ def yt_search(query: str, days: int, max_results: int, order: str,
             failure_stage="request",
             error=f"{type(error).__name__}: {error}",
         )
-        _command_error(str(error))
+        _command_error(
+            str(error),
+            raw=raw,
+            error_type=type(error).__name__,
+            stage="request",
+        )
+
+    result_videos = list(results or [])
+    transcript_errors: List[ErrorDetail] = []
+    if transcript and result_videos:
+        result_videos, transcript_errors = _evaluate_yt_search_transcripts(
+            result_videos,
+            str(transcript_query or query),
+            raw=raw,
+        )
 
     result_data: YouTubeSearchResultData = {
         "query": query,
-        "videos": list(results or []),
+        "videos": result_videos,
         "days": days,
+        "max_results": max_results,
         "order": order,
         "filters": filters,
         "transcript": transcript,
@@ -2489,20 +2661,29 @@ def yt_search(query: str, days: int, max_results: int, order: str,
     outcome = CommandResult(
         command="yt-search",
         status=(
-            ResultStatus.COMPLETED
-            if results
+            ResultStatus.PARTIAL
+            if transcript_errors
+            else ResultStatus.COMPLETED
+            if result_videos
             else ResultStatus.EMPTY
         ),
         data=result_data,
+        errors=transcript_errors,
     )
+    if raw:
+        outcome = _prepare_raw_result(outcome)
     log_result(
         "yt-search",
         outcome,
         data={
             **event_data,
-            "results": len(results or []),
+            "results": len(result_videos),
+            "transcript_failures": len(transcript_errors),
         },
     )
+    if raw:
+        _emit_raw_result(outcome, indent=2)
+        return
     _render_yt_search_result(outcome)
 
 

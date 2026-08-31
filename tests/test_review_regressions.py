@@ -19,8 +19,10 @@ from click.testing import CliRunner
 
 @pytest.fixture
 def runner():
-    # Keep stderr separate so raw-mode stdout is exactly one JSON document.
-    return CliRunner(mix_stderr=False)
+    # Modern Click exposes stdout and stderr separately on Result while keeping
+    # their interleaved form in ``output``. Older supported Click releases also
+    # work with the argument-free runner; ``mix_stderr`` was removed in 8.5.
+    return CliRunner()
 
 
 def test_v1_event_defaults_are_restored():

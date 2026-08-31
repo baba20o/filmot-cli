@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from typing import Optional
 
 import click
@@ -24,6 +26,44 @@ from ..cli_support import (
     prepare_raw_result as _prepare_raw_result,
 )
 from ..schemas import CLAIM_SCHEMA, ClaimResultData, CommandResult, ResultStatus
+
+
+_CITATION_TIMESTAMP_RE = re.compile(
+    r"(?:(?P<hours>[0-9]+):(?P<hour_minutes>[0-5][0-9]):|"
+    r"(?P<minutes>[0-9]+):)(?P<seconds>[0-5][0-9])\Z"
+)
+
+
+def _parse_citation_timestamp(value: str) -> float:
+    """Parse CLI citation seconds or a displayed ``M:SS``/``H:MM:SS`` value."""
+    candidate = value.strip()
+    if ":" not in candidate:
+        try:
+            seconds = float(candidate)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "must be finite non-negative seconds or M:SS/H:MM:SS"
+            ) from error
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(
+                "must be finite non-negative seconds or M:SS/H:MM:SS"
+            )
+        return 0.0 if seconds == 0 else seconds
+
+    match = _CITATION_TIMESTAMP_RE.fullmatch(candidate)
+    if match is None:
+        raise ValueError(
+            "must be finite non-negative seconds or M:SS/H:MM:SS"
+        )
+    hours = float(match.group("hours") or 0)
+    minutes = float(match.group("hour_minutes") or match.group("minutes"))
+    seconds = float(match.group("seconds"))
+    total = hours * 3600 + minutes * 60 + seconds
+    if not math.isfinite(total):
+        raise ValueError(
+            "must be finite non-negative seconds or M:SS/H:MM:SS"
+        )
+    return total
 
 
 def _emit_raw(outcome: CommandResult[ClaimResultData]) -> None:
@@ -170,6 +210,9 @@ def claims():
 
     Claim data is strict and append-only. Filmot records relationships but
     never infers stance, independence, confidence, or truth.
+    If publication-temporary cleanup fails, the error names that append's
+    exact temporary path and states whether the immutable event is already
+    durable; do not assume a reported cleanup failure rolled the mutation back.
     """
     pass
 
@@ -210,7 +253,12 @@ def claims_add(topic: str, text: str, claim_id: Optional[str], raw: bool):
     help="Source URL, DOI, patent ID, or local reference; mutually exclusive with --video",
 )
 @click.option("--video", "video_id", default=None, help="YouTube video ID; classifies this source as video and is mutually exclusive with --source")
-@click.option("--at", "start_seconds", type=click.FloatRange(min=0), default=None, help="Video timestamp in seconds")
+@click.option(
+    "--at",
+    "start_seconds",
+    default=None,
+    help="Video timestamp as seconds, M:SS, or H:MM:SS",
+)
 @click.option("--relation", "relation", required=True, type=click.Choice(CLAIM_RELATIONS), help="How the source relates to the claim")
 @click.option("--source-kind", type=click.Choice(SOURCE_KINDS), default=None, help="Source medium; inferred as video/web when omitted")
 @click.option("--locator", default=None, help="Page, table, figure, claim, or section locator")
@@ -225,7 +273,7 @@ def claims_cite(
     claim_id: str,
     source: Optional[str],
     video_id: Optional[str],
-    start_seconds: Optional[float],
+    start_seconds: Optional[str],
     relation: str,
     source_kind: Optional[str],
     locator: Optional[str],
@@ -237,6 +285,19 @@ def claims_cite(
     raw: bool,
 ):
     """Attach one explicitly classified evidence item to CLAIM_ID."""
+    if start_seconds is not None:
+        try:
+            start_seconds = _parse_citation_timestamp(start_seconds)
+        except ValueError as error:
+            if raw:
+                _command_error(
+                    "Invalid --at value: {}".format(error),
+                    command="claims-cite",
+                    raw=True,
+                    error_type="InvalidOptionValue",
+                    stage="validate-evidence",
+                )
+            raise click.BadParameter(str(error), param_hint="--at")
     if not source and not video_id:
         _command_error(
             "Provide --source or --video",

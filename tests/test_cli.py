@@ -16,6 +16,7 @@ from filmot.cli import (
     _find_probe_pairs,
     _research_query_ladder,
 )
+from filmot.commands.research import _topic_relationship_evidence
 
 
 @pytest.fixture
@@ -634,6 +635,14 @@ class TestTranscriptRawContract:
             item.kwargs.get("topic") == "topic"
             for item in mock_log_event.call_args_list
         )
+        saved_event = next(
+            item
+            for item in mock_log_event.call_args_list
+            if item.args[0] == "transcript_save"
+            and item.kwargs.get("status") == "saved"
+        )
+        assert saved_event.kwargs["title"] == "Title"
+        assert saved_event.kwargs["channel"] == "Channel"
         logged = mock_log_result.call_args.args[1]
         assert logged.to_raw_dict() == payload
         assert "full_text" not in mock_log_result.call_args.kwargs["data"]
@@ -876,6 +885,57 @@ class TestProbeExtraction:
             ["alpha", "beta"],
         ) == []
 
+    def test_probe_pair_salience_prioritizes_live_shaped_specific_relations(
+        self,
+    ):
+        terms = [
+            "machine learning",
+            "neural network",
+            "deep learning",
+            "free energy",
+            "generative models",
+        ]
+        texts = [
+            "free energy generative models. " * 20
+            + "deep learning free energy. " * 12
+            + "free energy machine learning. " * 9
+            + "machine learning neural network. deep learning neural network.",
+            "free energy generative models. " * 16
+            + "deep learning free energy. " * 10
+            + "free energy machine learning. " * 7
+            + "machine learning neural network. deep learning neural network.",
+            "free energy generative models. " * 12
+            + "deep learning free energy. " * 8
+            + "free energy machine learning. " * 5
+            + "machine learning neural network. deep learning neural network.",
+            # A long generic course can repeat one phrase hundreds of times,
+            # but source-length normalization must not let it consume the
+            # highest-value relationship slots.
+            "generic filler machine learning. " * 500
+            + "deep learning tutorial. " * 80
+            + "machine learning neural network. deep learning neural network.",
+        ]
+
+        pairs = _find_probe_pairs(texts, terms, include_scores=True)
+        names = [(left, right) for left, right, *_ in pairs]
+
+        assert names[:3] == [
+            ("free energy", "generative models"),
+            ("deep learning", "free energy"),
+            ("free energy", "machine learning"),
+        ]
+        assert names[3:] == [
+            ("machine learning", "neural network"),
+            ("deep learning", "neural network"),
+        ]
+        for _, _, co_windows, source_support, basis in pairs:
+            assert basis["method"] == "source_normalized_tfidf_v1"
+            assert basis["score"] == round(basis["score"], 3)
+            assert basis["co_windows"] == co_windows
+            assert basis["source_support"] == source_support
+            assert basis["left"]["document_frequency"] >= 2
+            assert basis["right"]["document_frequency"] >= 2
+
     def test_terms_prefer_cross_source_support_over_one_source_repetition(self):
         terms = _extract_probe_terms(
             [
@@ -887,6 +947,123 @@ class TestProbeExtraction:
             top_n=2,
         )
         assert "shared concept" in terms
+
+    def test_probe_terms_require_phrases_and_collapse_plural_variants(self):
+        texts = [
+            (
+                "Basically trying data model models. "
+                "Free energy and generative model interact. "
+            ) * 4,
+            (
+                "Trying models with data, basically. "
+                "Free energy and generative models interact. "
+            ) * 4,
+        ]
+
+        terms = _extract_probe_terms(
+            texts,
+            "active inference reinforcement learning",
+            top_n=12,
+        )
+
+        assert not {"data", "model", "models", "trying", "basically"} & set(terms)
+        assert "free energy" in terms
+        assert len({term for term in terms if term.startswith("generative model")}) == 1
+
+    def test_probe_pairs_reject_singular_plural_self_relationships(self):
+        assert _find_probe_pairs(
+            ["model models. model models.", "model models. model models."],
+            ["model", "models"],
+        ) == []
+
+    def test_relationship_evidence_is_field_aware_and_ordered(self):
+        scattered = {
+            "title": "Scaling LLM inference with reinforcement learning",
+            "description": "An active discussion of language model training",
+        }
+        title_supported = {
+            "title": "Active inference and reinforcement learning compared",
+        }
+        repeated_description = {
+            "title": "A technical field report",
+            "description": (
+                "Active inference and reinforcement learning are compared. "
+                "The limits of active inference versus reinforcement learning "
+                "are then tested."
+            ),
+        }
+
+        scattered_evidence = _topic_relationship_evidence(
+            scattered, "active inference reinforcement learning"
+        )
+        assert scattered_evidence == {
+            "admitted": False,
+            "title_spans": 0,
+            "description_spans": 0,
+            "hit_spans": 0,
+            "corroborating_spans": 0,
+            "max_span_words": 16,
+        }
+
+        title_evidence = _topic_relationship_evidence(
+            title_supported, "active inference reinforcement learning"
+        )
+        assert title_evidence["admitted"] is True
+        assert title_evidence["title_spans"] == 1
+
+        repeated_evidence = _topic_relationship_evidence(
+            repeated_description, "active inference reinforcement learning"
+        )
+        assert repeated_evidence["admitted"] is True
+        assert repeated_evidence["description_spans"] == 2
+
+        multilingual = _topic_relationship_evidence(
+            {"title": "人工知能と社会変革"}, "人工知能と社会変革"
+        )
+        assert multilingual["admitted"] is True
+        assert multilingual["title_spans"] == 1
+
+    def test_one_description_enumeration_is_not_lexical_corroboration(self):
+        video = {
+            "title": (
+                "Does Your Brain Build Thousands of Realities? | "
+                "A Thousand Brains"
+            ),
+            "description": (
+                "This overview discusses cortical columns, perception, "
+                "movement, prediction, and reference frames. "
+                + "Neocortical models and sensory evidence are reviewed. " * 35
+                + "Alternative perspectives include predictive processing, "
+                "active inference, reinforcement learning, dynamical-systems "
+                "approaches, and contemporary deep learning."
+            ),
+        }
+
+        evidence = _topic_relationship_evidence(
+            video, "active inference reinforcement learning"
+        )
+
+        assert evidence["admitted"] is False
+        assert evidence["title_spans"] == 0
+        assert evidence["description_spans"] == 1
+        assert evidence["corroborating_spans"] == 1
+
+    def test_description_and_distinct_hit_can_lexically_corroborate(self):
+        evidence = _topic_relationship_evidence(
+            {
+                "title": "A technical field report",
+                "description": "Active inference and reinforcement learning.",
+                "hits": [{
+                    "ctx_before": "The comparison tests",
+                    "token": "active inference versus reinforcement learning",
+                }],
+            },
+            "active inference reinforcement learning",
+        )
+
+        assert evidence["admitted"] is True
+        assert evidence["description_spans"] == 1
+        assert evidence["hit_spans"] == 1
 
     def test_non_latin_terms_and_pairs_are_extractable(self):
         texts = [
@@ -902,6 +1079,19 @@ class TestProbeExtraction:
             {left, right} == {"社会変革", "量子技術"}
             for left, right, _, _ in pairs
         )
+
+        scored = _find_probe_pairs(texts, terms, include_scores=True)
+        multilingual_pair = next(
+            row for row in scored
+            if {row[0], row[1]} == {"社会変革", "量子技術"}
+        )
+        basis = multilingual_pair[4]
+        assert basis["method"] == "source_normalized_tfidf_v1"
+        assert basis["score"] > 0
+        assert {basis["left"]["term"], basis["right"]["term"]} == {
+            "社会変革",
+            "量子技術",
+        }
 
     def test_odd_length_ladder_tries_both_adjacent_concept_splits(self):
         ladder = _research_query_ladder(
@@ -927,6 +1117,350 @@ class TestResearchSafetyAndLedger:
         library.list_transcripts.return_value = []
         library.exists.return_value = False
         return library
+
+    @staticmethod
+    def _probe_corpus(library, records):
+        library.list_transcripts.return_value = [
+            {"video_id": video_id} for video_id in records
+        ]
+        library.get.side_effect = (
+            lambda video_id, topic=None: records.get(video_id)
+        )
+
+    @staticmethod
+    def _research_candidate(video_id, label=None):
+        label = label or video_id
+        return {
+            "id": video_id,
+            "title": f"Alpha beta {label}",
+            "channelname": "Research Channel",
+            "duration": 600,
+            "viewcount": 1000,
+            "hits": [
+                {"token": "alpha beta"},
+                {"ctx_before": "alpha", "token": "beta"},
+            ],
+        }
+
+    @patch(
+        "filmot.commands.research._backfill_metadata",
+        side_effect=lambda video_id, title, channel: (title, channel),
+    )
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_relationship_ladder_accumulates_unique_candidates_and_origins(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_transcript,
+        mock_backfill,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        client = mock_client_type.return_value
+        strong = self._research_candidate("strong", "strong origin")
+        strong["_fallback_stage"] = "stale_internal_value"
+        duplicate = self._research_candidate(
+            "strong", "weaker duplicate must not replace origin"
+        )
+        exact = self._research_candidate("exact", "exact source")
+        proximity = self._research_candidate("near", "proximity source")
+        client.search_subtitles_all.side_effect = [
+            {"result": [strong], "totalresultcount": 1},
+            {"result": [duplicate, exact], "totalresultcount": 2},
+            {"result": [proximity], "totalresultcount": 1},
+        ]
+        mock_transcript.side_effect = lambda video_id, **kwargs: {
+            "video_id": video_id,
+            "full_text": f"alpha beta transcript for {video_id}",
+            "segments": [{
+                "text": f"alpha beta transcript for {video_id}",
+                "start": 0.0,
+                "duration": 1.0,
+            }],
+            "source": "youtube",
+            "route": "direct",
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "alpha beta",
+                "--no-scout",
+                "--depth",
+                "3",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert client.search_subtitles_all.call_count == 3
+        compact_output = " ".join(result.output.split())
+        assert (
+            "exact_phrase accumulation: 2 qualified, 1 new, "
+            "1 duplicate(s); unique pool 2/3."
+            in compact_output
+        )
+        assert [
+            call.kwargs["query"]
+            for call in client.search_subtitles_all.call_args_list
+        ] == [
+            "alpha beta",
+            '"alpha beta"',
+            '"alpha" NEAR/25 "beta"',
+        ]
+        assert {
+            call.args[0] for call in mock_transcript.call_args_list
+        } == {"strong", "exact", "near"}
+        saved_stages = {
+            call.kwargs["video_id"]:
+            call.kwargs["metadata"]["selection_stage"]
+            for call in library.save.call_args_list
+        }
+        assert saved_stages == {
+            "strong": "title+transcript",
+            "exact": "exact_phrase",
+            "near": "proximity",
+        }
+        selection = next(
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "selection"
+        )
+        assert {
+            row["video_id"]: row["stage"]
+            for row in selection["selections"]
+        } == saved_stages
+        exact_accumulation = next(
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "search_accumulate"
+            and call.kwargs.get("stage") == "exact_phrase"
+        )
+        assert exact_accumulation["added"] == 1
+        assert exact_accumulation["duplicates"] == 1
+
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_relationship_ladder_stops_calls_when_initial_stage_meets_depth(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_transcript,
+        runner,
+    ):
+        self._library(mock_get_library)
+        client = mock_client_type.return_value
+        client.search_subtitles_all.return_value = {
+            "result": [
+                self._research_candidate("first"),
+                self._research_candidate("second"),
+                self._research_candidate("third"),
+            ],
+            "totalresultcount": 3,
+        }
+        mock_transcript.return_value = {
+            "video_id": "candidate",
+            "full_text": "alpha beta transcript",
+            "segments": [],
+            "source": "youtube",
+            "route": "direct",
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "alpha beta",
+                "--no-scout",
+                "--depth",
+                "2",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert client.search_subtitles_all.call_count == 1
+        ladder_checkpoint = next(
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "search_ladder"
+        )
+        assert ladder_checkpoint["status"] == "target_reached"
+        assert ladder_checkpoint["unique_pool"] == 3
+        assert mock_transcript.call_count == 2
+
+    def test_research_help_describes_depth_as_accumulated_maximum(self, runner):
+        result = runner.invoke(cli, ["research", "--help"])
+
+        assert result.exit_code == 0, result.output
+        compact_output = " ".join(result.output.split())
+        assert "accumulates unique title+transcript" in compact_output
+        assert "Maximum transcripts to select" in compact_output
+        assert "0 previews the initial Filmot scope" in compact_output
+        assert "enabled scout and explicit probes still run" in compact_output
+        assert "even when current discovery is empty" in compact_output
+        assert "empty selection and probing continues" in compact_output
+        assert "never widened with a loose" in compact_output
+
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_depth_zero_keeps_preview_scope_without_expanding_ladder(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_transcript,
+        runner,
+    ):
+        self._library(mock_get_library)
+        client = mock_client_type.return_value
+        client.search_subtitles_all.return_value = {
+            "result": [self._research_candidate("preview")],
+            "totalresultcount": 1,
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "alpha beta",
+                "--no-scout",
+                "--depth",
+                "0",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert client.search_subtitles_all.call_count == 1
+        mock_transcript.assert_not_called()
+        assert "Depth target is 0" in result.output
+        compact_output = " ".join(result.output.split())
+        assert "preview pool 1" in compact_output
+        assert "/0" not in compact_output
+        ladder_checkpoint = next(
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "search_ladder"
+        )
+        assert ladder_checkpoint["status"] == "target_zero"
+        assert ladder_checkpoint["stages"] == ["title+transcript"]
+
+    @patch(
+        "filmot.commands.research._backfill_metadata",
+        side_effect=lambda video_id, title, channel: (title, channel),
+    )
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_exhausted_nonempty_relationship_pool_skips_broad_and_explains_underfill(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_transcript,
+        mock_backfill,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        client = mock_client_type.return_value
+        first = self._research_candidate("only", "only safe source")
+        duplicate = self._research_candidate("only", "later duplicate")
+        client.search_subtitles_all.side_effect = [
+            {"result": [first], "totalresultcount": 1},
+            {"result": [duplicate], "totalresultcount": 1},
+            {"result": [], "totalresultcount": 0},
+        ]
+        mock_transcript.return_value = {
+            "video_id": "only",
+            "full_text": "alpha beta transcript",
+            "segments": [],
+            "source": "youtube",
+            "route": "direct",
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "alpha beta",
+                "--no-scout",
+                "--depth",
+                "6",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert client.search_subtitles_all.call_count == 3
+        search_stages = [
+            call.kwargs["stage"]
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "search"
+            and call.kwargs.get("status") == "started"
+        ]
+        assert search_stages == [
+            "title+transcript",
+            "exact_phrase",
+            "proximity",
+        ]
+        compact_output = " ".join(result.output.split())
+        assert (
+            "Relationship-preserving ladder exhausted with 1/6"
+            in compact_output
+        )
+        assert (
+            "loose transcript-wide fallback is not entered"
+            in compact_output
+        )
+        assert "Qualified pool under target:" in compact_output
+        assert "Next action:" in compact_output
+        assert (
+            "increasing --depth alone will not widen" in compact_output
+        )
+        assert library.save.call_args.kwargs["metadata"][
+            "selection_stage"
+        ] == "title+transcript"
+        underfill = next(
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "candidate_underfill"
+        )
+        assert underfill["target"] == 6
+        assert underfill["qualified"] == 1
+        assert underfill["remaining"] == 5
+        assert underfill["reason"] == (
+            "relationship_ladder_exhausted_nonempty"
+        )
+        assert underfill["next_action"] == "targeted_exact_or_near_search"
+        selection = next(
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "selection"
+        )
+        assert selection["filmot_total"] == 1
 
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")
@@ -1009,6 +1543,20 @@ class TestResearchSafetyAndLedger:
 
         assert result.exit_code == 0, result.output
         assert mock_search_recent.call_args.kwargs["channel_id"] == "UC_ALLOWED"
+        assert mock_search_recent.call_args.kwargs["max_results"] == 10
+        assert mock_search_recent.call_args.kwargs["order"] == "relevance"
+        scout_started = [
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "scout"
+            and call.kwargs.get("status") == "started"
+        ][-1]
+        assert scout_started["days"] == 7
+        assert scout_started["max_results"] == 10
+        assert scout_started["order"] == "relevance"
+        assert scout_started["channel_id"] == "UC_ALLOWED"
+        assert scout_started["request_channel_id"] == "UC_ALLOWED"
         assert "Scout: Found 0 recent upload" in result.output
         mock_transcript.assert_not_called()
 
@@ -1046,8 +1594,181 @@ class TestResearchSafetyAndLedger:
         )
 
         assert result.exit_code == 0, result.output
-        assert "Scout relevance gate: 1 -> 0" in result.output
+        assert "Scout lexical admission gate: 1 -> 0" in result.output
         mock_transcript.assert_not_called()
+
+    @patch("filmot.youtube_search.search_recent")
+    @patch("filmot.youtube_search.validate_youtube_api")
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_scout_rejects_topic_words_scattered_across_unrelated_metadata(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_transcript,
+        mock_validate,
+        mock_search_recent,
+        runner,
+    ):
+        self._library(mock_get_library)
+        mock_client_type.return_value.search_subtitles_all.return_value = {
+            "result": [],
+            "totalresultcount": 0,
+        }
+        # The old bag-of-words gate admitted this: the title covers three of
+        # four tokens and the description supplies the remaining one, despite
+        # never stating the requested relationship in a single passage.
+        mock_search_recent.return_value = [{
+            "video_id": "lexical-false-positive",
+            "channel_id": "UC_ANY",
+            "title": "Scaling LLM Inference with Reinforcement Learning",
+            "description": "An active discussion of language model training",
+        }]
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "active inference reinforcement learning",
+                "--depth",
+                "1",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Scout lexical admission gate: 1 -> 0" in result.output
+        mock_transcript.assert_not_called()
+
+    @patch("filmot.youtube_search.search_recent")
+    @patch("filmot.youtube_search.validate_youtube_api")
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_scout_never_displaces_higher_global_rank_at_depth_one_or_two(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_transcript,
+        mock_validate,
+        mock_search_recent,
+        runner,
+    ):
+        self._library(mock_get_library)
+        filmot_candidates = [
+            {
+                "id": "filmot-a",
+                "title": "Active inference and reinforcement learning source A",
+                "channelname": "Established A",
+                "duration": 600,
+                "viewcount": 5_000_000,
+                "likecount": 250_000,
+                "channelsubcount": 2_000_000,
+                "hits": [
+                    {
+                        "ctx_before": "Mechanistic evidence begins",
+                        "token": "active inference and reinforcement learning",
+                        "ctx_after": "under controlled source A tests",
+                    },
+                    {
+                        "ctx_before": "Policy comparison follows",
+                        "token": "active inference versus reinforcement learning",
+                        "ctx_after": "with source A measurements",
+                    },
+                ],
+            },
+            {
+                "id": "filmot-b",
+                "title": "Active inference and reinforcement learning source B",
+                "channelname": "Established B",
+                "duration": 600,
+                "viewcount": 1_000_000,
+                "likecount": 50_000,
+                "channelsubcount": 1_000_000,
+                "hits": [
+                    {
+                        "ctx_before": "Formal derivation establishes",
+                        "token": "active inference and reinforcement learning",
+                        "ctx_after": "inside source B simulations",
+                    },
+                    {
+                        "ctx_before": "Independent evaluation contrasts",
+                        "token": "active inference versus reinforcement learning",
+                        "ctx_after": "using source B benchmarks",
+                    },
+                ],
+            },
+        ]
+        mock_client_type.return_value.search_subtitles_all.return_value = {
+            "result": filmot_candidates,
+            "totalresultcount": 2,
+        }
+        mock_search_recent.return_value = [{
+            "video_id": "scout-low",
+            "channel_id": "UC_SCOUT",
+            "channel_title": "New Scout",
+            "title": "Active inference and reinforcement learning scout source",
+            "description": "A newly uploaded lexical match.",
+            "views": 21,
+        }]
+
+        def transcript_for(video_id, **kwargs):
+            return {
+                "video_id": video_id,
+                "full_text": f"transcript for {video_id}",
+                "segments": [{
+                    "text": f"transcript for {video_id}",
+                    "start": 0.0,
+                    "duration": 1.0,
+                }],
+                "source": "youtube",
+                "route": "direct",
+            }
+
+        mock_transcript.side_effect = transcript_for
+        for depth, expected_ids in (
+            (1, ["filmot-a"]),
+            (2, ["filmot-a", "filmot-b"]),
+        ):
+            mock_log.reset_mock()
+            mock_transcript.reset_mock()
+
+            result = runner.invoke(
+                cli,
+                [
+                    "research",
+                    "active inference reinforcement learning",
+                    "--depth",
+                    str(depth),
+                ],
+            )
+
+            assert result.exit_code == 0, result.output
+            fetched_ids = [
+                call.args[0] for call in mock_transcript.call_args_list
+            ]
+            assert fetched_ids == expected_ids
+            selection = [
+                call.kwargs
+                for call in mock_log.call_args_list
+                if call.args[0] == "research_checkpoint"
+                and call.kwargs.get("phase") == "selection"
+            ][-1]
+            assert [
+                item["video_id"] for item in selection["selections"]
+            ] == expected_ids
+
+            preview = result.output.split("Candidate preview", 1)[1].split(
+                "Downloading", 1
+            )[0]
+            assert preview.index("source A") < preview.index("source B")
+            assert preview.index("source B") < preview.index("scout source")
+            assert "scout-lexical-spans=t1/d0/h0" in preview
+            assert preview.count("scout-lexical-spans=") == 1
 
     @patch("filmot.youtube_search.search_recent")
     @patch("filmot.youtube_search.validate_youtube_api")
@@ -1278,6 +1999,631 @@ class TestResearchSafetyAndLedger:
             for c in mock_log.call_args_list
         )
 
+    @patch("filmot.commands.research._extract_probe_terms")
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_probe_excludes_frontier_and_skips_with_one_eligible_seed(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_extract,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        self._probe_corpus(library, {
+            "selected": {
+                "video_id": "selected",
+                "transcript": "selected relationship source",
+                "metadata": {"selection_stage": "proximity"},
+            },
+            "scout": {
+                "video_id": "scout",
+                "transcript": "automatic scout frontier",
+                "metadata": {"selection_stage": "scout"},
+            },
+            "probe": {
+                "video_id": "probe",
+                "transcript": "automatic probe frontier",
+                "metadata": {"selection_stage": "probe"},
+            },
+        })
+        mock_client_type.return_value.search_subtitles_all.return_value = {
+            "result": [{
+                "id": "search-seed",
+                "title": "Alpha beta relationship source",
+                "hits": [
+                    {"token": "alpha beta"},
+                    {"token": "alpha beta"},
+                ],
+            }],
+            "totalresultcount": 1,
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "alpha beta",
+                "--no-scout",
+                "--depth",
+                "0",
+                "--probe",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "1 eligible selected/manual transcript" in result.output
+        assert "2 automatic frontier" in result.output
+        assert "probe:1, scout:1" in result.output
+        assert "need at least 2 eligible" in result.output
+        mock_extract.assert_not_called()
+        seed_checkpoint = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe_seed"
+        )
+        assert seed_checkpoint["eligible"] == 1
+        assert seed_checkpoint["excluded"] == 2
+        assert seed_checkpoint["excluded_by_stage"] == {
+            "scout": 1,
+            "probe": 1,
+        }
+        skipped = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe"
+            and call.kwargs.get("status") == "skipped"
+        )
+        assert skipped["reason"] == "insufficient_eligible_seeds"
+
+    @patch("filmot.commands.research._find_probe_pairs", return_value=[])
+    @patch(
+        "filmot.commands.research._extract_probe_terms",
+        return_value=["deliberate practice", "expert performance"],
+    )
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_probe_explains_when_supported_pair_frontier_is_empty(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_terms,
+        mock_pairs,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        self._probe_corpus(library, {
+            "manual-a": {
+                "video_id": "manual-a",
+                "transcript": "deliberate practice expert performance",
+            },
+            "manual-b": {
+                "video_id": "manual-b",
+                "transcript": "deliberate practice expert performance",
+            },
+        })
+        mock_client_type.return_value.search_subtitles_all.return_value = {
+            "result": [self._research_candidate("preview")],
+            "totalresultcount": 1,
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "alpha beta",
+                "--no-scout",
+                "--depth",
+                "0",
+                "--probe",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        compact_output = " ".join(result.output.split())
+        assert "Probe empty:" in compact_output
+        assert "no relationship pair met" in compact_output
+        assert "0 queries run" in compact_output
+        mock_client_type.return_value.search_subtitles.assert_not_called()
+        terminal_probe = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe"
+            and call.kwargs.get("status") == "empty"
+        )
+        assert terminal_probe["reason"] == "no_cross_source_pairs"
+        assert terminal_probe["terms"] == 2
+        assert terminal_probe["queries"] == 0
+        assert terminal_probe["queries_planned"] == 0
+
+    @patch("filmot.commands.research._find_probe_pairs", return_value=[])
+    @patch(
+        "filmot.commands.research._extract_probe_terms",
+        return_value=["deliberate practice", "expert performance"],
+    )
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_empty_discovery_still_runs_explicit_probe_from_saved_sources(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_terms,
+        mock_pairs,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        self._probe_corpus(library, {
+            "manual-a": {
+                "video_id": "manual-a",
+                "transcript": "deliberate practice with useful feedback",
+            },
+            "manual-b": {
+                "video_id": "manual-b",
+                "transcript": "expert performance through focused practice",
+            },
+        })
+        mock_client_type.return_value.search_subtitles_all.return_value = {
+            "result": [],
+            "totalresultcount": 0,
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "alpha beta",
+                "--no-scout",
+                "--depth",
+                "1",
+                "--probe",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "No current discovery candidates passed" in result.output
+        assert "Downloading 0 transcript" not in result.output
+        assert "2 eligible selected/manual transcript" in result.output
+        assert "Probe empty:" in result.output
+        selection = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "selection"
+        )
+        assert selection["status"] == "empty"
+        terminal_probe = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe"
+            and call.kwargs.get("status") == "empty"
+        )
+        assert terminal_probe["reason"] == "no_cross_source_pairs"
+        assert terminal_probe["eligible_seeds"] == 2
+        assert terminal_probe["queries"] == 0
+        assert terminal_probe["queries_planned"] == 0
+        research_end = next(
+            call.kwargs for call in reversed(mock_log.call_args_list)
+            if call.args[0] == "research_end"
+        )
+        assert research_end["status"] == "completed"
+
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_empty_discovery_without_probe_keeps_terminal_empty_behavior(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        self._probe_corpus(library, {
+            "manual-a": {
+                "video_id": "manual-a",
+                "transcript": "saved source remains available",
+            },
+        })
+        mock_client_type.return_value.search_subtitles_all.return_value = {
+            "result": [],
+            "totalresultcount": 0,
+        }
+
+        result = runner.invoke(
+            cli,
+            ["research", "alpha beta", "--no-scout", "--depth", "1"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "No candidates passed" in result.output
+        assert "Probe seeds:" not in result.output
+        assert not any(
+            call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe_seed"
+            for call in mock_log.call_args_list
+        )
+        selection = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "selection"
+        )
+        assert selection["status"] == "empty"
+        research_end = next(
+            call.kwargs for call in reversed(mock_log.call_args_list)
+            if call.args[0] == "research_end"
+        )
+        assert research_end["status"] == "empty"
+
+    @patch(
+        "filmot.commands.research._find_probe_pairs",
+        return_value=[
+            (
+                "machine learning",
+                "neural network",
+                7,
+                3,
+                {"method": "source_normalized_tfidf_v1", "score": 9.06},
+            ),
+            (
+                "deep learning",
+                "neural network",
+                5,
+                3,
+                {"method": "source_normalized_tfidf_v1", "score": 7.94},
+            ),
+        ],
+    )
+    @patch(
+        "filmot.commands.research._extract_probe_terms",
+        return_value=["machine learning", "neural network", "deep learning"],
+    )
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_probe_broad_sampled_zero_stops_and_records_lower_ranked_tail(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_terms,
+        mock_pairs,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        self._probe_corpus(library, {
+            "manual-a": {
+                "video_id": "manual-a",
+                "transcript": "machine learning and neural network",
+                "metadata": {},
+            },
+            "selected-b": {
+                "video_id": "selected-b",
+                "transcript": "machine learning and neural network",
+                "metadata": {"selection_stage": "exact_phrase"},
+            },
+            "old-scout": {
+                "video_id": "old-scout",
+                "transcript": "frontier text must not seed",
+                "metadata": {"selection_stage": "scout"},
+            },
+        })
+        client = mock_client_type.return_value
+        client.search_subtitles_all.return_value = {
+            "result": [{
+                "id": "search-seed",
+                "channelid": "UC_SCOPE",
+                "title": (
+                    "Active inference reinforcement learning source"
+                ),
+                "hits": [
+                    {"token": "active inference reinforcement learning"},
+                    {"token": "active inference reinforcement learning"},
+                ],
+            }],
+            "totalresultcount": 1,
+        }
+        client.search_subtitles.return_value = {
+            "result": [
+                {
+                    "id": f"generic-{index}",
+                    "title": f"Generic neural network course {index}",
+                    "channelid": "UC_SCOPE",
+                    "hits": [{"token": "machine learning neural network"}],
+                }
+                for index in range(50)
+            ],
+            "totalresultcount": 9797,
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "active inference reinforcement learning",
+                "--no-scout",
+                "--depth",
+                "0",
+                "--probe",
+                "--channel-id",
+                "UC_SCOPE",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert client.search_subtitles.call_count == 1
+        assert "2 eligible selected/manual transcript" in result.output
+        assert "1 automatic frontier" in result.output
+        assert "score:9.060" in result.output
+        assert "Sampled zero" in result.output
+        assert "50/9,797 results (0.5%)" in result.output
+        assert "global zero." in result.output
+        assert "manual query: filmot search" in result.output
+        compact_output = " ".join(result.output.split())
+        assert (
+            "Exact manual query: filmot search '"
+            '"machine learning" NEAR/15 "neural network"'
+            "' --lang en --title 'active inference reinforcement learning' "
+            "--channel-id UC_SCOPE"
+        ) in compact_output
+        probe_event = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_probe"
+        )
+        assert probe_event["status"] == "broad_sampled"
+        assert probe_event["api_total"] == 9797
+        assert probe_event["returned"] == 50
+        assert probe_event["scoped"] == 0
+        assert probe_event["sample_coverage"] == 0.0051
+        assert probe_event["informativeness"]["score"] == 9.06
+        deferred = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe_search"
+            and call.kwargs.get("status") == "deferred"
+        )
+        assert deferred["index"] == 2
+        assert deferred["reason"] == "broad_sampled_tail_budget"
+        assert deferred["query"] == (
+            '"deep learning" NEAR/15 "neural network"'
+        )
+
+    @patch(
+        "filmot.commands.research._find_probe_pairs",
+        return_value=[
+            ("specific alpha", "specific beta", 8, 3, {"score": 12.0}),
+            ("specific gamma", "specific delta", 6, 2, {"score": 10.0}),
+            ("generic alpha", "generic beta", 4, 2, {"score": 4.0}),
+        ],
+    )
+    @patch(
+        "filmot.commands.research._extract_probe_terms",
+        return_value=["specific alpha", "specific beta"],
+    )
+    @patch("filmot.commands.research._backfill_metadata")
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_probe_stops_api_calls_at_three_candidate_capacity(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_transcript,
+        mock_backfill,
+        mock_terms,
+        mock_pairs,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        self._probe_corpus(library, {
+            "manual-a": {"video_id": "manual-a", "transcript": "seed a"},
+            "manual-b": {"video_id": "manual-b", "transcript": "seed b"},
+        })
+        client = mock_client_type.return_value
+        client.search_subtitles_all.return_value = {
+            "result": [{
+                "id": "search-seed",
+                "title": "Alpha beta relationship source",
+                "hits": [
+                    {"token": "alpha beta"},
+                    {"token": "alpha beta"},
+                ],
+            }],
+            "totalresultcount": 1,
+        }
+
+        def candidates(prefix):
+            return {
+                "result": [
+                    {
+                        "id": f"{prefix}-{suffix}",
+                        "title": f"Alpha beta candidate {prefix}-{suffix}",
+                        "channelname": "Channel",
+                        "duration": 60,
+                        "hits": [],
+                    }
+                    for suffix in ("a", "b")
+                ],
+                "totalresultcount": 2,
+            }
+
+        client.search_subtitles.side_effect = [
+            candidates("first"),
+            candidates("second"),
+        ]
+
+        def transcript_result(video_id, *args, **kwargs):
+            return {
+                "video_id": video_id,
+                "full_text": f"transcript for {video_id}",
+                "segments": [{
+                    "text": f"transcript for {video_id}",
+                    "start": 0.0,
+                    "duration": 1.0,
+                }],
+                "source": "youtube",
+                "route": "direct",
+            }
+
+        mock_transcript.side_effect = transcript_result
+        mock_backfill.side_effect = (
+            lambda video_id, title, channel: (title, channel)
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "alpha beta",
+                "--no-scout",
+                "--depth",
+                "0",
+                "--probe",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert client.search_subtitles.call_count == 2
+        assert library.save.call_count == 3
+        assert mock_transcript.call_count == 3
+        assert "Probe candidate capacity reached (3)" in result.output
+        probe_indexes = [
+            call.kwargs["metadata"]["probe_index"]
+            for call in library.save.call_args_list
+        ]
+        assert probe_indexes == [1, 1, 2]
+        assert all(
+            call.kwargs["metadata"]["probe_query"]
+            for call in library.save.call_args_list
+        )
+        deferred = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe_search"
+            and call.kwargs.get("status") == "deferred"
+        )
+        assert deferred["index"] == 3
+        assert deferred["reason"] == "candidate_capacity_reached"
+
+    @patch(
+        "filmot.commands.research._find_probe_pairs",
+        return_value=[
+            ("free energy", "machine learning", 5, 2, {"score": 11.36}),
+        ],
+    )
+    @patch(
+        "filmot.commands.research._extract_probe_terms",
+        return_value=["free energy", "machine learning"],
+    )
+    @patch("filmot.commands.research._backfill_metadata")
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_probe_broad_sample_with_coherent_candidate_is_retained(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_transcript,
+        mock_backfill,
+        mock_terms,
+        mock_pairs,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        self._probe_corpus(library, {
+            "manual-a": {"video_id": "manual-a", "transcript": "seed a"},
+            "manual-b": {"video_id": "manual-b", "transcript": "seed b"},
+        })
+        client = mock_client_type.return_value
+        client.search_subtitles_all.return_value = {
+            "result": [{
+                "id": "search-seed",
+                "title": (
+                    "Active inference reinforcement learning source"
+                ),
+                "hits": [
+                    {"token": "active inference reinforcement learning"},
+                    {"token": "active inference reinforcement learning"},
+                ],
+            }],
+            "totalresultcount": 1,
+        }
+        client.search_subtitles.return_value = {
+            "result": [{
+                "id": "relevant",
+                "title": "Active inference reinforcement learning comparison",
+                "channelname": "Channel",
+                "duration": 120,
+                "hits": [{"token": "free energy machine learning"}],
+            }],
+            "totalresultcount": 9797,
+        }
+        mock_transcript.return_value = {
+            "video_id": "relevant",
+            "full_text": "relevant transcript",
+            "segments": [{
+                "text": "relevant transcript",
+                "start": 0.0,
+                "duration": 1.0,
+            }],
+            "source": "youtube",
+            "route": "direct",
+        }
+        mock_backfill.side_effect = (
+            lambda video_id, title, channel: (title, channel)
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "active inference reinforcement learning",
+                "--no-scout",
+                "--depth",
+                "0",
+                "--probe",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        mock_transcript.assert_called_once()
+        assert library.save.call_count == 1
+        assert library.save.call_args.kwargs["video_id"] == "relevant"
+        assert library.save.call_args.kwargs["metadata"]["probe_query"] == (
+            '"free energy" NEAR/15 "machine learning"'
+        )
+        assert "Sampled zero" not in result.output
+        probe_event = next(
+            call.kwargs for call in mock_log.call_args_list
+            if call.args[0] == "research_probe"
+        )
+        assert probe_event["status"] == "completed"
+        assert probe_event["api_total"] == 9797
+        assert probe_event["scoped"] == 1
+        assert probe_event["sample_coverage"] == 0.0001
+
     @patch(
         "filmot.commands.research._find_probe_pairs",
         return_value=[("language models", "neural networks", 6, 2)],
@@ -1347,6 +2693,118 @@ class TestResearchSafetyAndLedger:
         assert probe_calls[-1].kwargs["api_total"] == 1354
         assert probe_calls[-1].kwargs["returned"] == 0
         assert probe_calls[-1].kwargs["scoped"] == 0
+
+    @patch(
+        "filmot.commands.research._find_probe_pairs",
+        return_value=[("free energy", "generative model", 6, 2)],
+    )
+    @patch(
+        "filmot.commands.research._extract_probe_terms",
+        return_value=["free energy", "generative model"],
+    )
+    @patch(
+        "filmot.commands.research._backfill_metadata",
+        return_value=("Active inference reinforcement learning case study", "Channel"),
+    )
+    @patch("filmot.transcript.get_transcript")
+    @patch("filmot.transcript.is_proxy_configured", return_value=False)
+    @patch("filmot.ledger.log_event")
+    @patch("filmot.library.get_library")
+    @patch("filmot.commands.research.FilmotClient")
+    def test_probe_rejects_lexical_false_positive_and_saves_query_provenance(
+        self,
+        mock_client_type,
+        mock_get_library,
+        mock_log,
+        mock_proxy,
+        mock_transcript,
+        mock_backfill,
+        mock_terms,
+        mock_pairs,
+        runner,
+    ):
+        library = self._library(mock_get_library)
+        library.list_transcripts.return_value = [
+            {"video_id": "saved-a"},
+            {"video_id": "saved-b"},
+        ]
+        library.get.return_value = {
+            "transcript": "Free energy and generative model interact. " * 4
+        }
+        client = mock_client_type.return_value
+        client.search_subtitles_all.return_value = {
+            "result": [{
+                "id": "seed",
+                "title": "Active inference reinforcement learning overview",
+                "hits": [{"token": "active inference"}, {"token": "reinforcement learning"}],
+            }],
+            "totalresultcount": 1,
+        }
+        client.search_subtitles.return_value = {
+            "result": [
+                {
+                    "id": "unrelated",
+                    "title": "Data Science Full Course",
+                    "description": "Active students learn model inference",
+                    "hits": [{"token": "free energy generative model"}],
+                },
+                {
+                    "id": "coherent",
+                    "title": "Active inference reinforcement learning case study",
+                    "channelname": "Channel",
+                    "hits": [{"token": "free energy generative model"}],
+                },
+            ],
+            "totalresultcount": 2,
+        }
+        mock_transcript.return_value = {
+            "video_id": "coherent",
+            "full_text": "coherent transcript",
+            "segments": [{"text": "coherent transcript", "start": 0.0, "duration": 1.0}],
+            "source": "youtube",
+            "route": "direct",
+        }
+
+        result = runner.invoke(
+            cli,
+            [
+                "research",
+                "active inference reinforcement learning",
+                "--no-scout",
+                "--depth",
+                "0",
+                "--probe",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        mock_transcript.assert_called_once()
+        assert mock_transcript.call_args.args[0] == "coherent"
+        metadata = library.save.call_args.kwargs["metadata"]
+        assert metadata["probe_query"] == '"free energy" NEAR/15 "generative model"'
+        assert metadata["probe_index"] == 1
+        saved_checkpoints = [
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe_download"
+            and call.kwargs.get("status") == "saved"
+        ]
+        assert saved_checkpoints[-1]["probe_query"] == metadata["probe_query"]
+        assert saved_checkpoints[-1]["probe_index"] == 1
+        assert saved_checkpoints[-1]["title"] == metadata["title"]
+        assert saved_checkpoints[-1]["channel"] == metadata["channel"]
+        started_checkpoints = [
+            call.kwargs
+            for call in mock_log.call_args_list
+            if call.args[0] == "research_checkpoint"
+            and call.kwargs.get("phase") == "probe_download"
+            and call.kwargs.get("status") == "started"
+        ]
+        assert started_checkpoints[-1]["title"] == (
+            "Active inference reinforcement learning case study"
+        )
+        assert started_checkpoints[-1]["channel"] == "Channel"
 
     @patch("filmot.transcript.is_proxy_configured", return_value=False)
     @patch("filmot.ledger.log_event")

@@ -65,16 +65,39 @@ filmot research "nuclear fusion energy" --depth 12 --dedupe
 
 This runs the **Scout → Staged Search → Preview → Download** pipeline:
 
-1. **Scout** — Quick YouTube API probe for the latest uploads about your topic (last 7 days). Catches breaking news that Filmot hasn't indexed yet.
-2. **Staged search** — Tries title+transcript, an exact phrase, and `NEAR/N` before considering loose transcript-wide matching.
-3. **Safety gate** — Exact/`NEAR/N` fallbacks require at least 75% topic-token coverage in one visible passage; a high-cardinality loose fallback is blocked unless `--accept-broad` is explicit.
-4. **Preview and rank** — Shows relevance, density, echo risk, and a separate audience/engagement `source-prior`; balanced ranking is the default.
+1. **Scout** — Queries recent YouTube uploads by relevance (10 results over the last 7 days by default), then applies an inspectable lexical admission gate. Catches breaking news that Filmot hasn't indexed yet.
+2. **Accumulating staged search** — Adds unique qualified candidates from title+transcript, exact phrase, and `NEAR/N` in that order until the depth target is met or the safe ladder is exhausted; duplicates keep their first, stronger-stage origin.
+3. **Safety gate** — Exact/`NEAR/N` fallbacks require at least 75% topic-token coverage in one visible passage. A nonempty underfilled safe pool never triggers loose search merely to fill slots; a high-cardinality loose fallback after a completely empty safe ladder is blocked unless `--accept-broad` is explicit.
+4. **Preview and rank** — Shows relevance, density, echo risk, and a separate audience/engagement `source-prior`; balanced ranking is the default and one global rank governs selection regardless of source origin.
 5. **Download and checkpoint** — Saves selected transcripts and per-item outcomes under the Unicode-safe topic name.
 6. **Probe (optional)** — Extracts cross-source entities, reports co-occurrence-window and source support, and runs transparent `NEAR/N` follow-ups.
 
 **Why this matters:** Filmot indexes transcripts ~24-48 hours after upload. For breaking news, the scout phase finds videos that Filmot can't see yet. Without it, you'd miss same-day developments entirely.
 
 The source prior is an unverified popularity/engagement heuristic, not a credibility or truth score. Treat every automatically selected transcript as candidate material until you inspect the passage and verify important claims.
+
+`--depth` is a maximum, not a guaranteed corpus size. When the safe ladder
+underfills, Filmot keeps the qualified sources and tells you to inspect them,
+refine TOPIC, or run a targeted exact/`NEAR/N` search; increasing `--depth`
+alone cannot widen an exhausted pool. `--depth 0` skips Filmot ladder expansion
+beyond the initial title+transcript stage and downloads no selected candidates;
+an enabled scout can still join the preview. If you also pass `--probe`, that
+separately requested phase can still use existing eligible library seeds.
+“Qualified” here means visible lexical/coverage evidence, not a
+semantic, credibility, or truth judgment.
+
+The same separation holds at every depth: a legitimately empty current
+discovery records an empty selection, then an explicit `--probe` continues from
+eligible preexisting transcripts in the topic library and records its terminal
+probe accounting. A fatal broad-scope safety gate is different—it still fails
+closed and does not permit probe continuation.
+
+The scout gate requires one bounded ordered topic span in the title, or two
+non-overlapping spans in total across the description and/or de-duplicated
+visible hit passages. It is lexical admission—not semantic relevance or source
+credibility. An admitted scout competes in the same global rank, and selection
+follows that order exactly; Filmot does not reserve a scout download slot or
+use a hidden origin quota.
 
 Then cross-reference what your sources say:
 
@@ -112,7 +135,7 @@ filmot research "your topic" [OPTIONS]
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-n, --depth N` | Number of transcripts to download | 10 |
+| `-n, --depth N` | Maximum selected transcripts to download; 0 previews the initial scope | 10 |
 | `--min-views N` | Minimum view count filter | None |
 | `-l, --lang` | Language code | en |
 | `--fallback` | Use AWS Transcribe when captions unavailable | Off |
@@ -124,7 +147,7 @@ filmot research "your topic" [OPTIONS]
 | `--accept-broad` | Permit a high-cardinality loose fallback after preview/gating | Off |
 | `--broad-threshold N` | Loose-result cardinality requiring explicit acceptance | 1000 |
 | `--channel` / `--channel-id` | Restrict candidates to resolved or exact channel IDs; fail closed on resolution errors | None |
-| `--scout / --no-scout` | YouTube API freshness probe for latest uploads | On (if API key set) |
+| `--scout / --no-scout` | YouTube freshness probe; admitted results join the global rank without an origin quota | On (if API key set) |
 | `--scout-days N` | How far back the scout looks | 7 |
 | `--probe` | Auto-extract entities from transcripts and run NEAR/N probes to discover related content | Off |
 | `--verbose` | Show full transcript failure details | Off |
@@ -155,18 +178,29 @@ filmot research "grid demand" --channel "Lawrence Berkeley National Laboratory"
 
 # Skip scout if you only want indexed transcripts (faster, no YouTube API needed)
 filmot research "your topic" --no-scout --sort viewcount
+
+# Preview only the initial Filmot scope; do not expand or download selections
+filmot research "your topic" --no-scout --depth 0
 ```
 
 ### The Probe Phase (--probe)
 
 The `--probe` flag activates Phase 4: automatic NEAR/N discovery. After downloading transcripts, it:
 
-1. **Extracts key entities** — preserves source/sentence boundaries, filters stopwords, clusters likely ASR variants, and prefers terms supported by multiple transcripts
-2. **Finds co-occurring pairs** — scans overlapping 50-word windows (25-word stride) without crossing source or sentence boundaries; a pair must occur in at least two transcripts
-3. **Generates NEAR/N probes** — turns the top pairs into `"entity1" NEAR/15 "entity2"` searches; it retains a title constraint when the initial title stage proved usable, otherwise it applies the displayed passage-level topic relevance filter
-4. **Downloads discoveries** — the top 3 new videos (not already in your library) from the probes are downloaded
+1. **Bounds the seed corpus** — requires at least two selected/manual transcripts and excludes automatic scout/probe discoveries, preventing recursive frontier pollution
+2. **Extracts key entities** — preserves source/sentence boundaries, filters stopwords, clusters likely ASR variants, and prefers terms supported by multiple transcripts
+3. **Ranks co-occurring pairs** — scans overlapping 50-word windows (25-word stride) without crossing source or sentence boundaries; pairs need support in at least two transcripts and are ranked with source-length-normalized TF-IDF-style salience plus co-window/source support
+4. **Runs scoped NEAR/N probes** — turns ranked pairs into `"entity1" NEAR/15 "entity2"` searches; it retains a title constraint when the initial title stage proved usable, otherwise it applies the displayed passage-level topic relevance filter
+5. **Stops with visible budgets** — downloads at most 3 new discoveries and defers the lower-ranked query tail once that capacity is filled. If an over-threshold query's returned sample contains zero new scoped candidates, Filmot labels it `broad_sampled`, says it is not a global zero, stops the tail, and prints the exact constrained `filmot search` follow-up
 
-**Why this is powerful:** Your initial search finds videos explicitly about your topic. The probe phase finds videos that discuss the *relationships within* your topic — angles, connections, and context your original search missed. Each iteration surfaces new entities that could feed further probing.
+**Why this is powerful:** Your initial search finds videos explicitly about your topic. The probe phase finds videos that discuss the *relationships within* your topic—angles, connections, and context your original search missed—without automatically feeding its own discoveries back into the next frontier.
+
+An empty probe frontier is explicit. If the eligible seeds produce no
+sufficiently specific terms, Filmot reports and logs `no_candidate_terms`; if
+terms exist but no pair meets cross-source/co-window support, it records
+`no_cross_source_pairs`. Both terminal outcomes run zero probe queries. They
+describe the lexical extraction frontier, not the absence of a semantic
+relationship in the source material.
 
 ```bash
 # Example output:
@@ -285,7 +319,22 @@ filmot transcript VIDEO_ID --grep '("memory" | "context") NEAR/15 "production"'
 filmot transcript VIDEO_ID --grep '"first plasma"~5'
 ```
 
-This closes the search → download → grep loop inside the tool: find a promising video with `search`, then probe its exact content without leaving the CLI.
+This closes the search → download → grep loop inside the tool. Before using an
+external transcript route, grep reuses one unambiguous language-compatible
+library record only when its finite, monotonic timestamp segments reproduce
+the complete stored text exactly. Equivalent copies across topics collapse;
+distinct usable copies, language mismatches, text-only records, or invalid
+timing fall back explicitly to the normal route ladder. Blank or malformed
+proximity syntax fails preflight before local lookup, route setup, or network
+access. `--grep` cannot be combined with `--save-to`, `--output`, `--full`,
+`--timestamps`, `--chunk`, or `--fallback`.
+
+Human matches show the readable timestamp and literal timestamped YouTube URL,
+ready for `claims cite --at`. Raw grep returns `query`, `match_count`, and
+stable `matches` rows containing `seconds`, `timestamp`, `deep_link`, and
+`excerpt`. A clean miss is typed `empty`; malformed syntax is a typed
+`InvalidGrepQuery` at `parse-query`, using the same evaluated outcome that is
+logged.
 
 ### Save to Library
 
@@ -348,6 +397,9 @@ filmot library context prompt-injection --format structured
 # Get combined text limited to 50K chars
 filmot library context prompt-injection --max-chars 50000
 
+# Materialize into a nested path; missing parents are created
+filmot library context prompt-injection --output exports/prompts/context.txt
+
 # Show library statistics
 filmot library stats
 
@@ -364,8 +416,11 @@ filmot library delete topic-name --all
 Inspection is deliberately quiet: `library list`, `search`, `compare`, and
 `stats` never append session events. `library context` also remains read-only
 when it prints to stdout; a context file write, including the structured
-format's automatic save, is logged. `library echoes` never logs, even with
-`--persist`. Raw mode does not alter these rules.
+format's automatic save, is logged. `--output` creates missing parent
+directories; parent-creation or file-write errors return the same typed
+`write-output` failure, exit nonzero, and log a failed delivery.
+`library echoes` never logs, even with `--persist`. Raw mode does not alter
+these rules.
 
 ### Library Search: Word-Boundary Matching
 
@@ -470,7 +525,7 @@ filmot claims add robin-ai-scientist \
 
 # Cite a saved or external video at an exact moment
 filmot claims cite robin-ai-scientist c-CLAIMID \
-  --video VIDEO_ID --at 312 --relation supports \
+  --video VIDEO_ID --at 5:12 --relation supports \
   --excerpt "short exact source text" --secondary
 
 # Cite a primary document and keep source text separate from analyst notes
@@ -494,8 +549,9 @@ All four subcommands accept `--raw`. Relations are `supports`, `contradicts`,
 `supported`, `contradicted`, and `mixed`; confidence is `unknown`, `low`,
 `medium`, or `high`. Use `--independence independent|echo` and
 `--lineage-group` only when you have made that lineage judgment; Filmot does
-not infer it from an echo cluster. `--at` requires a video and accepts only a
-finite, non-negative number of seconds. `--video` cannot be paired with a
+not infer it from an echo cluster. `--at` requires a video and accepts finite,
+non-negative seconds or the `M:SS`/`H:MM:SS` timestamps displayed by transcript
+and library commands; Filmot stores canonical numeric seconds. `--video` cannot be paired with a
 non-video `--source-kind` or with `--source`; one evidence event always
 describes one source. `--video` accepts exactly 11 YouTube-ID characters
 matching `[A-Za-z0-9_-]{11}`, not a URL, and malformed values fail before
@@ -517,6 +573,15 @@ Claim events are strict, append-only files under
 a later assessment supersedes rather than erases history. Per-topic OS locks
 cover each full read/check/append transaction, and every event is validated
 before publication, so concurrent mutations cannot fork an assessment chain.
+A successful append normally removes its publication temporary source. If the
+event is durable but unlinking the temporary fails, the command surfaces the
+durable destination and exact retained temporary without claiming rollback. If
+publication and cleanup both fail, it reports both errors, names the exact
+retained temporary, and says the destination was not confirmed. Claim
+operations do not scan for or delete historical or unrelated `.tmp` leftovers.
+Exact mutation retries are content-idempotent; recovery should inspect the
+reported durable/not-confirmed outcome rather than infer state from the error
+alone.
 New events use `filmot.claim/v2` with contiguous per-topic sequence numbers.
 Sequence-less `filmot.claim/v1` histories are accepted for compatibility,
 ordered in memory, and never rewritten; a valid legacy history can be
@@ -552,6 +617,19 @@ filmot sessions 2026-06-10         # replay a day's ad-hoc search queries
 filmot sessions 2026-06-10 --raw   # one result with an events array
 ```
 
+For every recorded scout request, the human summary prints a copyable command
+equivalent to:
+
+```bash
+filmot yt-search "TOPIC" --days 7 --max-results 10 \
+  --order relevance --show-description --raw
+```
+
+The actual query, days, maximum results, order, and request channel are taken
+from that run rather than reconstructed from current defaults. The command
+reproduces the upstream request; a multi-channel local post-filter remains
+visible in raw provenance because one YouTube request cannot express it.
+
 `research <topic>` logs a run ID, `research_start`, phase checkpoints, every
 selected/downloaded item, and `research_end` with completed, failed, or
 interrupted status to `<topic>.jsonl`. Search routing is explicit `--session`,
@@ -564,8 +642,25 @@ deliberately.
 `--summary` folds one named session while keeping unlike universes separate:
 standalone-search API/fetched/post-filter counts, staged research-search counts
 after their explicit gates, selected-download and probe outcomes, unique saved
-transcripts, failed attempts and unique failed videos, and claim mutations. It does not
-reinterpret those numbers as one source count. Listing, replaying, or
+transcripts, failed attempts and unique failed videos, and claim mutations. A
+bounded provenance view links scout gates, probe queries, and saved sources to
+their discovery stage/query; older probe downloads without that field say
+`query not recorded` instead of guessing. Successful manual
+`transcript --save-to` events are saved-source origin `manual`. Human output
+says `query not recorded (manual save)`; raw provenance uses null
+`origin_query` plus `provenance_status: query_not_recorded`, never inferring a
+query from adjacent activity. New successful manual-save events include
+best-effort title/channel display metadata; legacy events that did not record
+it remain `Unknown` rather than being inferred. Each provenance section keeps
+its 25 most recent rows and reports omitted counts. Scout provenance includes the effective
+request, found/gated counts, and reproduction command. Bounded probe-run outcomes retain terminal
+status/reason and seed, term, executed/planned/deferred query, failure, and
+saved counts—including zero-query `no_candidate_terms` and
+`no_cross_source_pairs` runs. Probe-query provenance preserves operational
+`broad_sampled`, `deferred`, and `failed_closed` states instead of normalizing
+them into misleading completed rows, with API/returned/scoped counts retained
+when recorded. It does not reinterpret those numbers as one source count.
+Listing, replaying, or
 summarizing sessions is read-only, never logs the inspection, and does not
 create project storage on an empty workspace. Malformed/unreadable ledger
 records are surfaced as typed read errors: a partly readable replay/summary is
@@ -866,13 +961,25 @@ filmot library context brain-computer-interfaces --format structured
 # research command auto-scouts YouTube for latest uploads
 filmot research "TOPIC" --scout-days 3 --depth 10
 
-# Or manually: yt-search first (headlines), then Filmot (depth)
-filmot yt-search "TOPIC" --days 3 --order relevance
+# Or manually: reproduce the scout first, then use Filmot for transcript depth
+filmot yt-search "TOPIC" --days 3 --max-results 10 \
+  --order relevance --show-description --raw
 filmot search 'TOPIC' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
 filmot transcript VIDEO_ID --full
 ```
 
 **Key insight:** Filmot indexes transcripts ~24-48 hours after upload. For same-day events, `yt-search` (YouTube Data API) finds videos that Filmot can't see yet. The `research` command's `--scout` phase handles this automatically. If you're investigating something that happened today, always start with `yt-search` or use `--scout-days 1`.
+
+Direct `yt-search` defaults to date order and 25 results; the research scout
+uses and records relevance order with 10. `yt-search --raw` returns one
+`filmot.result/v1` object with `videos`. Add `--transcript` (and optionally
+`--transcript-query`) to attach the same per-video `transcript_search` object to
+each video in human and raw mode: `query`, `status`, `match_count`, `matches`,
+and available language/generation metadata. The transcript query is a
+case-insensitive segment substring, not `NEAR/N`. One transcript failure does not
+discard the YouTube discoveries; it produces a typed `transcript-search`
+error, marks that video's nested result `failed`, and makes the command
+`partial`.
 
 ### Pattern 3: Deep Discovery (Probe)
 ```bash
@@ -884,7 +991,10 @@ filmot library compare "entity from probe" --topic TOPIC
 filmot library search "new angle" --topic TOPIC
 ```
 
-The `--probe` flag is the compounding move. It mines your downloaded transcripts for entity relationships, auto-generates NEAR/N searches, and downloads the best discoveries. Use this when you want the tool to actively find angles you didn't think to search for.
+The `--probe` flag is a bounded discovery move. It mines eligible
+selected/manual transcripts for entity relationships, auto-generates scoped
+NEAR/N searches, and downloads up to three discoveries without recursively
+using automatic scout/probe frontier records as new seeds.
 
 ### Pattern 3b: Channel Corpus Mining (Deep Knowledge Base)
 
@@ -1026,7 +1136,11 @@ use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
   keys and add `_filmot` metadata (`schema`, `command`, `status`, `errors`,
   `warnings`). Library list/search/compare use `rows`; local search and compare
   rows include citation details, with timestamps and deep links when saved
-  segments exist. `library echoes` adds `clusters`, `method`, and
+  segments exist. `yt-search` uses `videos`; with `--transcript`, every video
+  carries the shared `transcript_search` outcome and per-video failures make
+  the top-level result `partial`. `transcript --grep --raw` returns stable
+  seconds/timestamp/link/excerpt match rows, typed `empty` misses, and typed
+  preflight parse failures. `library echoes` adds `clusters`, `method`, and
   `artifact_hash`. Claim commands use `rows`, and all four accept `--raw`.
   `sessions NAME --raw` exposes its replay in `events`, while
   `sessions NAME --summary --raw` uses `summary`; every replayed event uses the
@@ -1047,6 +1161,7 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | Task | Command |
 |------|---------|
 | **Research a topic (one command)** | `filmot research "topic" --depth 12 --dedupe` |
+| **Preview initial research scope** | `filmot research "topic" --no-scout --depth 0` |
 | **Deep discovery research** | `filmot research "topic" --probe --depth 12 --dedupe` |
 | **Breaking news research** | `filmot research "topic" --scout-days 3 --depth 10` |
 | **Search latest YouTube uploads** | `filmot yt-search "topic" --days 7 --order relevance` |
@@ -1066,6 +1181,7 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Date filter** | `filmot search "query" --start-date YYYY-MM-DD --end-date YYYY-MM-DD --full` |
 | **Density sort** | `filmot search "query" --sort density --min-matches 3 --full` |
 | **Get transcript** | `filmot transcript VIDEO_ID --full` |
+| **Search one transcript** | `filmot transcript VIDEO_ID --grep '"term A" NEAR/15 "term B"'` |
 | **Save to library** | `filmot transcript VIDEO_ID --full --save-to TOPIC` |
 | **Bulk download (dedupe)** | `filmot search "query" --bulk-download TOPIC:10 --dedupe` |
 | **Pipeline download** | `filmot search "query" --raw \| filmot download -t TOPIC --dedupe` |

@@ -244,6 +244,500 @@ _STATUS_ALIASES = {
 }
 _CANONICAL_STATUSES = {item.value for item in ResultStatus}
 
+# Session summaries are a resumption aid, not a second copy of the ledger.
+# Keep provenance useful in human and raw output without allowing a long-running
+# investigation (or an unexpectedly large title/query) to dominate the result.
+SESSION_PROVENANCE_ROW_LIMIT = 25
+SESSION_PROVENANCE_QUERY_CHARS = 180
+SESSION_PROVENANCE_LABEL_CHARS = 120
+_PROBE_PROVENANCE_DETAIL_STATUSES = {
+    "broad_sampled",
+    "deferred",
+    "failed_closed",
+}
+_RESEARCH_STAGE_ALIASES = {
+    "title_transcript": "title+transcript",
+}
+
+
+def _probe_provenance_status(status: str, data: Mapping[str, Any]) -> str:
+    """Preserve bounded operational states hidden by event normalization."""
+    detail = data.get("detail_status")
+    if detail in _PROBE_PROVENANCE_DETAIL_STATUSES:
+        return str(detail)
+    return status
+
+
+def _canonical_research_stage(value: object) -> str:
+    stage = str(value or "")
+    return _RESEARCH_STAGE_ALIASES.get(stage, stage)
+
+
+def _compact_provenance_text(value: object, limit: int) -> str:
+    """Return one bounded, single-line ledger label for a session summary."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _bounded_provenance_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep the most recent provenance rows and report what was omitted."""
+    total = len(rows)
+    visible = rows[-SESSION_PROVENANCE_ROW_LIMIT:]
+    return {
+        "total": total,
+        "shown": len(visible),
+        "omitted": total - len(visible),
+        "rows": visible,
+    }
+
+
+def _optional_provenance_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_provenance_constraints(value: object) -> Dict[str, Any]:
+    """Retain only the documented probe scope fields, each size-bounded."""
+    if not isinstance(value, dict):
+        return {}
+    compact: Dict[str, Any] = {}
+    for key in ("title", "channel_id", "lang"):
+        item = value.get(key)
+        if item is None:
+            compact[key] = None
+        elif isinstance(item, str):
+            compact[key] = _compact_provenance_text(
+                item, SESSION_PROVENANCE_QUERY_CHARS
+            )
+    return compact
+
+
+def _compact_selection_signals(value: object) -> Dict[str, Any]:
+    """Keep the small ranking subset that explains a selected source."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value[key]
+        for key in (
+            "token_coverage",
+            "passage_coverage",
+            "title_coverage",
+            "density",
+            "source_signal",
+            "balanced_score",
+        )
+        if isinstance(value.get(key), (int, float))
+        and not isinstance(value.get(key), bool)
+    }
+
+
+def _fold_research_provenance(
+    events: list,
+    research_search_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a bounded resumption view of compound-research provenance.
+
+    Only known operational fields are copied. Transcript excerpts, errors,
+    routes, paths, and claim payloads deliberately remain in their respective
+    detailed stores rather than leaking into the compact session summary.
+    """
+    scout_runs: Dict[str, Dict[str, Any]] = {}
+    probe_runs: Dict[str, Dict[str, Any]] = {}
+    probe_queries: Dict[tuple, Dict[str, Any]] = {}
+    source_rows: Dict[tuple, Dict[str, Any]] = {}
+    manual_source_rows: Dict[str, Dict[str, Any]] = {}
+
+    for order, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        kind = str(event.get("kind") or "")
+        status = str(event.get("status") or "unknown")
+        run_id = str(data.get("run_id") or "legacy")
+        phase = str(data.get("phase") or "")
+
+        if kind == "research_checkpoint" and phase in {"scout", "scout_gate"}:
+            row = scout_runs.setdefault(run_id, {
+                "run_id": _compact_provenance_text(
+                    run_id, SESSION_PROVENANCE_LABEL_CHARS
+                ),
+                "query": "",
+                "days": None,
+                "max_results": None,
+                "order": None,
+                "channel_id": None,
+                "request_channel_id": None,
+                "candidates_found": 0,
+                "gate_before": None,
+                "gate_after": None,
+                "status": ResultStatus.STARTED.value,
+                "ts": event.get("ts"),
+                "_order": order,
+            })
+            row["ts"] = event.get("ts") or row.get("ts")
+            if phase == "scout":
+                if isinstance(data.get("query"), str):
+                    row["query"] = _compact_provenance_text(
+                        data["query"], SESSION_PROVENANCE_QUERY_CHARS
+                    )
+                if data.get("days") is not None:
+                    row["days"] = _optional_provenance_int(data.get("days"))
+                if data.get("max_results") is not None:
+                    row["max_results"] = _optional_provenance_int(
+                        data.get("max_results")
+                    )
+                if isinstance(data.get("order"), str):
+                    row["order"] = _compact_provenance_text(
+                        data["order"], SESSION_PROVENANCE_LABEL_CHARS
+                    )
+                if isinstance(data.get("channel_id"), str):
+                    row["channel_id"] = _compact_provenance_text(
+                        data["channel_id"], SESSION_PROVENANCE_QUERY_CHARS
+                    )
+                if isinstance(data.get("request_channel_id"), str):
+                    row["request_channel_id"] = _compact_provenance_text(
+                        data["request_channel_id"],
+                        SESSION_PROVENANCE_QUERY_CHARS,
+                    )
+                if data.get("results") is not None:
+                    row["candidates_found"] = (
+                        _optional_provenance_int(data.get("results")) or 0
+                    )
+                row["status"] = status
+            else:
+                row["gate_before"] = _optional_provenance_int(
+                    data.get("candidates_before")
+                )
+                row["gate_after"] = _optional_provenance_int(
+                    data.get("candidates_after")
+                )
+
+        if kind == "research_checkpoint" and phase == "probe":
+            row = probe_runs.setdefault(run_id, {
+                "run_id": _compact_provenance_text(
+                    run_id, SESSION_PROVENANCE_LABEL_CHARS
+                ),
+                "status": ResultStatus.STARTED.value,
+                "reason": None,
+                "eligible_seeds": None,
+                "terms": None,
+                "queries": None,
+                "planned": None,
+                "deferred": None,
+                "failures": None,
+                "saved": None,
+                "ts": event.get("ts"),
+                "_order": order,
+            })
+            row["status"] = status
+            row["ts"] = event.get("ts") or row.get("ts")
+            row["_order"] = order
+            if "reason" in data:
+                reason = data.get("reason")
+                row["reason"] = (
+                    _compact_provenance_text(
+                        reason, SESSION_PROVENANCE_LABEL_CHARS
+                    )
+                    if isinstance(reason, str) and reason
+                    else None
+                )
+            for source_field, visible_field in (
+                ("eligible_seeds", "eligible_seeds"),
+                ("terms", "terms"),
+                ("queries", "queries"),
+                ("queries_planned", "planned"),
+                ("queries_deferred", "deferred"),
+                ("saved", "saved"),
+            ):
+                if source_field in data:
+                    row[visible_field] = _optional_provenance_int(
+                        data.get(source_field)
+                    )
+            if "failures" in data:
+                row["failures"] = _optional_provenance_int(
+                    data.get("failures")
+                )
+            elif "query_failed" in data and "download_failed" in data:
+                query_failures = _optional_provenance_int(
+                    data.get("query_failed")
+                )
+                download_failures = _optional_provenance_int(
+                    data.get("download_failed")
+                )
+                row["failures"] = (
+                    query_failures + download_failures
+                    if query_failures is not None
+                    and download_failures is not None
+                    else None
+                )
+
+        query = data.get("query")
+        is_probe_event = kind == "research_probe" or (
+            kind == "research_checkpoint" and phase == "probe_search"
+        )
+        if is_probe_event and isinstance(query, str) and query:
+            probe_status = _probe_provenance_status(status, data)
+            probe_key = (run_id, query)
+            row = probe_queries.setdefault(probe_key, {
+                "run_id": _compact_provenance_text(
+                    run_id, SESSION_PROVENANCE_LABEL_CHARS
+                ),
+                "index": None,
+                "query": _compact_provenance_text(
+                    query, SESSION_PROVENANCE_QUERY_CHARS
+                ),
+                "constraints": {},
+                "co_windows": None,
+                "source_support": None,
+                "api_total": 0,
+                "returned": 0,
+                "scoped": 0,
+                "status": probe_status,
+                "ts": event.get("ts"),
+                "_order": order,
+            })
+            row["status"] = probe_status
+            row["ts"] = event.get("ts") or row.get("ts")
+            for field in (
+                "index",
+                "co_windows",
+                "source_support",
+                "api_total",
+                "returned",
+                "scoped",
+            ):
+                if data.get(field) is not None:
+                    row[field] = _optional_provenance_int(data.get(field))
+            constraints = _compact_provenance_constraints(
+                data.get("constraints")
+            )
+            if constraints:
+                row["constraints"] = constraints
+
+        if kind == "research_checkpoint" and phase in {
+            "download_item",
+            "probe_download",
+        }:
+            video_id = data.get("video_id")
+            if not isinstance(video_id, str) or not video_id:
+                continue
+            source_key = (run_id, video_id)
+            row = source_rows.setdefault(source_key, {
+                "run_id": _compact_provenance_text(
+                    run_id, SESSION_PROVENANCE_LABEL_CHARS
+                ),
+                "video_id": _compact_provenance_text(
+                    video_id, SESSION_PROVENANCE_LABEL_CHARS
+                ),
+                "title": "",
+                "channel": "",
+                "origin_stage": "probe" if phase == "probe_download" else "",
+                "probe_query": None,
+                "probe_index": None,
+                "selection_signals": {},
+                "saved_at": None,
+                "_saved": False,
+                "_run_key": run_id,
+                "_order": order,
+            })
+            for field in ("title", "channel"):
+                if isinstance(data.get(field), str):
+                    row[field] = _compact_provenance_text(
+                        data[field], SESSION_PROVENANCE_LABEL_CHARS
+                    )
+            if isinstance(data.get("stage"), str):
+                row["origin_stage"] = _compact_provenance_text(
+                    _canonical_research_stage(data["stage"]),
+                    SESSION_PROVENANCE_LABEL_CHARS,
+                )
+            probe_query = data.get("probe_query")
+            if probe_query is None and phase == "probe_download":
+                probe_query = data.get("query")
+            if isinstance(probe_query, str) and probe_query:
+                row["probe_query"] = _compact_provenance_text(
+                    probe_query, SESSION_PROVENANCE_QUERY_CHARS
+                )
+            probe_index = data.get("probe_index")
+            if probe_index is None and phase == "probe_download":
+                probe_index = data.get("index")
+            if probe_index is not None:
+                row["probe_index"] = _optional_provenance_int(probe_index)
+            signals = _compact_selection_signals(data.get("signals"))
+            if signals:
+                row["selection_signals"] = signals
+            detail_status = (
+                data.get("detail_status") or data.get("legacy_status")
+            )
+            if (
+                status == ResultStatus.COMPLETED.value
+                and detail_status == "saved"
+            ):
+                row["_saved"] = True
+                row["saved_at"] = event.get("ts")
+
+        if (
+            kind == "transcript_save"
+            and _STATUS_ALIASES.get(status, status)
+            == ResultStatus.COMPLETED.value
+        ):
+            video_id = data.get("video_id")
+            if isinstance(video_id, str) and video_id:
+                row = manual_source_rows.setdefault(video_id, {
+                    "run_id": None,
+                    "video_id": _compact_provenance_text(
+                        video_id, SESSION_PROVENANCE_LABEL_CHARS
+                    ),
+                    "title": "",
+                    "channel": "",
+                    "origin_stage": "manual",
+                    "selection_signals": {},
+                    "saved_at": event.get("ts"),
+                    "_saved": True,
+                    "_run_key": "",
+                    "_order": order,
+                })
+                for field in ("title", "channel"):
+                    if isinstance(data.get(field), str):
+                        row[field] = _compact_provenance_text(
+                            data[field], SESSION_PROVENANCE_LABEL_CHARS
+                        )
+                # One row per saved video. If legacy history contains more
+                # than one successful save, the latest event is the most
+                # useful bounded-resumption timestamp.
+                row["saved_at"] = event.get("ts") or row.get("saved_at")
+                row["_order"] = order
+
+        if kind == "research" and isinstance(data.get("sources"), list):
+            # Aggregate sources can backfill labels but cannot create rows:
+            # that list may include transcripts saved by earlier runs.
+            for source in data["sources"]:
+                if not isinstance(source, dict):
+                    continue
+                video_id = source.get("video_id")
+                if not isinstance(video_id, str):
+                    continue
+                row = source_rows.get((run_id, video_id))
+                if row is None:
+                    continue
+                for field in ("title", "channel"):
+                    if not row.get(field) and isinstance(source.get(field), str):
+                        row[field] = _compact_provenance_text(
+                            source[field], SESSION_PROVENANCE_LABEL_CHARS
+                        )
+
+    stage_queries = {
+        (
+            str(row.get("run_id") or "legacy"),
+            _canonical_research_stage(row.get("stage")),
+        ):
+        str(row.get("query") or "")
+        for row in research_search_rows
+    }
+    scout_rows = []
+    for row in sorted(scout_runs.values(), key=lambda item: int(item["_order"])):
+        visible = dict(row)
+        visible.pop("_order", None)
+        scout_rows.append(visible)
+    probe_rows = []
+    for row in sorted(probe_queries.values(), key=lambda item: int(item["_order"])):
+        visible = dict(row)
+        visible.pop("_order", None)
+        probe_rows.append(visible)
+
+    probe_run_rows = []
+    for row in sorted(probe_runs.values(), key=lambda item: int(item["_order"])):
+        visible = dict(row)
+        visible.pop("_order", None)
+        probe_run_rows.append(visible)
+
+    saved_rows = []
+    origins: Dict[str, int] = {}
+    linked_video_ids = {
+        video_id
+        for (_, video_id), row in source_rows.items()
+        if row.get("_saved")
+    }
+    provenance_sources = list(source_rows.values())
+    provenance_sources.extend(
+        row
+        for video_id, row in manual_source_rows.items()
+        if video_id not in linked_video_ids
+    )
+    for row in sorted(
+        provenance_sources, key=lambda item: int(item["_order"])
+    ):
+        if not row.get("_saved"):
+            continue
+        visible = dict(row)
+        visible.pop("_saved", None)
+        visible.pop("_order", None)
+        run_key = str(visible.pop("_run_key", "legacy"))
+        stage = str(visible.get("origin_stage") or "unknown")
+        origins[stage] = origins.get(stage, 0) + 1
+        if stage == "probe":
+            origin_query = visible.pop("probe_query", None)
+        elif stage == "scout":
+            origin_query = scout_runs.get(run_key, {}).get("query")
+            visible.pop("probe_query", None)
+            visible.pop("probe_index", None)
+        elif stage == "manual":
+            origin_query = None
+            visible.pop("probe_query", None)
+            visible.pop("probe_index", None)
+        else:
+            origin_query = stage_queries.get(
+                (run_key, stage)
+            )
+            visible.pop("probe_query", None)
+            visible.pop("probe_index", None)
+        visible["origin_query"] = (
+            _compact_provenance_text(
+                origin_query, SESSION_PROVENANCE_QUERY_CHARS
+            )
+            if origin_query
+            else None
+        )
+        visible["provenance_status"] = (
+            "recorded"
+            if origin_query
+            else "query_not_recorded"
+            if stage in {"probe", "manual"}
+            else "origin_not_recorded"
+        )
+        if not visible.get("selection_signals"):
+            visible.pop("selection_signals", None)
+        saved_rows.append(visible)
+
+    return {
+        "scout_runs": _bounded_provenance_rows(scout_rows),
+        "probe_runs": _bounded_provenance_rows(probe_run_rows),
+        "probe_queries": _bounded_provenance_rows(probe_rows),
+        "saved_sources": {
+            **_bounded_provenance_rows(saved_rows),
+            "origins": dict(sorted(origins.items())),
+        },
+        "limits": {
+            "rows_per_section": SESSION_PROVENANCE_ROW_LIMIT,
+            "query_chars": SESSION_PROVENANCE_QUERY_CHARS,
+            "label_chars": SESSION_PROVENANCE_LABEL_CHARS,
+        },
+        "counting_note": (
+            "rows are a bounded resumption view over research checkpoints; "
+            "query_not_recorded marks probe or manual saves whose originating "
+            "query was not persisted"
+        ),
+    }
+
 
 def _normalize_status(value: object) -> tuple[str, Optional[str]]:
     detail = str(value or ResultStatus.COMPLETED.value)
@@ -662,6 +1156,9 @@ def summarize_events(name: str, events: list) -> Dict[str, Any]:
             str(item.get("stage", "")),
         ),
     )
+    research_provenance = _fold_research_provenance(
+        events, staged_search_rows
+    )
 
     return {
         "name": name,
@@ -731,6 +1228,7 @@ def summarize_events(name: str, events: list) -> Dict[str, Any]:
                 "separately and are distinct from unique transcript-save events"
             ),
         },
+        "research_provenance": research_provenance,
         "analysis": {"historical_comparisons_logged": comparisons},
         "claims": {
             "mutation_events": claim_mutations,

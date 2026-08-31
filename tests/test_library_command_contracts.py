@@ -80,6 +80,32 @@ def test_library_context_stdout_is_read_only():
     assert compact is None
 
 
+def test_library_context_creates_missing_output_parents(tmp_path):
+    library = MagicMock()
+    library.get_context.return_value = "full context body"
+    output = tmp_path / "nested" / "research" / "context.txt"
+
+    result, outcome, compact = _invoke_with_contract(
+        library,
+        [
+            "library",
+            "context",
+            "science",
+            "--output",
+            str(output),
+        ],
+        "_render_library_context",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert output.read_text(encoding="utf-8") == "full context body"
+    assert outcome.status_value == "completed"
+    assert outcome.data["output"] == str(output)
+    assert outcome.data["summary"]["delivery"] == "saved"
+    assert compact["output"] == str(output)
+    assert compact["delivery"] == "saved"
+
+
 @pytest.mark.parametrize(
     ("arguments", "method", "return_value", "renderer", "command"),
     [
@@ -474,6 +500,52 @@ def test_library_context_write_failure_has_structured_error():
     assert outcome.errors[0].details == {"output": "artifact.txt"}
     assert compact["delivery"] == "failed"
     assert compact["output"] == "artifact.txt"
+    assert "context body" not in compact.values()
+
+
+def test_library_context_help_explains_nested_output_contract():
+    result = CliRunner().invoke(cli, ["library", "context", "--help"])
+
+    assert result.exit_code == 0, result.output
+    compact_output = " ".join(result.output.split())
+    assert "creates missing parent directories" in compact_output
+    assert "typed write-output failures" in compact_output
+
+
+def test_library_context_parent_creation_failure_uses_write_contract():
+    library = MagicMock()
+    library.get_context.return_value = "context body"
+    with (
+        patch.object(
+            Path,
+            "mkdir",
+            side_effect=OSError("parent unavailable"),
+        ),
+        patch("builtins.open") as output_file,
+    ):
+        result, outcome, compact = _invoke_with_contract(
+            library,
+            [
+                "library",
+                "context",
+                "science",
+                "--output",
+                "nested/artifact.txt",
+            ],
+            "_render_library_context",
+        )
+
+    assert result.exit_code == 1
+    output_file.assert_not_called()
+    assert outcome.status_value == "failed"
+    assert outcome.errors[0].type == "OSError"
+    assert outcome.errors[0].message == "parent unavailable"
+    assert outcome.errors[0].stage == "write-output"
+    assert outcome.errors[0].details == {
+        "output": "nested/artifact.txt"
+    }
+    assert compact["delivery"] == "failed"
+    assert compact["output"] == "nested/artifact.txt"
     assert "context body" not in compact.values()
 
 

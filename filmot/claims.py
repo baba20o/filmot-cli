@@ -505,6 +505,9 @@ class ClaimStore:
         directory = self._topic_dir(topic, create=True)
         destination = directory / "{:020d}-{}.json".format(sequence, event_id)
         temporary = directory / ".{}.{}.tmp".format(event_id, uuid.uuid4().hex)
+        cleanup_error = None
+        operation_error = None
+        operation_cause = None
         try:
             descriptor = os.open(
                 str(temporary),
@@ -521,14 +524,48 @@ class ClaimStore:
                     "Claim event collision at {}".format(destination)
                 )
         except Exception as error:
-            if temporary.exists():
-                try:
-                    temporary.unlink()
-                except OSError:
-                    pass
             if isinstance(error, ClaimStoreError):
-                raise
-            raise ClaimStoreError("Cannot persist claim event: {}".format(error)) from error
+                operation_error = error
+            else:
+                operation_error = ClaimStoreError(
+                    "Cannot persist claim event: {}".format(error)
+                )
+                operation_cause = error
+        finally:
+            # The exclusive publisher normally creates an atomic hard link,
+            # which intentionally leaves its complete source in place. The
+            # source name is only a publication temporary, so remove it after
+            # both successful publication and any failed attempt. If the
+            # no-hardlink fallback renamed it, there is nothing left to clean.
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                cleanup_error = error
+        if operation_error is not None:
+            if cleanup_error is not None:
+                raise ClaimStoreError(
+                    "{} Cleanup also failed for temporary file {}: {}. No "
+                    "destination publication was confirmed at {}. Remove only "
+                    "that temporary file after checking the destination.".format(
+                        operation_error,
+                        temporary,
+                        cleanup_error,
+                        destination,
+                    )
+                ) from operation_error
+            if operation_cause is not None:
+                raise operation_error from operation_cause
+            raise operation_error
+        if cleanup_error is not None:
+            raise ClaimStoreError(
+                "Claim event was published at {} but its temporary file {} "
+                "could not be removed: {}. Remove that temporary file after "
+                "checking that the published event is present.".format(
+                    destination, temporary, cleanup_error
+                )
+            ) from cleanup_error
         return event
 
     def list_claims(self, topic: str) -> List[ClaimData]:

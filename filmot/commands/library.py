@@ -2,6 +2,8 @@
 
 from contextlib import nullcontext
 import json as json_mod
+from pathlib import Path
+import shlex
 from typing import Optional
 
 import click
@@ -414,7 +416,9 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
 
     Use --format structured for markdown with full metadata headers.
     Printing context is read-only and does not log. Writing --output (including
-    the structured default output) records the materialized artifact event.
+    the structured default output) creates missing parent directories and
+    records the materialized artifact event. Parent-creation and file-write
+    errors remain typed write-output failures.
     """
     from ..library import get_library
     from ..ledger import log_result
@@ -477,6 +481,7 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
 
     if output:
         try:
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
             with open(output, "w", encoding="utf-8") as handle:
                 handle.write(context)
         except Exception as error:
@@ -1543,6 +1548,35 @@ def library_echoes(
 
 
 
+def _scout_reproduction_argv(row: dict) -> Optional[list]:
+    """Return the exact direct-search argv when its request was recorded."""
+    query = row.get("query")
+    order = row.get("order")
+    try:
+        days = int(row.get("days"))
+        max_results = int(row.get("max_results"))
+    except (TypeError, ValueError):
+        return None
+    if not query or not order or days < 1 or max_results < 1:
+        return None
+    argv = [
+        "filmot",
+        "yt-search",
+        str(query),
+        "--days",
+        str(days),
+        "--max-results",
+        str(max_results),
+        "--order",
+        str(order),
+    ]
+    request_channel_id = row.get("request_channel_id")
+    if request_channel_id:
+        argv.extend(["--channel-id", str(request_channel_id)])
+    argv.extend(["--show-description", "--raw"])
+    return argv
+
+
 def _render_sessions(
     outcome: CommandResult[SessionResultData],
 ) -> None:
@@ -1592,6 +1626,13 @@ def _render_sessions(
         research_searches = summary.get("research_searches") or {}
         transcripts = summary.get("transcripts") or {}
         research = summary.get("research") or {}
+        provenance = summary.get("research_provenance") or {}
+        saved_provenance = provenance.get("saved_sources") or {}
+        origin_counts = saved_provenance.get("origins") or {}
+        origin_summary = ", ".join(
+            "{} {}".format(stage, count)
+            for stage, count in sorted(origin_counts.items())
+        ) or "none recorded"
         claims = summary.get("claims") or {}
         console.print(
             Panel(
@@ -1605,6 +1646,7 @@ def _render_sessions(
                 "{research_failed} failed / {research_deduped} deduped\n"
                 "  Probes: {probe_saved} saved / {probe_failed} download failures / "
                 "{probe_query_failed} query failures\n"
+                "Saved-source origins: {source_origins}\n"
                 "Claim mutations: {claim_events} ({claim_ids} claim IDs)".format(
                     events=summary.get("event_count", 0),
                     searches=searches.get("events", 0),
@@ -1621,6 +1663,7 @@ def _render_sessions(
                     probe_saved=research.get("probe_saved_reported", 0),
                     probe_failed=research.get("probe_download_failed_reported", 0),
                     probe_query_failed=research.get("probe_query_failed_reported", 0),
+                    source_origins=origin_summary,
                     claim_events=claims.get("mutation_events", 0),
                     claim_ids=len(claims.get("unique_claim_ids") or []),
                 ),
@@ -1663,6 +1706,177 @@ def _render_sessions(
                     str(row.get("status", "")),
                 )
             console.print(table)
+        scout_rows = (provenance.get("scout_runs") or {}).get("rows") or []
+        if scout_rows:
+            table = Table(title="Scout provenance")
+            table.add_column("Run", style="dim", max_width=14)
+            table.add_column("Query", max_width=42)
+            table.add_column("Request", max_width=24)
+            table.add_column("Found", justify="right")
+            table.add_column("After gate", justify="right")
+            table.add_column("Status")
+            for row in scout_rows:
+                table.add_row(
+                    str(row.get("run_id", "")),
+                    str(row.get("query", "")),
+                    "{}d / {} / n={}".format(
+                        row.get("days")
+                        if row.get("days") is not None else "-",
+                        row.get("order") or "-",
+                        row.get("max_results")
+                        if row.get("max_results") is not None else "-",
+                    ),
+                    str(row.get("candidates_found", 0)),
+                    (
+                        str(row.get("gate_after"))
+                        if row.get("gate_after") is not None
+                        else "-"
+                    ),
+                    str(row.get("status", "")),
+                )
+            console.print(table)
+            for row in scout_rows:
+                argv = _scout_reproduction_argv(row)
+                if argv:
+                    # Click writes one physical line. Rich would insert hard
+                    # wraps, making the displayed reproduction command harder
+                    # to copy back into a shell.
+                    click.echo(
+                        "Inspect scout candidates: {}".format(shlex.join(argv))
+                    )
+            omitted = int(
+                (provenance.get("scout_runs") or {}).get("omitted", 0)
+            )
+            if omitted:
+                console.print(
+                    "[dim]{} older scout run(s) omitted.[/dim]".format(omitted)
+                )
+        probe_rows = (provenance.get("probe_queries") or {}).get("rows") or []
+        probe_run_rows = (
+            (provenance.get("probe_runs") or {}).get("rows") or []
+        )
+        if probe_run_rows:
+            table = Table(title="Probe run outcomes")
+            table.add_column("Run", style="dim", max_width=14)
+            table.add_column("Status")
+            table.add_column("Reason", max_width=28)
+            table.add_column("Seeds", justify="right")
+            table.add_column("Terms", justify="right")
+            table.add_column("Queries e/p/d", justify="right")
+            table.add_column("Failures", justify="right")
+            table.add_column("Saved", justify="right")
+
+            def probe_metric(row, field):
+                value = row.get(field)
+                return "-" if value is None else str(value)
+
+            for row in probe_run_rows:
+                table.add_row(
+                    str(row.get("run_id", "")),
+                    str(row.get("status", "")),
+                    str(row.get("reason") or "-"),
+                    probe_metric(row, "eligible_seeds"),
+                    probe_metric(row, "terms"),
+                    "{}/{}/{}".format(
+                        probe_metric(row, "queries"),
+                        probe_metric(row, "planned"),
+                        probe_metric(row, "deferred"),
+                    ),
+                    probe_metric(row, "failures"),
+                    probe_metric(row, "saved"),
+                )
+            console.print(table)
+            for row in probe_run_rows:
+                if row.get("reason"):
+                    # Keep the machine-readable terminal state copyable on
+                    # one physical line even when Rich narrows the table.
+                    click.echo(
+                        "Probe outcome: {} status={} reason={}".format(
+                            row.get("run_id", ""),
+                            row.get("status", ""),
+                            row["reason"],
+                        )
+                    )
+            omitted = int(
+                (provenance.get("probe_runs") or {}).get("omitted", 0)
+            )
+            if omitted:
+                console.print(
+                    "[dim]{} older probe run(s) omitted.[/dim]".format(
+                        omitted
+                    )
+                )
+        if probe_rows:
+            table = Table(title="Probe query provenance")
+            table.add_column("Probe", style="dim", max_width=18)
+            table.add_column("Query", max_width=48)
+            table.add_column("Basis", justify="right")
+            table.add_column("API", justify="right")
+            table.add_column("Scoped", justify="right")
+            table.add_column("Status")
+            for row in probe_rows:
+                probe_label = str(row.get("run_id", ""))
+                if row.get("index") is not None:
+                    probe_label += " #{}".format(row["index"])
+                basis = "{}/{}".format(
+                    row.get("co_windows")
+                    if row.get("co_windows") is not None else "-",
+                    row.get("source_support")
+                    if row.get("source_support") is not None else "-",
+                )
+                table.add_row(
+                    probe_label,
+                    str(row.get("query", "")),
+                    basis,
+                    str(row.get("api_total", 0)),
+                    str(row.get("scoped", 0)),
+                    str(row.get("status", "")),
+                )
+            console.print(table)
+            console.print("[dim]Probe basis is co-windows/source transcripts.[/dim]")
+            omitted = int(
+                (provenance.get("probe_queries") or {}).get("omitted", 0)
+            )
+            if omitted:
+                console.print(
+                    "[dim]{} older probe query/queries omitted.[/dim]".format(
+                        omitted
+                    )
+                )
+        source_rows = saved_provenance.get("rows") or []
+        if source_rows:
+            table = Table(title="Saved source provenance")
+            table.add_column("Video ID", style="cyan", max_width=16)
+            table.add_column("Title", max_width=42)
+            table.add_column("Origin", max_width=16)
+            table.add_column("Discovery query", max_width=48)
+            for row in source_rows:
+                origin = str(row.get("origin_stage") or "unknown")
+                if origin == "probe" and row.get("probe_index") is not None:
+                    origin += " #{}".format(row["probe_index"])
+                origin_query = row.get("origin_query")
+                if not origin_query:
+                    if row.get("provenance_status") == "query_not_recorded":
+                        origin_query = (
+                            "query not recorded (manual save)"
+                            if origin == "manual"
+                            else "query not recorded (legacy event)"
+                        )
+                    else:
+                        origin_query = "not recorded"
+                table.add_row(
+                    str(row.get("video_id", "")),
+                    str(row.get("title") or "Unknown"),
+                    origin,
+                    str(origin_query),
+                )
+            console.print(table)
+            omitted = int(saved_provenance.get("omitted", 0))
+            if omitted:
+                console.print(
+                    "[dim]{} older saved source(s) omitted; origin totals above "
+                    "still cover all rows.[/dim]".format(omitted)
+                )
         console.print(
             "[dim]Standalone and research-stage counts are separate event totals; "
             "saved and failed video counts are unique IDs.[/dim]"

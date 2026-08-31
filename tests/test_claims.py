@@ -16,6 +16,57 @@ from filmot.claims import (
     default_claim_id,
 )
 from filmot.cli import cli
+from filmot.commands.claims import _parse_citation_timestamp
+
+
+def test_claims_help_explains_cleanup_failure_state():
+    result = CliRunner().invoke(cli, ["claims", "--help"])
+
+    assert result.exit_code == 0, result.output
+    compact_output = " ".join(result.output.split())
+    assert "exact temporary path" in compact_output
+    assert "states whether the immutable event is already durable" in compact_output
+    assert "do not assume" in compact_output
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("90", 90.0),
+        ("90.5", 90.5),
+        ("1e2", 100.0),
+        ("-0", 0.0),
+        ("0:00", 0.0),
+        ("1:30", 90.0),
+        ("60:00", 3600.0),
+        ("1:01:30", 3690.0),
+    ],
+)
+def test_citation_timestamp_parser_accepts_seconds_and_display_forms(
+    value,
+    expected,
+):
+    assert _parse_citation_timestamp(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "nan",
+        "inf",
+        "-1",
+        "1:2",
+        "1:60",
+        "1::02",
+        "1:2:03",
+        "1:60:00",
+        "1:02:60",
+    ],
+)
+def test_citation_timestamp_parser_rejects_malformed_or_nonfinite_values(value):
+    with pytest.raises(ValueError, match="finite non-negative seconds"):
+        _parse_citation_timestamp(value)
 
 
 def test_unicode_claim_is_stable_and_exact_duplicate_is_idempotent(tmp_path):
@@ -509,6 +560,91 @@ def test_claim_persistence_failure_is_visible(tmp_path):
             store.add_claim("science", "This write must not disappear")
 
 
+def test_successful_claim_append_removes_publication_temporary(tmp_path):
+    data_dir = tmp_path / ".filmot_data"
+    store = ClaimStore(data_dir)
+
+    def publish_while_leaving_source(source, destination):
+        destination.write_bytes(source.read_bytes())
+        return True
+
+    with patch(
+        "filmot.claims.publish_file_exclusive",
+        side_effect=publish_while_leaving_source,
+    ):
+        store.add_claim("science", "A successfully published claim")
+
+    topic_dir = data_dir / "claims" / "science"
+    assert len(list(topic_dir.glob("*.json"))) == 1
+    assert not [path for path in topic_dir.iterdir() if path.suffix == ".tmp"]
+
+
+def test_failed_claim_publication_removes_temporary(tmp_path):
+    data_dir = tmp_path / ".filmot_data"
+    store = ClaimStore(data_dir)
+
+    with patch(
+        "filmot.claims.publish_file_exclusive",
+        side_effect=OSError("publish failed"),
+    ):
+        with pytest.raises(ClaimStoreError, match="publish failed"):
+            store.add_claim("science", "A claim that cannot be published")
+
+    topic_dir = data_dir / "claims" / "science"
+    assert not list(topic_dir.glob("*.json"))
+    assert not [path for path in topic_dir.iterdir() if path.suffix == ".tmp"]
+
+
+def test_successful_claim_append_reports_temporary_cleanup_failure(tmp_path):
+    data_dir = tmp_path / ".filmot_data"
+    store = ClaimStore(data_dir)
+
+    with patch(
+        "filmot.claims.Path.unlink",
+        side_effect=OSError("permission denied"),
+    ):
+        with pytest.raises(
+            ClaimStoreError,
+            match="event was published.*temporary file.*permission denied",
+        ):
+            store.add_claim("science", "A published claim with failed cleanup")
+
+    topic_dir = data_dir / "claims" / "science"
+    # Publication remains atomic and durable; only cleanup failed. The error
+    # identifies this append's exact temporary path for deliberate recovery.
+    assert len(list(topic_dir.glob("*.json"))) == 1
+    assert len([path for path in topic_dir.iterdir() if path.suffix == ".tmp"]) == 1
+
+
+def test_failed_claim_publication_reports_temporary_cleanup_failure(tmp_path):
+    data_dir = tmp_path / ".filmot_data"
+    store = ClaimStore(data_dir)
+
+    with patch(
+        "filmot.claims.publish_file_exclusive",
+        side_effect=OSError("publish exploded"),
+    ):
+        with patch(
+            "filmot.claims.Path.unlink",
+            side_effect=OSError("cleanup denied"),
+        ):
+            with pytest.raises(ClaimStoreError) as captured:
+                store.add_claim("science", "An unpublished claim with failed cleanup")
+
+    topic_dir = data_dir / "claims" / "science"
+    temporary_paths = [
+        path for path in topic_dir.iterdir() if path.suffix == ".tmp"
+    ]
+    message = str(captured.value)
+    assert "Cannot persist claim event: publish exploded" in message
+    assert "Cleanup also failed" in message
+    assert "cleanup denied" in message
+    assert "No destination publication was confirmed" in message
+    assert len(temporary_paths) == 1
+    assert str(temporary_paths[0]) in message
+    assert not list(topic_dir.glob("*.json"))
+
+
 def test_claim_read_rejects_non_finite_tampered_evidence(tmp_path, monkeypatch):
     data_dir = tmp_path / ".filmot_data"
     store = ClaimStore(data_dir)
@@ -569,7 +705,7 @@ def test_claim_cli_raw_round_trip_and_compact_session_log(tmp_path, monkeypatch)
             "--video",
             "abcdefghijk",
             "--at",
-            "90",
+            "1:30",
             "--relation",
             "supports",
             "--excerpt",
@@ -590,6 +726,71 @@ def test_claim_cli_raw_round_trip_and_compact_session_log(tmp_path, monkeypatch)
     assert claim_id in ledger_text
     assert "Ripasudil was proposed for AMD" not in ledger_text
     assert "A short exact excerpt" not in ledger_text
+
+
+@pytest.mark.parametrize("value", ["not-a-time", "nan", "inf", "1:60"])
+def test_claim_cli_rejects_invalid_timestamp_as_one_raw_error(
+    tmp_path,
+    monkeypatch,
+    value,
+):
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "claims",
+            "cite",
+            "science",
+            "c-missing",
+            "--video",
+            "abcdefghijk",
+            "--at",
+            value,
+            "--relation",
+            "supports",
+            "--raw",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["status"] == "failed"
+    assert payload["_filmot"]["errors"][0] == {
+        "type": "InvalidOptionValue",
+        "message": (
+            "Invalid --at value: must be finite non-negative seconds "
+            "or M:SS/H:MM:SS"
+        ),
+        "stage": "validate-evidence",
+    }
+    assert not (tmp_path / ".filmot_data").exists()
+
+
+def test_claim_cli_rejects_invalid_timestamp_as_human_usage_error(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "claims",
+            "cite",
+            "science",
+            "c-missing",
+            "--video",
+            "abcdefghijk",
+            "--at",
+            "1:60",
+            "--relation",
+            "supports",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid value for --at" in result.output
+    assert "M:SS/H:MM:SS" in result.output
+    assert not (tmp_path / ".filmot_data").exists()
 
 
 def test_claim_show_on_empty_workspace_is_read_only(tmp_path, monkeypatch):

@@ -212,16 +212,45 @@ filmot research "your topic" --depth 10 --dedupe --scout-days 14
 
 This gives you:
 
-- **Scout results**: What's happening RIGHT NOW (last 7-14 days)
-- **Filmot candidates**: Historical depth from title+transcript, exact-phrase,
-  and `NEAR/N` stages before loose matching
+- **Scout candidates**: Recently uploaded material from the requested 7-14 day
+  window
+- **Filmot candidates**: An accumulated, unique pool from title+transcript,
+  exact-phrase, and `NEAR/N` relationship stages before any loose matching
 - **Downloaded transcripts**: Raw material for analysis
 
 Treat the automatic corpus as candidate material, not verified evidence.
 Balanced ranking keeps passage relevance, lexical density, echo risk, and an
 audience/engagement source prior visible as separate signals. The source prior
-is not a credibility score. A loose fallback above the configured threshold is
-blocked unless `--accept-broad` is explicit, and accepted candidates still
+is not a credibility score. Freshness-scout admission is also only a lexical
+safety gate: one bounded ordered topic span in the title, or two non-overlapping
+and non-duplicate spans in the description/hit evidence, can admit a candidate
+for ranking. It does not establish semantic relevance, credibility, or truth.
+The preview labels those counters `scout-lexical-spans` only on scout rows.
+
+There is no reserved scout download slot. After admission, Filmot and scout
+candidates share the displayed global ranking, and the top `--depth` rows are
+selected. A weaker scout therefore cannot displace a stronger Filmot candidate
+merely to diversify source type. `--depth` is a maximum download target: the
+relationship ladder accumulates unique candidates until that target is reached
+or every stage is exhausted, and a duplicate keeps the strongest (earliest)
+stage provenance that admitted it. `--depth 0` keeps the Filmot ladder at the
+title+transcript preview, skips its expansion, and downloads no selected
+candidates. An enabled scout may still join that preview, and an explicit
+probe may use existing eligible library seeds.
+
+This is not limited to depth zero. At any depth, a legitimately empty current
+discovery records an empty selection, while an explicitly requested probe
+continues from eligible transcripts already present in the topic library and
+emits terminal probe accounting. Fatal broad-scope safety gates remain fatal
+and fail closed before probe work.
+
+If the exhausted relationship ladder has a nonempty pool below the target,
+Filmot keeps it and does not enter loose transcript-wide fallback. The
+underfill checkpoint reports the target, qualified and remaining counts, and
+points to a targeted exact/`NEAR/N` search; increasing `--depth` alone will not
+widen that pool. Loose fallback is considered only when the relationship pool
+is empty and depth is nonzero. A loose fallback above the configured threshold
+is blocked unless `--accept-broad` is explicit, and accepted candidates still
 pass a passage-level relevance gate. Widen client-side ranking deliberately
 with `--candidate-pages` and `--candidate-pool`; inspect the preview, effective
 query, candidate scope, and source mix before citing or synthesizing anything.
@@ -229,6 +258,17 @@ query, candidate scope, and source mix before citing or synthesizing anything.
 Use `--channel` when you want a named source. The name is resolved to displayed
 channel IDs and the command fails closed when resolution is empty or Filmot
 returns candidates outside the selected IDs.
+
+Research scouting records its effective days, `order=relevance`, maximum result
+count, and actual YouTube request-channel filter. Resume with
+`filmot sessions "your topic" --summary`: when those fields were recorded, the
+summary prints a copyable `filmot yt-search ... --show-description --raw`
+command for inspecting the same scout request. It does not invent missing
+parameters for legacy events. Raw YouTube discovery returns the effective
+request and exact candidate rows. With `--transcript`, human and raw modes both
+attach a typed `transcript_search` result to each video; individual caption or
+search failures make the aggregate result `partial` instead of silently
+skipping the requested work.
 
 Before treating the downloaded videos as independent sources, run
 `filmot library echoes "your topic" --raw` and inspect the strongest pairs.
@@ -257,7 +297,21 @@ For search activity, routing precedence is explicit `--session`, then
 `FILMOT_SESSION`, then a bulk-download TOPIC, then the current date.
 `filmot sessions "your topic" --summary` keeps manual search events and the
 fallback stages inside `research` in separate scope tables, so repeated
-candidates across stages are not presented as one corpus count.
+candidates across stages are not presented as one corpus count. The same
+summary links bounded scout/probe provenance and saved sources to their
+discovery stage/query. A completed transcript save that has no staged research
+or probe selection is included as stage `manual`, with
+`query_not_recorded`; the summary does not invent an originating query. When a
+source has both records, the research/probe selection takes precedence over
+the manual fallback. New successful `transcript --save-to` events record
+best-effort title and channel for display; legacy manual events without that
+metadata remain honestly `Unknown`, and neither case permits query inference.
+Probe rows preserve operational states such as
+`broad_sampled`, `deferred`, and `failed_closed` rather than presenting them as
+completed calls. The legacy selected-source stage `title_transcript` is joined
+to the canonical `title+transcript` search stage; a legacy
+`query not recorded` marker remains an explicit unknown, not permission to
+reconstruct or infer the missing relationship.
 
 **If you have a channel corpus downloaded**, you can run the same proximity operators offline:
 
@@ -293,6 +347,28 @@ Use the durable claim register to keep exact source text, analyst notes, and
 judgments separate:
 
 ```bash
+# Narrow a saved passage locally; output includes a literal timestamped URL
+filmot transcript VIDEO_ID --grep '"claim phrase" NEAR/20 "mechanism"'
+
+# The same evaluation as versioned JSON, including citation-ready match rows
+filmot transcript VIDEO_ID --grep '"claim phrase" NEAR/20 "mechanism"' --raw
+```
+
+`transcript --grep` filters saved copies by requested language and validated,
+monotonic segment/text alignment, collapses equivalent copies, and reuses the
+single remaining content variant before configuring external routes. Multiple
+distinct usable variants or incompatible timing retain the normal fetch path
+and explain the fallback on stderr. Human matches include a literal timestamped
+URL; raw matches contain `seconds`, `timestamp`, `deep_link`, and `excerpt`, and
+a valid query with no hits is a typed empty result.
+
+Every supplied grep value is parsed before library lookup, proxy setup, or
+network retrieval. Blank or malformed proximity expressions therefore fail as
+`InvalidGrepQuery` at `parse-query` without turning into a full-transcript
+download. Human and raw rendering consume the same typed evaluator, and a
+unique local result routes its compact activity event to the saved source topic.
+
+```bash
 # Declare one atomic, falsifiable statement
 filmot claims add "your topic" "One exact claim statement"
 
@@ -316,7 +392,9 @@ Relations are `supports`, `contradicts`, `qualifies`, `context`, `origin`, and
 match lexically; the analyst must choose and record the relationship. Claim
 events are strict and append-only, while their session mutation logs contain
 only compact IDs and classifications. A timestamp/`--video` locator belongs
-only to source kind `video`; `--source` and `--video` are mutually exclusive,
+only to source kind `video`; `--at` accepts finite non-negative seconds or a
+displayed `M:SS`/`H:MM:SS` timestamp and stores canonical seconds. `--source`
+and `--video` are mutually exclusive,
 and `--video` requires an exact 11-character YouTube ID matching
 `[A-Za-z0-9_-]{11}`, not a URL; malformed values fail before persistence. Cite
 a paper or patent as a separate evidence item. Derived claim IDs use
@@ -331,7 +409,15 @@ chain, and complete events are validated before they become visible. New
 events use `filmot.claim/v2` with contiguous per-topic sequences. Valid
 sequence-less `filmot.claim/v1` histories remain readable and can be continued
 with v2 events, but the legacy files are ordered only in memory and never
-rewritten.
+rewritten. A successful new publication normally removes its private
+same-directory temporary after the immutable event is visible. If that unlink
+fails, the failure names both the durable destination and exact retained
+temporary; it does not imply rollback. If publication and cleanup both fail,
+both errors are surfaced, the exact retained temporary is named, and the
+destination is explicitly not confirmed. Claim operations never scan for or
+delete historical or unrelated temporaries. Exact mutation retries are
+content-idempotent, but recovery should inspect the reported
+durable/not-confirmed outcome rather than guess.
 
 ### Phase 4: Probe for Connections (optional, 5 minutes)
 
@@ -341,15 +427,43 @@ If you have enough transcript material, use `--probe` to discover connections yo
 filmot research "your topic" --depth 12 --dedupe --probe
 ```
 
-The probe preserves source and sentence boundaries, prefers terms supported by
-multiple transcripts, clusters likely ASR variants, and reports both
-`co-windows:N` (overlapping 50-word windows, 25-word stride) and distinct
-supporting-source counts. A relationship must occur in at least two transcripts
-before it consumes a probe query. It logs the exact query, effective title/channel
-scope, raw API count, returned candidates, post-scope count, and errors before
-downloading a small set of related discoveries. A probe keeps the title
-constraint only when the initial title stage proved usable; otherwise the
-reported scope uses a passage-level topic relevance filter.
+Only manually saved sources and transcripts selected by the staged Filmot
+workflow seed an automatic probe. Scout and earlier probe discoveries are
+quarantined from the seed frontier so one loose result cannot recursively steer
+later queries. The probe preserves source and sentence boundaries, clusters
+likely ASR variants, and ranks lexical pairs with a language-neutral,
+source-normalized salience score. It reports both `co-windows:N` (overlapping
+50-word windows, 25-word stride) and distinct supporting-source counts. A
+relationship must occur in at least two eligible transcripts before it consumes
+a probe query. These are lexical discovery signals, not semantic or evidentiary
+judgments.
+
+Probe planning also has explicit terminal outcomes. With enough eligible
+seeds but no sufficiently specific multiword terms, it records
+`no_candidate_terms`; with terms but no pair meeting cross-source support and
+co-window requirements, it records `no_cross_source_pairs`. Both outcomes run
+zero queries rather than appearing to hang or silently finish. Named session
+summaries retain a bounded table of probe-run outcomes (including skipped,
+empty, partial, and completed runs), with older rows counted as omitted.
+
+Each attempted probe logs the exact query, effective title/channel/language
+scope, raw API count, returned sample, post-scope count, and errors before
+downloading at most three related discoveries. API calls stop once that
+capacity is full. If a query exceeds the broad threshold and its returned
+sample contains no lexically coherent new candidate, Filmot records the query
+as `broad_sampled`,
+reports sample coverage without claiming a global zero, marks the lower-ranked
+tail `deferred`, and stops automatic probing. Its copyable manual command keeps
+the same language, usable title constraint, and channel-ID scope. A probe keeps
+the title constraint only when the initial title stage proved usable; otherwise
+the automatic result reports its passage-level topic relevance post-filter and
+the manual command reproduces the API request scope for explicit screening.
+
+For a reusable synthesis packet, `filmot library context TOPIC --format
+structured --output PATH` creates missing parent directories for nested output
+paths. Parent creation and the file write share the typed context-write failure
+boundary, so automation receives a command failure instead of an uncaught
+filesystem exception.
 
 ---
 
@@ -475,7 +589,7 @@ These are patterns we discovered the hard way.
 - **Update (2026-06-10):** PDM remains *unreplicated but undisputed* — still one Nature paper (FeTe₀.₅₅Se₀.₄₅, 40% gap modulation), no published independent confirmation 16 months on. Twistronics coverage went quiet (zero transcript hits Feb–Jun 2026). No new LK-99-style hype wave emerged; the slop ecosystem migrated to quantum-computing chips instead (same announcement-vs-evidence pattern, see Majorana 2). Lesson reinforced: **quiet science is underrepresented on YouTube exactly as press-release claims are overrepresented** — a stale field note can mean "nothing happened," not "you missed it." Check primary literature before assuming either.
 
 ### Key Takeaway
-The tool's real power isn't finding information — any search engine does that. **The power is combining scout freshness + Filmot depth + NEAR/N precision + multilingual reach + probe discovery to triangulate truth.** No single query gives you the answer. The methodology does.
+The tool's real power isn't finding information — any search engine does that. **The power is combining scout freshness + Filmot depth + NEAR/N precision + multilingual reach + probe discovery to triangulate evidence and test claims.** No single query gives you the answer. The methodology does.
 
 ---
 

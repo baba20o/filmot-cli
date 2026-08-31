@@ -395,6 +395,243 @@ def test_yt_search_logs_and_renders_the_same_outcome():
     assert "videos" not in compact
 
 
+def test_yt_search_raw_emits_the_logged_candidate_set_and_effective_request():
+    videos = [{
+        "video_id": "video-id",
+        "title": "Recent result",
+        "channel_title": "Channel",
+        "published_at": "2026-07-25T00:00:00Z",
+        "views": 5,
+        "duration": "PT1M",
+    }]
+    with (
+        patch("filmot.youtube_search.validate_youtube_api"),
+        patch(
+            "filmot.youtube_search.search_recent",
+            return_value=videos,
+        ) as search_recent,
+        patch("filmot.ledger.log_result") as log_result,
+        patch(
+            "filmot.commands.search._render_yt_search_result"
+        ) as renderer,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "yt-search",
+                "alpha beta",
+                "--days",
+                "3",
+                "--max-results",
+                "10",
+                "--order",
+                "relevance",
+                "--region",
+                "US",
+                "--raw",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["videos"] == videos
+    assert payload["query"] == "alpha beta"
+    assert payload["days"] == 3
+    assert payload["max_results"] == 10
+    assert payload["order"] == "relevance"
+    assert payload["filters"]["region"] == "US"
+    assert payload["filters"]["max_results"] == 10
+    assert payload["_filmot"]["command"] == "yt-search"
+    assert payload["_filmot"]["status"] == "completed"
+    assert search_recent.call_args.kwargs["days_back"] == 3
+    assert search_recent.call_args.kwargs["max_results"] == 10
+    assert search_recent.call_args.kwargs["order"] == "relevance"
+    logged = log_result.call_args.args[1]
+    assert logged.to_raw_dict() == payload
+    assert log_result.call_args.kwargs["data"]["raw"] is True
+    renderer.assert_not_called()
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_yt_search_transcript_search_is_shared_by_human_and_raw(raw):
+    videos = [{
+        "video_id": "video-id",
+        "title": "Recent result",
+        "channel_title": "Channel",
+        "published_at": "2026-07-25T00:00:00Z",
+        "views": 1,
+        "duration": "PT1M",
+    }]
+    transcript_result = {
+        "video_id": "video-id",
+        "query": "needle",
+        "match_count": 1,
+        "matches": [{
+            "timestamp": "0:05",
+            "start_seconds": 5.0,
+            "matched_text": "needle",
+            "context": "the needle passage",
+            "segment_index": 2,
+        }],
+        "language": "en",
+        "is_generated": False,
+    }
+    arguments = [
+        "yt-search",
+        "alpha",
+        "--transcript",
+        "--transcript-query",
+        "needle",
+    ]
+    if raw:
+        arguments.append("--raw")
+    with (
+        patch("filmot.youtube_search.validate_youtube_api"),
+        patch("filmot.youtube_search.search_recent", return_value=videos),
+        patch(
+            "filmot.transcript.search_in_transcript",
+            return_value=transcript_result,
+        ) as search_transcript,
+        patch("filmot.ledger.log_result") as log_result,
+        patch(
+            "filmot.commands.search._render_yt_search_result"
+        ) as renderer,
+    ):
+        result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    search_transcript.assert_called_once_with("video-id", "needle")
+    outcome = log_result.call_args.args[1]
+    transcript_search = outcome.data["videos"][0]["transcript_search"]
+    assert transcript_search["status"] == "completed"
+    assert transcript_search["match_count"] == 1
+    assert transcript_search["matches"] == transcript_result["matches"]
+    if raw:
+        payload = json.loads(result.stdout)
+        assert outcome.to_raw_dict() == payload
+        assert payload["videos"][0]["transcript_search"] == transcript_search
+        renderer.assert_not_called()
+    else:
+        assert renderer.call_args.args[0] is outcome
+
+
+def test_yt_search_raw_transcript_failure_is_typed_partial():
+    videos = [{"video_id": "video-id", "title": "Recent result"}]
+    with (
+        patch("filmot.youtube_search.validate_youtube_api"),
+        patch("filmot.youtube_search.search_recent", return_value=videos),
+        patch(
+            "filmot.transcript.search_in_transcript",
+            return_value={
+                "video_id": "video-id",
+                "error_type": "CaptionsUnavailable",
+                "error": "no captions",
+            },
+        ),
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["yt-search", "alpha", "--transcript", "--raw"],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["status"] == "partial"
+    assert payload["_filmot"]["errors"] == [{
+        "type": "CaptionsUnavailable",
+        "message": "no captions",
+        "stage": "transcript-search",
+        "details": {"video_id": "video-id"},
+    }]
+    transcript_search = payload["videos"][0]["transcript_search"]
+    assert transcript_search["status"] == "failed"
+    assert transcript_search["match_count"] == 0
+    assert log_result.call_args.args[1].to_raw_dict() == payload
+
+
+def test_yt_search_raw_empty_is_a_successful_typed_result():
+    with (
+        patch("filmot.youtube_search.validate_youtube_api"),
+        patch("filmot.youtube_search.search_recent", return_value=[]),
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["yt-search", "alpha", "--raw"],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["videos"] == []
+    assert payload["days"] == 7
+    assert payload["max_results"] == 25
+    assert payload["order"] == "date"
+    assert payload["_filmot"]["status"] == "empty"
+    assert log_result.call_args.args[1].to_raw_dict() == payload
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "failure", "error_type"),
+    [
+        ("configuration", ValueError("missing key"), "ValueError"),
+        ("request", RuntimeError("quota exhausted"), "RuntimeError"),
+    ],
+)
+def test_yt_search_raw_failure_is_one_typed_json_result(
+    failure_stage,
+    failure,
+    error_type,
+):
+    with (
+        patch("filmot.youtube_search.validate_youtube_api") as validate,
+        patch("filmot.youtube_search.search_recent") as search_recent,
+        patch("filmot.ledger.log_event") as log_event,
+    ):
+        if failure_stage == "configuration":
+            validate.side_effect = failure
+        else:
+            search_recent.side_effect = failure
+        result = CliRunner().invoke(
+            cli,
+            ["yt-search", "alpha", "--raw"],
+        )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["command"] == "yt-search"
+    assert payload["_filmot"]["status"] == "failed"
+    assert payload["_filmot"]["errors"][0]["type"] == error_type
+    assert payload["_filmot"]["errors"][0]["stage"] == failure_stage
+    assert log_event.call_count == 1
+    assert log_event.call_args.kwargs["failure_stage"] == failure_stage
+    assert log_event.call_args.kwargs["raw"] is True
+
+
+def test_yt_search_raw_serialization_failure_is_the_logged_outcome():
+    videos = [{
+        "video_id": "video-id",
+        "title": "Recent result",
+        "score": float("nan"),
+    }]
+    with (
+        patch("filmot.youtube_search.validate_youtube_api"),
+        patch("filmot.youtube_search.search_recent", return_value=videos),
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["yt-search", "alpha", "--raw"],
+        )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["status"] == "failed"
+    assert payload["_filmot"]["errors"][0]["type"] == "InvalidJSONValue"
+    assert payload["_filmot"]["errors"][0]["stage"] == "serialize-result"
+    assert log_result.call_args.args[1].to_raw_dict() == payload
+
+
 @pytest.mark.parametrize(
     ("command", "method"),
     [

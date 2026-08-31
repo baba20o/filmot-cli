@@ -32,6 +32,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Raw JSON for `library list`, `library search`, and `library compare`, including
   citation-ready local excerpt details and timestamped deep links when saved
   caption segments are available.
+- `yt-search --raw` for the effective discovery request and exact candidate
+  metadata. With `--transcript`, each video carries a typed transcript-search
+  outcome and item failures make the aggregate result partial.
 - `library echoes TOPIC` for deterministic, advisory full-transcript word
   n-gram Jaccard analysis. `--persist` writes and verifies a canonical,
   content-addressed artifact in `.filmot_data/analysis/TOPIC/`; method metadata
@@ -60,9 +63,50 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Topic slug v1 remains compatible with existing NFKC/case-folded paths and is
   now explicitly scoped to Python's bundled Unicode database; shared projects
   should pin their Python minor version before reusing one data directory.
+- Freshness scouting now exposes a field-aware lexical admission gate and uses
+  the displayed global candidate rank without a reserved scout quota. Lexical
+  admission is explicitly not a semantic relevance, credibility, or truth
+  judgment, and scout-only span diagnostics no longer appear on Filmot rows.
+- Automatic probes seed only from manual/staged-selected transcripts, rank
+  relationships with source-normalized salience, and stop after three
+  discoveries or a broad returned sample with no lexically coherent candidate.
+  Broad sampled-zero output reports coverage, defers the lower-ranked tail,
+  avoids a global-zero claim, and preserves language/title/channel scope in its
+  exact manual follow-up command.
+- Research relationship stages now accumulate one unique candidate pool until
+  the maximum depth target is reached or the ladder is exhausted. Duplicates
+  keep their strongest stage provenance; a nonempty underfilled pool skips
+  loose fallback and reports targeted exact/near-search recovery. Depth zero
+  keeps the Filmot ladder at the title+transcript preview and downloads no
+  selected candidates; an enabled scout may still join that preview, and an
+  explicit probe may use existing eligible library seeds.
+- At any depth, a legitimately empty current discovery records an empty
+  selection while an explicit probe continues from eligible preexisting topic
+  library seeds and emits terminal accounting. Fatal broad-scope gates remain
+  fail-closed and do not continue into probing.
+- Probe planning records explicit zero-query terminal outcomes when eligible
+  seeds yield no candidate terms or no supported cross-source pair. Session
+  summaries expose bounded probe-run outcomes and count omitted older runs.
 
 ### Fixed
 
+- `claims cite --at` accepts the timestamps Filmot displays (`M:SS` and
+  `H:MM:SS`) as well as numeric seconds, eliminating manual time conversion
+  while preserving canonical evidence identity and typed raw failures.
+- `transcript --grep` filters and validates saved copies before ambiguity,
+  collapses equivalent records, reuses a single compatible local content
+  variant before external routing, and returns the same citation-ready match
+  evaluation in human and raw modes. Distinct or incompatible variants fall
+  back with an explanation.
+- Blank and malformed `transcript --grep` expressions now fail through typed
+  `InvalidGrepQuery` results before library lookup, proxy setup, or retrieval;
+  an empty raw grep can no longer become an unintended full-transcript result.
+- Raw `yt-search --transcript` no longer bypasses transcript evaluation. Its
+  per-video status, match count, matches, and bounded failure details are shared
+  with human mode instead of being hidden inside the human renderer.
+- The Click regression-test runner no longer passes the constructor option
+  removed in Click 8.5, so a fresh supported development install reaches the
+  product regressions.
 - Legacy transcript-library records are normalized to the current in-memory
   shape without an eager rewrite; absent caption segments remain an explicit
   empty list rather than receiving invented timestamps.
@@ -75,6 +119,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   invents a locator.
 - Session summaries include item-level bulk and research download failures and
   saves while keeping selected-download and probe outcomes separately visible.
+- Session summaries now provide bounded scout/probe provenance and link saved
+  sources to their discovery stage/query; missing links in older probe events
+  are explicitly reported instead of inferred. Scout rows retain the exact
+  request parameters and render a copyable raw inspection command when known.
+- Session summaries preserve `broad_sampled`, `deferred`, and `failed_closed`
+  probe states instead of normalizing them to completed work, and canonicalize
+  legacy `title_transcript` source metadata to the recorded
+  `title+transcript` search stage.
+- Session provenance includes completed manual transcript saves as `manual` /
+  `query_not_recorded` without inferring a query. Recorded research or probe
+  selection provenance takes precedence when the same source has both. New
+  successful manual-save events carry best-effort title/channel metadata;
+  legacy manual events without it remain `Unknown` rather than inferred.
+- Nested `library context --output` paths now create missing parent directories
+  inside the typed write boundary, including typed failures when parent
+  creation is impossible.
 - Search interruption before outcome persistence leaves one resumable event;
   session replay/summary reports malformed ledger records as partial or failed.
 - Echo analysis fails closed on unreadable/incomplete corpus records, keeps the
@@ -84,6 +144,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - No-hardlink publication uses crash-releasing OS locks and atomically renames
   a complete same-directory temporary, so concurrent writers never expose a
   partial destination or strand a stale existence-based lock.
+- Successful claim publication normally removes its private same-directory
+  temporary. Cleanup failure after durable publication reports the durable
+  destination and exact retained temporary without implying rollback.
+  Publication plus cleanup failure reports both errors, names the exact retained
+  temporary, and says the destination was not confirmed. Claim operations do
+  not scan/delete historical or unrelated temporaries. Exact mutation retries
+  are content-idempotent; recovery follows the reported durable/not-confirmed
+  outcome rather than guessing.
 - Echo human output is capped at the 25 strongest matching pairs; raw output
   and artifacts remain complete.
 - Non-finite echo thresholds and evidence timestamps are rejected before JSON

@@ -27,7 +27,8 @@ from ..schemas import CommandResult, ErrorDetail, ResultStatus
 from .search import (
     _backfill_metadata,
     _bulk_download_transcripts,
-    _grep_transcript,
+    _evaluate_transcript_grep,
+    _render_transcript_grep,
 )
 
 
@@ -141,6 +142,185 @@ def _validate_transcript_response(
                     )
                 )
     return result
+
+
+def _validated_saved_grep_candidate(
+    video_id: str,
+    record: object,
+) -> Optional[dict]:
+    """Adapt one saved record only when its grep offsets are trustworthy."""
+    if not isinstance(record, dict) or record.get("video_id") != video_id:
+        return None
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    language = metadata.get("language")
+    if not isinstance(language, str) or not language:
+        return None
+
+    full_text = record.get("transcript")
+    segments = record.get("segments")
+    if (
+        not isinstance(full_text, str)
+        or not full_text.strip()
+        or not isinstance(segments, list)
+        or not segments
+    ):
+        return None
+    if not all(isinstance(segment, dict) for segment in segments):
+        return None
+    if not all(isinstance(segment.get("text"), str) for segment in segments):
+        return None
+    previous_start = -1.0
+    for segment in segments:
+        start = segment.get("start")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(float(start))
+            or float(start) < previous_start
+        ):
+            return None
+        previous_start = float(start)
+    joined_text = " ".join(
+        segment["text"].replace("\n", " ") for segment in segments
+    )
+    if joined_text != full_text:
+        return None
+
+    source = metadata.get("source")
+    if not isinstance(source, str) or not source:
+        source_record = record.get("source")
+        source = (
+            source_record.get("transcript_source")
+            if isinstance(source_record, dict)
+            else None
+        )
+    if not isinstance(source, str) or not source:
+        source = "youtube"
+
+    result = {
+        "video_id": video_id,
+        "language": language,
+        "is_generated": metadata.get("is_generated"),
+        "segments": segments,
+        "full_text": full_text,
+        "duration_seconds": metadata.get("duration_seconds"),
+        "segment_count": len(segments),
+        "source": source,
+        "route": "library",
+        "routes_tried": ["library"],
+    }
+    try:
+        validated = _validate_transcript_response(
+            result,
+            expected_video_id=video_id,
+        )
+    except (TypeError, ValueError):
+        return None
+    return validated
+
+
+def _saved_transcript_for_grep(
+    video_id: str,
+    preferred_language: Optional[str],
+) -> tuple[Optional[dict], list[str], Optional[str]]:
+    """Select one distinct safe local transcript or explain route fallback.
+
+    Language and segment integrity are checked before ambiguity. Byte/segment-
+    equivalent copies then collapse into one candidate so saving the same
+    transcript to multiple topics does not force an external refetch.
+    """
+    from ..library import get_library
+
+    records = []
+    try:
+        library = get_library()
+        for topic_row in library.list_topics():
+            topic = topic_row.get("topic") if isinstance(topic_row, dict) else None
+            if not isinstance(topic, str) or not topic:
+                continue
+            record = library.get(video_id, topic)
+            if record is not None:
+                records.append((topic, record))
+    except (
+        json_mod.JSONDecodeError,
+        OSError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        return (
+            None,
+            [],
+            "Local transcript cache could not be validated; fetching externally.",
+        )
+
+    if not records:
+        return None, [], None
+
+    language_matches = []
+    for topic, record in records:
+        metadata = record.get("metadata") if isinstance(record, dict) else None
+        language = metadata.get("language") if isinstance(metadata, dict) else None
+        if (
+            not preferred_language
+            or (
+                isinstance(language, str)
+                and language.casefold() == preferred_language.casefold()
+            )
+        ):
+            language_matches.append((topic, record))
+    if not language_matches:
+        return (
+            None,
+            [],
+            "Local transcript cache has no valid {!r} transcript; "
+            "fetching externally.".format(preferred_language),
+        )
+
+    distinct = {}
+    for topic, record in language_matches:
+        candidate = _validated_saved_grep_candidate(video_id, record)
+        if candidate is None:
+            continue
+        signature = (
+            candidate["language"].casefold(),
+            candidate["full_text"].encode("utf-8"),
+            json_mod.dumps(
+                candidate["segments"],
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        group = distinct.setdefault(signature, {"result": candidate, "topics": []})
+        group["topics"].append(topic)
+
+    if not distinct:
+        return (
+            None,
+            [],
+            "Local transcript cache lacks trustworthy timestamp segments; "
+            "fetching externally.",
+        )
+    if len(distinct) > 1:
+        return (
+            None,
+            [],
+            "Local transcript cache has multiple distinct usable transcripts; "
+            "fetching externally.",
+        )
+
+    group = next(iter(distinct.values()))
+    topics = sorted(set(group["topics"]))
+    result = group["result"]
+    result["library_copy_count"] = len(topics)
+    if len(topics) == 1:
+        result["library_topic"] = topics[0]
+    return result, topics, None
+
 
 def _transcript_failure_detail(result: dict, *, verbose: bool) -> str:
     """Render a redacted transcript failure with optional route diagnostics."""
@@ -612,13 +792,13 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
     if proxy and no_proxy:
         raise click.UsageError("--proxy and --no-proxy are mutually exclusive")
-    if raw and grep:
-        raise click.UsageError("--raw and --grep cannot be combined")
     if raw and output:
         raise click.UsageError("--raw and --output cannot be combined")
     if chunk is not None and fallback:
         raise click.UsageError("--chunk and --fallback cannot be combined")
-    if grep and any((save_to, output, full, timestamps, chunk is not None, fallback)):
+    if grep is not None and any(
+        (save_to, output, full, timestamps, chunk is not None, fallback)
+    ):
         raise click.UsageError(
             "--grep cannot be combined with --save-to, --output, --full, "
             "--timestamps, --chunk, or --fallback"
@@ -632,80 +812,151 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             stage="validate-options",
         )
 
-    # Handle proxy configuration (status messages go to stderr to avoid polluting --raw)
-    if no_proxy:
-        disable_proxy()
-    elif proxy:
-        try:
-            configure_proxy(http_proxy=proxy, exclusive=True)
-        except Exception as e:
-            _command_error(f"Proxy error: {e}", raw=raw)
+    expected_video_id = extract_video_id(video_id)
+    if grep is not None:
+        # Query validity is independent of transcript contents. Reject it
+        # before library lookup, route configuration, or any network request so
+        # a typo cannot incur retrieval work or silently become a full download.
+        preflight = _evaluate_transcript_grep(
+            {
+                "video_id": expected_video_id,
+                "language": lang,
+                "full_text": "",
+                "segments": [],
+            },
+            grep,
+        )
+        if not preflight.ok:
+            from ..ledger import log_result
 
-    try:
-        route_plan = routing_plan()
-    except Exception as error:
-        _command_error(f"Could not prepare transcript routes: {error}", raw=raw)
-    if not raw:
+            if raw:
+                preflight = _prepare_raw_result(preflight)
+            log_result(
+                "transcript",
+                preflight,
+                topic=None,
+                data={
+                    "video_id": expected_video_id,
+                    "grep": grep,
+                    "raw": raw,
+                    "failure_stage": "parse-query",
+                },
+            )
+            if raw:
+                _emit_raw_result(preflight, indent=2)
+                return
+            _render_transcript_grep(preflight)
+            raise click.exceptions.Exit(2)
+
+    saved_grep, _library_topics, cache_fallback_reason = (
+        _saved_transcript_for_grep(expected_video_id, lang)
+        if grep is not None
+        else (None, [], None)
+    )
+    if saved_grep is not None:
+        result = saved_grep
+        library_topic = result.get("library_topic")
+        library_label = (
+            f"library/{library_topic}" if library_topic else "library"
+        )
+        route_plan = {
+            "mode": "library",
+            "routes": [{
+                "kind": "library",
+                "label": library_label,
+                "source": "library",
+                "max_attempts": 1,
+            }],
+            "pool_configured": False,
+            "pool_source": None,
+            "primary": "library",
+            "primary_is_proxy": False,
+            "has_direct_route": False,
+            "connect_timeout_s": 0.0,
+            "read_timeout_s": 0.0,
+            "route_timeout_s": 0.0,
+        }
         click.echo(
-            f"Transcript routes ({route_plan['mode']}): "
-            f"{describe_routing_plan(route_plan)}; "
-            f"connect/read {route_plan['connect_timeout_s']:g}/"
-            f"{route_plan['read_timeout_s']:g}s; "
-            f"route deadline {route_plan['route_timeout_s']:g}s",
+            f"Transcript source: {library_label} (no external fetch)",
             err=True,
         )
-    route_progress = None if raw else _route_progress_for(video_id)
+    else:
+        if cache_fallback_reason:
+            click.echo(cache_fallback_reason, err=True)
+        # Configure transport only after the opportunistic local grep lookup.
+        if no_proxy:
+            disable_proxy()
+        elif proxy:
+            try:
+                configure_proxy(http_proxy=proxy, exclusive=True)
+            except Exception as e:
+                _command_error(f"Proxy error: {e}", raw=raw)
 
-    # Progress callback for AWS fallback
-    def aws_progress(stage: str, msg: str):
+        try:
+            route_plan = routing_plan()
+        except Exception as error:
+            _command_error(f"Could not prepare transcript routes: {error}", raw=raw)
         if not raw:
-            click.echo(f"AWS:{stage} {msg}", err=True)
+            click.echo(
+                f"Transcript routes ({route_plan['mode']}): "
+                f"{describe_routing_plan(route_plan)}; "
+                f"connect/read {route_plan['connect_timeout_s']:g}/"
+                f"{route_plan['read_timeout_s']:g}s; "
+                f"route deadline {route_plan['route_timeout_s']:g}s",
+                err=True,
+            )
+        route_progress = None if raw else _route_progress_for(video_id)
 
-    try:
-        with _search_status("[bold green]Fetching transcript...", raw=raw):
-            languages = [lang] if lang else None
+        # Progress callback for AWS fallback
+        def aws_progress(stage: str, msg: str):
+            if not raw:
+                click.echo(f"AWS:{stage} {msg}", err=True)
 
-            if chunk:
-                # Chunked mode doesn't support fallback (needs timestamps)
-                result = get_transcript_with_timestamps(
-                    video_id,
-                    languages,
-                    chunk_minutes=chunk,
-                    progress_callback=route_progress,
-                )
-            elif fallback:
-                # Use fallback-enabled fetch
-                result = get_transcript_with_fallback(
-                    video_id,
-                    languages,
-                    use_aws_fallback=True,
-                    aws_progress_callback=aws_progress,
-                    progress_callback=route_progress,
-                )
-            else:
-                result = get_transcript(
-                    video_id,
-                    languages,
-                    progress_callback=route_progress,
-                )
-    except Exception as error:
-        from ..ledger import log_event
-        detail = f"{type(error).__name__}: {error}"
-        log_event(
-            "transcript",
-            topic=save_to,
-            video_id=video_id,
-            grep=grep,
-            save_to=save_to,
-            status="failed",
-            error=detail,
-        )
-        _command_error(detail, raw=raw)
+        try:
+            with _search_status("[bold green]Fetching transcript...", raw=raw):
+                languages = [lang] if lang else None
+
+                if chunk:
+                    # Chunked mode doesn't support fallback (needs timestamps)
+                    result = get_transcript_with_timestamps(
+                        video_id,
+                        languages,
+                        chunk_minutes=chunk,
+                        progress_callback=route_progress,
+                    )
+                elif fallback:
+                    # Use fallback-enabled fetch
+                    result = get_transcript_with_fallback(
+                        video_id,
+                        languages,
+                        use_aws_fallback=True,
+                        aws_progress_callback=aws_progress,
+                        progress_callback=route_progress,
+                    )
+                else:
+                    result = get_transcript(
+                        video_id,
+                        languages,
+                        progress_callback=route_progress,
+                    )
+        except Exception as error:
+            from ..ledger import log_event
+            detail = f"{type(error).__name__}: {error}"
+            log_event(
+                "transcript",
+                topic=save_to,
+                video_id=video_id,
+                grep=grep,
+                save_to=save_to,
+                status="failed",
+                error=detail,
+            )
+            _command_error(detail, raw=raw)
 
     try:
         result = _validate_transcript_response(
             result,
-            expected_video_id=extract_video_id(video_id),
+            expected_video_id=expected_video_id,
             expected_chunks=chunk is not None,
         )
     except (TypeError, ValueError) as error:
@@ -783,9 +1034,6 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
     # Show source if using fallback
     source = result.get('source', 'youtube')
-    outcome = CommandResult.completed("transcript", result)
-    if raw:
-        outcome = _prepare_raw_result(outcome)
     transcript_data = result
     deferred_diagnostics = []
     if source == 'aws_transcribe':
@@ -819,26 +1067,53 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             "routing_plan": route_plan,
         }
 
-    def log_final(final_outcome: CommandResult) -> None:
+    def log_final(
+        final_outcome: CommandResult,
+        *,
+        topic: Optional[str] = save_to,
+        data: Optional[dict] = None,
+    ) -> None:
         log_result(
             "transcript",
             final_outcome,
-            topic=save_to,
-            data=ledger_data,
+            topic=topic,
+            data=ledger_data if data is None else data,
         )
 
+    if grep is not None:
+        grep_outcome = _evaluate_transcript_grep(transcript_data, grep)
+        if raw:
+            grep_outcome = _prepare_raw_result(grep_outcome)
+        grep_data = dict(ledger_data)
+        grep_data.update({
+            "query": grep,
+            "match_count": int(grep_outcome.data.get("match_count") or 0),
+        })
+        for key in ("library_topic", "library_copy_count"):
+            if transcript_data.get(key) is not None:
+                grep_data[key] = transcript_data[key]
+        activity_topic = (
+            transcript_data.get("library_topic")
+            if transcript_data.get("route") == "library"
+            else None
+        )
+        log_final(grep_outcome, topic=activity_topic, data=grep_data)
+        if raw:
+            _emit_raw_result(grep_outcome, indent=2)
+            return
+        for message in deferred_diagnostics:
+            _diagnostic(message, raw=raw)
+        _render_transcript_grep(grep_outcome)
+        if not grep_outcome.ok:
+            raise click.exceptions.Exit(2)
+        return
+
+    outcome = CommandResult.completed("transcript", result)
+    if raw:
+        outcome = _prepare_raw_result(outcome)
     if raw and not outcome.ok:
         log_final(outcome)
         _emit_raw_result(outcome, indent=2)
-        return
-
-    # Grep mode: search within the transcript and print timestamped matches, then stop
-    if grep:
-        log_final(outcome)
-        for message in deferred_diagnostics:
-            _diagnostic(message, raw=raw)
-        if not _grep_transcript(transcript_data, grep):
-            raise click.exceptions.Exit(2)
         return
 
     # Save to library if --save-to specified
@@ -914,6 +1189,8 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                     "transcript_save",
                     topic=save_to,
                     video_id=transcript_data["video_id"],
+                    title=video_title,
+                    channel=video_channel,
                     status="saved",
                     path=str(saved_path),
                     chars=len(transcript_data.get("full_text", "")),
