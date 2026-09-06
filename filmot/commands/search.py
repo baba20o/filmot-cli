@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
+from ..session_context import current_session, session_option
 from ..api import FilmotClient
 from ..api_contract import FilmotAPIContractError, validate_api_response
 from ..cli_support import (
@@ -297,16 +298,7 @@ def _resolve_search_session(
               help="Maximum hit details to display per video")
 @click.option("--context", "context_chars", default=50, type=click.IntRange(0), help="Characters of context per side in snippets (raise for fuller quotes)")
 @click.option("--bulk-download", default=None, help="Download top N transcripts to TOPIC (e.g., --bulk-download prompt-injection:10)")
-@click.option(
-    "--session",
-    default=None,
-    envvar="FILMOT_SESSION",
-    show_envvar=True,
-    help=(
-        "Route this search event to a named session; overrides FILMOT_SESSION "
-        "and the inferred --bulk-download topic"
-    ),
-)
+@session_option
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback during bulk download when captions unavailable")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts during bulk download")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy during bulk download, connect directly")
@@ -318,7 +310,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
            max_query_time: int, hit_format: str, full: bool, raw: bool, min_matches: int,
            limit: int, max_hits: int, context_chars: int, bulk_download: str,
-           session: str, fallback: bool, dedupe: bool, no_proxy: bool):
+           fallback: bool, dedupe: bool, no_proxy: bool):
     """Search for videos by subtitle/transcript content.
 
     Unquoted words use loose transcript-wide implicit AND: each word may occur
@@ -343,7 +335,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
     """
     from ..ledger import log_event
 
-    resolved_session = _resolve_search_session(session, bulk_download)
+    resolved_session = _resolve_search_session(current_session(), bulk_download)
     search_event_logged = False
 
     if raw and bulk_download:

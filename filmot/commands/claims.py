@@ -19,6 +19,7 @@ from ..claims import (
     get_claim_store,
     validate_youtube_video_id,
 )
+from ..session_context import session_option
 from ..cli_support import (
     command_error as _command_error,
     console,
@@ -205,6 +206,7 @@ def _render_claims(outcome: CommandResult[ClaimResultData]) -> None:
 
 
 @click.group()
+@session_option
 def claims():
     """Track claims, citations, contradictions, and human assessments.
 
@@ -218,6 +220,7 @@ def claims():
 
 
 @claims.command("add")
+@session_option
 @click.argument("topic")
 @click.argument("text")
 @click.option("--id", "claim_id", default=None, help="Optional stable claim ID")
@@ -245,6 +248,7 @@ def claims_add(topic: str, text: str, claim_id: Optional[str], raw: bool):
 
 
 @claims.command("cite")
+@session_option
 @click.argument("topic")
 @click.argument("claim_id")
 @click.option(
@@ -408,6 +412,7 @@ def claims_cite(
 
 
 @claims.command("assess")
+@session_option
 @click.argument("topic")
 @click.argument("claim_id")
 @click.option("--verdict", required=True, type=click.Choice(CLAIM_VERDICTS))

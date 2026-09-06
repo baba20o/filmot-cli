@@ -209,6 +209,7 @@ class ResearchResultData(TypedDict, total=False):
     """Final staged-research accounting used by ledger and renderer."""
 
     run_id: str
+    session: str
     topic: str
     query: str
     phase: str

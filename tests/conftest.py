@@ -31,6 +31,7 @@ def _isolated_proxy_state(monkeypatch, tmp_path):
         str(tmp_path / "user-state" / "rate_limit.db"),
     )
     monkeypatch.delenv("WEBSHARE_SESSION_FILE", raising=False)
+    monkeypatch.delenv("FILMOT_SESSION", raising=False)
     proxy_pool.reset_pool()
     transcript_module._initialized = False
     yield

@@ -12,6 +12,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from ..api import FilmotClient
+from ..session_context import session_option
 from ..cli_support import (
     command_error as _command_error,
     console,
@@ -708,6 +709,7 @@ def _render_download(outcome: CommandResult[dict]) -> None:
 
 
 @click.command("transcript")
+@session_option
 @click.argument("video_id", nargs=1)
 @click.option("--lang", "-l", default=None, help="Preferred language code (e.g., en, es, de)")
 @click.option("--timestamps", "-t", is_flag=True, help="Include timestamps for each segment")
@@ -1366,6 +1368,7 @@ def transcript_search(video_id: str, query: str, context: int, lang: str):
 # ========== YOUTUBE API SEARCH ==========
 
 @click.command("channel-download")
+@session_option
 @click.argument("channel_id")
 @click.option("--delay", "-d", default=1.0, type=click.FloatRange(min=0), help="Seconds between downloads (rate limiting, default: 1.0)")
 @click.option("--lang", "-l", default="en", help="Preferred language code (default: en)")
@@ -1737,12 +1740,15 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         else:
             # Parallel mode with ThreadPoolExecutor
             from concurrent.futures import ThreadPoolExecutor, as_completed
+            from contextvars import copy_context
 
             try:
                 with ThreadPoolExecutor(max_workers=workers) as executor:
                     futures = {}
                     for v in to_download:
-                        fut = executor.submit(_download_one, v)
+                        # Each worker needs its own context snapshot so its
+                        # item events retain this invocation's investigation.
+                        fut = executor.submit(copy_context().run, _download_one, v)
                         futures[fut] = v
 
                     for fut in as_completed(futures):
@@ -2043,6 +2049,7 @@ def channel_search(channel_slug: str, query: str, limit: int):
 # ========== SESSIONS (LEDGER) ==========
 
 @click.command("download")
+@session_option
 @click.option("--topic", "-t", required=True, help="Library topic to save transcripts under")
 @click.option("--count", "-n", default=50, type=click.IntRange(1), help="Maximum transcripts to download (default: 50)")
 @click.option("--lang", "-l", default=None, help="Preferred transcript language code")

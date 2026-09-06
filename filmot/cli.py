@@ -13,10 +13,12 @@ from .cli_support import (
     silence_broken_pipe_streams as _silence_broken_pipe_streams,
 )
 from .schemas import CommandResult, ErrorDetail, ResultStatus
+from .session_context import session_option
 
 
 @click.group()
 @click.version_option(version=__version__, prog_name="filmot")
+@session_option
 def cli():
     """Filmot CLI - Search YouTube transcripts and metadata."""
     pass

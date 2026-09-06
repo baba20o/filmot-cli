@@ -9,6 +9,7 @@ from typing import Optional
 import click
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from ..cli_support import (
     command_error as _command_error,
@@ -1673,20 +1674,53 @@ def _render_sessions(
         scope_rows = searches.get("scope_rows") or []
         if scope_rows:
             table = Table(title="Standalone search universes")
+            table.add_column("#", justify="right")
             table.add_column("Query")
             table.add_column("API total", justify="right")
             table.add_column("Fetched", justify="right")
             table.add_column("Post-filter", justify="right")
             table.add_column("Status")
-            for row in scope_rows:
+            for index, row in enumerate(scope_rows, 1):
                 table.add_row(
-                    str(row.get("query", "")),
+                    str(index),
+                    Text(str(row.get("query", ""))),
                     str(row.get("api_total", 0)),
                     str(row.get("candidates_fetched", 0)),
                     str(row.get("post_filter_count", 0)),
                     str(row.get("status", "")),
                 )
             console.print(table)
+            for index, row in enumerate(scope_rows, 1):
+                filters = row.get("effective_filters")
+                details = []
+                effective_query = row.get("effective_query")
+                if effective_query is not None and effective_query != row.get("query"):
+                    details.append("effective_query={}".format(
+                        json_mod.dumps(effective_query, ensure_ascii=False)
+                    ))
+                if isinstance(filters, dict):
+                    details.extend(
+                        "{}={}".format(
+                            key, json_mod.dumps(value, ensure_ascii=False)
+                        )
+                        for key, value in filters.items()
+                        if value is not None and value != "" and value != []
+                    )
+                    if not details:
+                        details.append("Recorded filters are unset")
+                else:
+                    details.append("Filters not recorded")
+                console.print(Text("{}. Scope: {}".format(index, "; ".join(details))))
+                truncated = row.get("effective_filters_truncated") or []
+                if row.get("effective_query_truncated"):
+                    truncated = [*truncated, "effective_query"]
+                if truncated:
+                    console.print(Text(
+                        "   Truncated fields: {}. Replay the session for full values.".format(
+                            ", ".join(truncated)
+                        ),
+                        style="dim",
+                    ))
         research_scope_rows = research_searches.get("scope_rows") or []
         if research_scope_rows:
             table = Table(title="Research search universes (kept by stage)")

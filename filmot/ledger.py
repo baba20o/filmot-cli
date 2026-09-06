@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Union
 
 from .library import _legacy_normalize_topic, normalize_topic_name
 from .paths import project_data_dir
+from .session_context import current_session
 from .schemas import (
     CommandResult,
     ErrorDetail,
@@ -120,6 +121,10 @@ def _event_matches_topic(event: dict, topic_slug: str) -> bool:
     data = event.get("data")
     if not isinstance(data, dict):
         data = event
+    # New events explicitly distinguish investigation identity from corpus
+    # topic. Never migrate them based on a coincidentally matching query/topic.
+    if isinstance(data.get("session"), str):
+        return _normalize(data["session"]) == topic_slug
     for field in ("topic", "research_topic", "query"):
         value = event.get(field)
         if value is None:
@@ -250,6 +255,15 @@ _CANONICAL_STATUSES = {item.value for item in ResultStatus}
 SESSION_PROVENANCE_ROW_LIMIT = 25
 SESSION_PROVENANCE_QUERY_CHARS = 180
 SESSION_PROVENANCE_LABEL_CHARS = 120
+SESSION_SEARCH_FILTER_CHARS = 180
+SESSION_SEARCH_CHANNEL_LIMIT = 5
+_SEARCH_SCOPE_FILTERS = (
+    "title", "channel_id", "channel", "resolved_channels", "lang",
+    "start_date", "end_date", "min_views", "max_views", "min_likes",
+    "max_likes", "min_duration", "max_duration", "manual_subs",
+    "category", "exclude_category", "country", "license", "min_matches",
+    "sort", "order", "page", "pages", "candidate_pool", "channel_count",
+)
 _PROBE_PROVENANCE_DETAIL_STATUSES = {
     "broad_sampled",
     "deferred",
@@ -293,6 +307,74 @@ def _bounded_provenance_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "omitted": total - len(visible),
         "rows": visible,
     }
+
+
+def _compact_search_scope(data: Mapping[str, Any]) -> Dict[str, Any]:
+    """Project recorded search scope without guessing absent legacy defaults.
+
+    Flat ledger fields and typed result filters are both supported. Only known
+    scope fields are copied; text and resolved-channel lists are bounded, with
+    field names identifying any truncation so this is never an exact replay
+    contract.
+    """
+    nested = data.get("effective_filters")
+    source = dict(data)
+    if isinstance(nested, dict):
+        source.update(nested)
+    filters: Dict[str, Any] = {}
+    truncated = []
+
+    def compact_text(value: str, field: str) -> str:
+        if len(" ".join(value.split())) > SESSION_SEARCH_FILTER_CHARS:
+            if field not in truncated:
+                truncated.append(field)
+        return _compact_provenance_text(value, SESSION_SEARCH_FILTER_CHARS)
+
+    for field in _SEARCH_SCOPE_FILTERS:
+        if field not in source:
+            continue
+        value = source[field]
+        if field == "resolved_channels" and isinstance(value, list):
+            channels = []
+            for channel in value[:SESSION_SEARCH_CHANNEL_LIMIT]:
+                if not isinstance(channel, dict):
+                    continue
+                item = {
+                    key: compact_text(channel[key], field)
+                    for key in ("id", "name")
+                    if isinstance(channel.get(key), str)
+                }
+                if item:
+                    channels.append(item)
+            filters[field] = channels
+            if len(value) > SESSION_SEARCH_CHANNEL_LIMIT and field not in truncated:
+                truncated.append(field)
+        elif value is None or isinstance(value, bool):
+            filters[field] = value
+        elif isinstance(value, str):
+            filters[field] = compact_text(value, field)
+        elif isinstance(value, int):
+            # Real search limits are small integers; bound malformed legacy
+            # values too, without converting a truncated number into a number.
+            if value.bit_length() <= 64:
+                filters[field] = value
+            else:
+                filters[field] = "[oversized integer omitted]"
+                truncated.append(field)
+
+    scope: Dict[str, Any] = {}
+    if filters:
+        scope["effective_filters"] = filters
+    if truncated:
+        scope["effective_filters_truncated"] = truncated
+    effective_query = data.get("effective_query")
+    if isinstance(effective_query, str):
+        scope["effective_query"] = _compact_provenance_text(
+            effective_query, SESSION_PROVENANCE_QUERY_CHARS
+        )
+        if len(" ".join(effective_query.split())) > SESSION_PROVENANCE_QUERY_CHARS:
+            scope["effective_query_truncated"] = True
+    return scope
 
 
 def _optional_provenance_int(value: object) -> Optional[int]:
@@ -753,11 +835,18 @@ def _append_record(
 ) -> None:
     sessions = _sessions_dir(data_dir)
     sessions.mkdir(parents=True, exist_ok=True)
-    name = record.topic or datetime.now().strftime("%Y-%m-%d")
+    selected = current_session()
+    name = (
+        _normalize(selected) if selected
+        else record.topic or datetime.now().strftime("%Y-%m-%d")
+    )
+    payload = record.to_dict()
+    if selected:
+        payload["data"]["session"] = name
     with open(sessions / "{}.jsonl".format(name), "a", encoding="utf-8") as f:
         f.write(
             json.dumps(
-                record.to_dict(),
+                payload,
                 ensure_ascii=False,
                 allow_nan=False,
             )
@@ -779,8 +868,9 @@ def log_result(
     """
     try:
         topic_slug = _normalize(topic) if topic else None
-        if topic:
-            migrate_legacy_session(topic, data_dir)
+        migration_name = current_session() or topic
+        if migration_name:
+            migrate_legacy_session(migration_name, data_dir)
         _append_record(
             result.to_event(
                 kind,
@@ -803,7 +893,9 @@ def log_event(
 
     Args:
         kind: Event type ("search", "research", "channel-search", "transcript", ...).
-        topic: If given, log to <topic>.jsonl; otherwise to today's date file.
+        topic: Default ledger/topic identity. An invocation's explicit session
+            overrides the ledger destination, preserving this topic metadata.
+            Without either, use today's date file.
         fields: Arbitrary JSON-serializable event data (query, results, saved, ...).
     """
     try:
@@ -831,13 +923,14 @@ def log_event(
                 )
             )
 
-        if topic:
-            migration_name = topic
-            for field in ("research_topic", "query"):
-                value = fields.get(field)
-                if isinstance(value, str) and _normalize(value) == topic_slug:
-                    migration_name = value
-                    break
+        migration_name = current_session() or topic
+        if migration_name:
+            if not current_session():
+                for field in ("research_topic", "query"):
+                    value = fields.get(field)
+                    if isinstance(value, str) and _normalize(value) == topic_slug:
+                        migration_name = value
+                        break
             migrate_legacy_session(migration_name, data_dir)
 
         record = EventRecord(
@@ -1005,6 +1098,7 @@ def summarize_events(name: str, events: list) -> Dict[str, Any]:
                 "candidates_fetched": fetched,
                 "post_filter_count": filtered,
                 "partial": bool(data.get("partial")),
+                **_compact_search_scope(data),
             })
 
         if kind == "research_checkpoint":

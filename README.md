@@ -129,11 +129,14 @@ per-user file can be redirected with `FILMOT_CONFIG_FILE`. Filmot does not
 search parent directories for `.env`, so editable and packaged installs behave
 the same way.
 
-For `filmot search`, the session used for activity logging is selected in this
-order: explicit `--session`, `FILMOT_SESSION`, the TOPIC from
-`--bulk-download TOPIC[:N]`, then the current date. A session changes where the
-activity event is recorded; it does not alter the search query or library
-destination.
+Activity logging accepts a shared investigation identity through
+`filmot --session NAME COMMAND ...` or `FILMOT_SESSION`. Research, search,
+transcript, download, channel-download, and claim mutations also accept a local
+`--session` flag. The nearest explicit flag wins over a parent flag, then the
+environment default. Without either, existing topic/date routing applies
+(including a search's `--bulk-download TOPIC[:N]` destination). The investigation
+groups activity events without altering queries, library destinations, or claim
+topics. Nested saves and parallel channel-download items inherit the selection.
 
 Proxy credential inventories are stored in the per-user configuration
 directory with owner-only permissions where the platform supports them.
@@ -757,6 +760,17 @@ text or excerpts. `claims show` is read-only and does not log.
 ### Research Sessions
 
 ```bash
+# Keep a compound run, follow-up searches, saves, and claims in one history.
+export FILMOT_SESSION=agent-continuity
+filmot research "long horizon agents" --depth 5 --raw > research.json
+filmot search '"memory" NEAR/25 "dreaming"' --title agent --raw
+filmot transcript VIDEO_ID --save-to agent-memory
+filmot claims add agent-memory "A claim to investigate" --id claim-1
+filmot sessions agent-continuity --summary
+
+# Override just one command, keeping its corpus topic unchanged.
+filmot research "agent memory" --session another-investigation --depth 2
+
 # Replay events or derive a non-conflating summary
 filmot sessions robin-ai-scientist
 filmot sessions robin-ai-scientist --summary
@@ -765,7 +779,18 @@ filmot sessions robin-ai-scientist --summary --raw
 
 The summary keeps standalone search universes, each staged research-search
 universe, selected-download outcomes, probe outcomes, unique saved transcripts,
-failed attempts, and claim mutations distinct. It also shows bounded scout and
+failed attempts, and claim mutations distinct. Each standalone search includes
+its recorded title, channel, language, date, subtitle, and numeric restrictions,
+so identical query text with different filters stays distinguishable. Missing
+legacy filters are explicitly unknown. Long filter values and channel lists
+are bounded with truncation notices; full replay retains the original values.
+Explicitly routed events include `data.session`, while topic metadata keeps its
+existing meaning. Selecting a session does not combine prior topic histories.
+The existing Unicode-name migration can still move safely attributable legacy
+records into their canonical session file. Use a distinctive investigation name
+to avoid sharing a ledger with an older topic or a legacy fallback such as
+`session` or `uncategorized`.
+The summary also shows bounded scout and
 probe provenance plus each saved source's discovery stage/query, so compound
 runs can be resumed without replaying the raw ledger. Missing links in older
 probe events are labeled `query not recorded` rather than inferred. Successful
@@ -1253,7 +1278,7 @@ filmot sessions your-topic --summary
 - **`filmot library echoes`** — Reproducible full-transcript similarity analysis for advisory lineage review
 - **`filmot claims`** — Append-only claims, classified evidence, and explicit human assessments
 - **`filmot sessions NAME --summary`** — Derived investigation totals without conflating candidate, source, and failure universes
-- **`filmot search --session NAME`** — Route manual follow-up searches into the intended investigation
+- **`filmot --session NAME COMMAND`** — Keep compound research and follow-up activity in one investigation
 - **`--sort density`** — Sort fetched candidates by matches-per-minute to find focused text coverage; this is not a credibility score
 - **`--min-matches N`** — Filter out videos with only passing mentions
 - **`--dedupe`** — Skip matching first-500-character transcript fingerprints during bulk download
@@ -1286,6 +1311,9 @@ filmot search "data science" --raw > results.json
 
 # Use with jq for filtering
 filmot search "tutorial" --raw | jq '.result[0].hits'
+
+# Run the compound workflow with one final JSON result.
+filmot research "agent memory" --depth 5 --raw > research.json
 ```
 
 Raw mode suppresses interactive progress and keeps any remaining diagnostics
@@ -1324,6 +1352,15 @@ while `filmot sessions NAME --summary --raw` uses `summary`. Every replayed
 session entry is itself a `filmot.event/v1` record with the same
 command/status/data/errors/warnings vocabulary. Raw mode does not change a
 command's persistence or logging behavior.
+
+`research --raw` returns the run ID, topic, selected/downloaded/skipped/failed
+counts, probe counts, source inventory, and routing plan, plus `_filmot` status
+and errors. Progress and nested diagnostics go to stderr. Clean no-candidate
+runs report `empty`; recoverable scout/search/item failures report `partial`;
+total selected-download or operational failure reports `failed` with a nonzero
+exit code. Its final ledger outcome uses the same prepared result as stdout,
+including serialization failures. Existing topic sources remain in the source
+inventory; use run counters and checkpoints to distinguish new work.
 
 ### Example Agent Workflow (Python)
 

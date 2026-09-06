@@ -1,9 +1,13 @@
 """Staged research workflow and relationship-probe command."""
 
+from contextlib import redirect_stdout
+from dataclasses import replace
+from functools import wraps
 import math
 import os
 import re
 import shlex
+import sys
 from typing import Optional
 
 import click
@@ -14,10 +18,13 @@ from ..api import FilmotClient
 from ..cli_support import (
     command_error as _command_error,
     console,
+    emit_raw_result,
+    prepare_raw_result,
     route_progress_for as _route_progress_for,
     transcript_failure_detail as _transcript_failure_detail,
     whole_word_summary as _whole_word_summary,
 )
+from ..session_context import current_session, session_option
 from ..schemas import (
     CommandResult,
     ErrorDetail,
@@ -800,16 +807,35 @@ def _render_research_result(
         f'  filmot claims add {data["topic"]} "exact claim statement"'
     )
     console.print(
-        f'  filmot sessions {data["topic"]} --summary'
+        f'  filmot sessions {shlex.quote(current_session() or data["topic"])} --summary'
     )
     console.print(
         f'  filmot library context {data["topic"]} -o context.txt'
     )
 
 
+def _research_output(callback):
+    """Keep progress on stderr and emit JSON only after the run is finalized.
+
+    The redirect includes nested scout/download helpers. Emission happens outside
+    their exception handling so Exit(1) for a failed result cannot be caught as
+    another research failure or produce a second result.
+    """
+    @wraps(callback)
+    def run(*args, **kwargs):
+        if not kwargs.get("raw", False):
+            return callback(*args, **kwargs)
+        with redirect_stdout(sys.stderr):
+            outcome = callback(*args, **kwargs)
+        return emit_raw_result(outcome, indent=2)
+
+    return run
+
+
 # ========== RESEARCH COMMAND ==========
 
 @click.command("research")
+@session_option
 @click.argument("topic")
 @click.option(
     "--depth",
@@ -856,6 +882,8 @@ def _render_research_result(
               ))
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy for transcript downloads")
 @click.option("--verbose", is_flag=True, help="Show full transcript failure details")
+@click.option("--raw", is_flag=True, help="Emit one typed JSON result; progress goes to stderr")
+@_research_output
 def research(
     topic: str,
     depth: int,
@@ -877,6 +905,7 @@ def research(
     probe: bool,
     no_proxy: bool,
     verbose: bool,
+    raw: bool,
 ):
     """Research TOPIC with staged search, visible selection, and checkpoints.
 
@@ -900,7 +929,7 @@ def research(
     import uuid
 
     from ..ledger import log_event, log_result
-    from ..library import get_library
+    from ..library import get_library, normalize_topic_name
     from ..transcript import (
         describe_routing_plan,
         disable_proxy,
@@ -909,8 +938,14 @@ def research(
         routing_plan,
     )
 
-    library = get_library()
-    normalized_topic = library._normalize_topic(topic)
+    library = None
+    normalized_topic = normalize_topic_name(topic)
+    selected_session = current_session()
+    normalized_session = (
+        normalize_topic_name(selected_session, fallback="session")
+        if selected_session is not None
+        else None
+    )
     run_id = uuid.uuid4().hex[:12]
     run_status = "failed"
     run_error = None
@@ -934,12 +969,15 @@ def research(
     route_plan = None
     search_partial = False
     search_page_errors = []
+    scout_error = None
+    recorded_outcome = None
 
-    def aggregate_data() -> ResearchResultData:
+    def aggregate_data(*, include_sources=True) -> ResearchResultData:
         """Build the one result payload used by renderer and ledger."""
         return {
             "run_id": run_id,
             "topic": normalized_topic,
+            **({"session": normalized_session} if normalized_session is not None else {}),
             "query": topic,
             "phase": phase,
             "scout": len(scout_videos),
@@ -954,12 +992,16 @@ def research(
             "probe_download_failed": probe_fail_count,
             "probe_query_failed": probe_query_fail_count,
             "chars": total_chars + probe_chars,
-            "sources": library.list_transcripts(normalized_topic),
+            "sources": (
+                library.list_transcripts(normalized_topic)
+                if library is not None and include_sources
+                else []
+            ),
             "routing_plan": route_plan or {},
         }
 
     def aggregate_errors() -> list[ErrorDetail]:
-        errors = []
+        errors = [scout_error] if scout_error is not None else []
         if search_page_errors:
             errors.append(
                 ErrorDetail(
@@ -988,6 +1030,39 @@ def research(
             )
         return errors
 
+    def record_result(outcome):
+        """Persist exactly the outcome emitted by the selected renderer."""
+        nonlocal run_status, recorded_outcome
+        if raw:
+            outcome = prepare_raw_result(outcome)
+            if normalized_session is not None:
+                # Serialization failures replace the payload; retain the safe
+                # routing identity so stdout and the ledger still agree.
+                outcome = replace(
+                    outcome, data={**outcome.data, "session": normalized_session},
+                )
+        run_status = outcome.status_value
+        recorded_outcome = outcome
+        log_result(
+            "research",
+            outcome,
+            topic=normalized_topic,
+            data=outcome.data,
+        )
+        return outcome
+
+    def failure_result(error, *, status=ResultStatus.FAILED):
+        if recorded_outcome is not None:
+            return recorded_outcome
+        # A failed library read may itself be the exception; do not repeat it
+        # while constructing the failure report. Counters still preserve work.
+        return record_result(CommandResult(
+            command="research",
+            status=status,
+            data=aggregate_data(include_sources=False),
+            errors=[*aggregate_errors(), ErrorDetail.from_exception(error, stage=phase)],
+        ))
+
     start_fields = {
         "run_id": run_id,
         "query": topic,
@@ -1008,6 +1083,7 @@ def research(
         "probe": probe,
         "dedupe": dedupe,
         "fallback": fallback,
+        "raw": raw,
     }
     log_event("research_start", topic=normalized_topic, **start_fields)
 
@@ -1045,6 +1121,8 @@ def research(
         )
 
     try:
+        library = get_library()
+        normalized_topic = library._normalize_topic(topic)
         if no_proxy:
             disable_proxy()
         route_plan = routing_plan()
@@ -1139,6 +1217,7 @@ def research(
                 checkpoint("scout", status="skipped", error=str(error))
                 console.print("[dim]Scout: Skipped (YOUTUBE_API_KEY not configured)[/dim]")
             except Exception as error:
+                scout_error = ErrorDetail.from_exception(error, stage="scout")
                 detail = f"{type(error).__name__}: {_whole_word_summary(error)}"
                 checkpoint(
                     "scout",
@@ -1578,7 +1657,7 @@ def research(
         if not videos:
             run_status = (
                 ResultStatus.PARTIAL.value
-                if search_partial
+                if search_partial or scout_error is not None
                 else ResultStatus.EMPTY.value
             )
             if not probe:
@@ -1602,14 +1681,10 @@ def research(
                         else []
                     ),
                 )
-                log_result(
-                    "research",
-                    outcome,
-                    topic=normalized_topic,
-                    data=outcome.data,
-                )
-                _render_research_result(outcome)
-                return
+                outcome = record_result(outcome)
+                if not raw:
+                    _render_research_result(outcome)
+                return outcome
             console.print(
                 "[dim]No current discovery candidates passed the gates; "
                 "continuing the requested probe from eligible transcripts "
@@ -2440,6 +2515,7 @@ def research(
                 or probe_fail_count
                 or probe_query_fail_count
                 or search_partial
+                or scout_error is not None
             )
             else ResultStatus.COMPLETED.value
         )
@@ -2450,21 +2526,16 @@ def research(
             data=result_data,
             errors=aggregate_errors(),
         )
-        # The aggregate result and its human rendering now consume one typed
-        # accounting object. Checkpoints remain smaller phase events.
-        log_result(
-            "research",
-            outcome,
-            topic=normalized_topic,
-            data=result_data,
-        )
-        _render_research_result(outcome)
-        if total_item_failure:
-            _command_error(
-                f"All {fail_count} selected transcript downloads failed."
-            )
+        outcome = record_result(outcome)
+        if not raw:
+            _render_research_result(outcome)
+            if total_item_failure:
+                _command_error(
+                    f"All {fail_count} selected transcript downloads failed."
+                )
+        return outcome
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as error:
         run_status = "interrupted"
         run_error = f"Interrupted during {phase}"
         checkpoint(
@@ -2474,17 +2545,33 @@ def research(
             failed=fail_count,
             selected=selected_count,
         )
+        outcome = failure_result(error, status=ResultStatus.INTERRUPTED)
+        if raw:
+            return outcome
         raise click.Abort()
     except click.ClickException as error:
         run_error = str(error)
+        outcome = failure_result(error)
+        if raw:
+            return outcome
         raise
     except FilmotAPIContractError as error:
         run_error = f"Invalid Filmot API response: {error}"
+        outcome = failure_result(error)
+        if raw:
+            return outcome
+        _command_error(run_error)
     except ValueError as error:
         run_error = f"Configuration error: {error}"
+        outcome = failure_result(error)
+        if raw:
+            return outcome
         _command_error(run_error)
     except Exception as error:
         run_error = f"{type(error).__name__}: {error}"
+        outcome = failure_result(error)
+        if raw:
+            return outcome
         _command_error(run_error)
     finally:
         log_event(
