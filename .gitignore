@@ -54,7 +54,6 @@ htmlcov/
 *.json
 *.csv
 !package.json
-!tests/fixtures/filmot_api/*.json
 
 # Dev/reference files
 reference.txt
