@@ -120,6 +120,23 @@ def test_versioned_yt_search_raw_sets_provider_and_preserves_provenance():
     }
 
 
+@pytest.mark.parametrize("command", ["yt-video", "yt-playlist"])
+def test_exact_youtube_artifact_commands_imply_strict_provider(command):
+    artifact = {
+        "videos": [{"video_id": "abc12345678", "title": "Curated source"}],
+        "_filmot": {
+            "schema": "filmot.result/v1",
+            "command": command,
+            "status": "completed",
+        },
+    }
+
+    candidate = normalize_candidates(artifact)[0]
+
+    assert candidate["provider"] == "youtube"
+    assert candidate["provenance"]["artifact"]["command"] == command
+
+
 def test_direct_youtube_resource_normalizes_nested_aliases_and_extras():
     resource = {
         "kind": "youtube#video",

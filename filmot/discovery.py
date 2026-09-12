@@ -465,7 +465,7 @@ def _artifact_provider(artifact: Any) -> Optional[str]:
         return explicit
     metadata = artifact.get("_filmot")
     command = metadata.get("command") if isinstance(metadata, Mapping) else None
-    if command == "yt-search":
+    if command in {"yt-search", "yt-video", "yt-playlist"}:
         return "youtube"
     if command in {"search", "search-all", "research"}:
         return "filmot"

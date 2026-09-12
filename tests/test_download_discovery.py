@@ -100,6 +100,15 @@ def test_unchanged_yt_search_raw_payload_pipes_into_download():
     assert log_result.call_args.args[1].data["discovery_ref"] == discovery_ref
 
 
+
+def test_download_help_describes_all_discovery_inputs():
+    result = CliRunner().invoke(cli, ["download", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "piped discovery results" in result.output
+    assert "filmot yt-playlist PLAYLIST_ID --raw" in result.output
+
+
 def test_download_preflights_complete_batch_before_any_mutation():
     payload = _yt_payload([
         {"video_id": "abc12345678", "title": "Valid first row"},
@@ -121,3 +130,110 @@ def test_download_preflights_complete_batch_before_any_mutation():
     assert "validation failed" in result.output.lower()
     get_library.assert_not_called()
     get_transcript.assert_not_called()
+
+
+def test_unchanged_yt_playlist_raw_pipes_only_observed_videos_into_download():
+    video = {
+        "video_id": "abc12345678",
+        "title": "Curated active-inference lecture",
+        "description": "Observed video metadata",
+        "channel_title": "Research channel",
+        "channel_id": "UC1234567890123456789012",
+        "published_at": "2026-09-01T09:00:00Z",
+        "views": 0,
+        "metadata_observed_at": "2026-09-12T10:00:00Z",
+        "metadata_expires_at": "2026-10-12T10:00:00Z",
+        "provider": "youtube-data-api-v3",
+        "provenance": {
+            "resource": "playlistItem",
+            "playlist_id": "PLactive_inference",
+            "playlist_item_id": "item-observed",
+            "playlist_position": 0,
+        },
+    }
+    provider = {
+        "provider": "youtube-data-api-v3",
+        "playlist": {
+            "playlist_id": "PLactive_inference",
+            "title": "Active Inference",
+        },
+        "playlist_items": [
+            {
+                "playlist_item_id": "item-observed",
+                "playlist_id": "PLactive_inference",
+                "video_id": video["video_id"],
+                "video_metadata_status": "observed",
+            },
+            {
+                "playlist_item_id": "item-idless",
+                "playlist_id": "PLactive_inference",
+                "video_id": None,
+                "video_metadata_status": "not_applicable",
+            },
+        ],
+        "videos": [video],
+        "video_id_outcomes": [
+            {"video_id": video["video_id"], "status": "observed"}
+        ],
+        "request": {"playlist_id": "PLactive_inference"},
+        "coverage": {
+            "playlist_returned": True,
+            "pages_attempted": 1,
+            "pages_fetched": 1,
+            "playlist_items_returned": 2,
+            "videos_returned": 1,
+            "next_page_token": None,
+            "stopping_reason": "exhausted",
+            "partial": False,
+        },
+        "api_calls": {
+            "playlists": 1,
+            "playlist_items": 1,
+            "videos": 1,
+            "total": 3,
+        },
+        "observed_at": "2026-09-12T10:00:00Z",
+        "expires_at": "2026-10-12T10:00:00Z",
+        "warnings": ["One ID-less item was retained as evidence."],
+        "errors": [],
+    }
+    with (
+        patch(
+            "filmot.youtube_resources.get_playlist_detailed",
+            return_value=provider,
+        ),
+        patch("filmot.ledger.log_result"),
+    ):
+        discovery = CliRunner().invoke(
+            cli, ["yt-playlist", "PLactive_inference", "--raw"]
+        )
+
+    assert discovery.exit_code == 0, discovery.output
+    piped = discovery.output
+    with (
+        patch("filmot.library.get_library") as get_library,
+        patch(
+            "filmot.transcript.get_transcript",
+            return_value=_transcript(video["video_id"]),
+        ) as get_transcript,
+        patch("filmot.ledger.log_result"),
+        patch("filmot.ledger.log_event"),
+    ):
+        library = get_library.return_value
+        library.exists.return_value = False
+        library.list_transcripts.return_value = []
+        downloaded = CliRunner().invoke(
+            cli,
+            ["download", "--topic", "active-inference", "--count", "10"],
+            input=piped,
+        )
+
+    assert downloaded.exit_code == 0, downloaded.output
+    get_transcript.assert_called_once()
+    assert get_transcript.call_args.args[0] == video["video_id"]
+    assert library.save.call_count == 1
+    saved = library.save.call_args.kwargs
+    assert saved["metadata"]["discovery_provider"] == "youtube"
+    assert saved["metadata"]["discovery_provenance"]["playlist_id"] == (
+        "PLactive_inference"
+    )

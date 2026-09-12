@@ -20,6 +20,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable
@@ -33,7 +34,22 @@ from .redaction import redact_sensitive_text
 
 CHANNEL_METADATA_TTL_DAYS = 30
 _CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+_CHANNEL_HANDLE_SEPARATORS = frozenset("_-.·")
 _YOUTUBE_CHANNEL_HOSTS = {"youtube.com", "www.youtube.com"}
+
+
+def _valid_channel_handle(value: str) -> bool:
+    """Validate the safe cross-script shape; YouTube owns final acceptance."""
+    if not 1 <= len(value) <= 30:
+        return False
+    if not value[0].isalnum() or not value[-1].isalnum():
+        return False
+    return all(
+        character.isalnum()
+        or unicodedata.category(character).startswith("M")
+        or character in _CHANNEL_HANDLE_SEPARATORS
+        for character in value
+    )
 
 
 class YouTubeChannelAPIError(RuntimeError):
@@ -198,8 +214,8 @@ def _parse_channel_reference(channel_reference: str) -> tuple[str, str]:
     if _CHANNEL_ID_RE.fullmatch(value):
         return "id", value
     if value.startswith("@"):
-        handle = value[1:]
-        if handle and not re.search(r"[\s/?#]", handle):
+        handle = unicodedata.normalize("NFC", value[1:])
+        if _valid_channel_handle(handle):
             return "forHandle", handle
         raise ValueError("Invalid YouTube @handle")
 
@@ -227,8 +243,8 @@ def _parse_channel_reference(channel_reference: str) -> tuple[str, str]:
     if len(parts) == 2 and parts[0] == "channel" and _CHANNEL_ID_RE.fullmatch(parts[1]):
         return "id", parts[1]
     if len(parts) == 1 and parts[0].startswith("@"):
-        handle = parts[0][1:]
-        if handle and not re.search(r"[\s/?#]", handle):
+        handle = unicodedata.normalize("NFC", parts[0][1:])
+        if _valid_channel_handle(handle):
             return "forHandle", handle
 
     raise ValueError(

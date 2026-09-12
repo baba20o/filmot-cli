@@ -59,7 +59,8 @@ class TestCLIEntryPoint:
         result = runner.invoke(cli, ["config"])
 
         assert result.exit_code == 0, result.output
-        assert "API Key: configured" in result.output
+        assert "Filmot API Key: configured" in result.output
+        assert "YouTube API Key:" in result.output
         assert secret not in result.output
         assert secret[:8] not in result.output
         assert secret[-4:] not in result.output

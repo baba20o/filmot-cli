@@ -14,9 +14,10 @@ Filmot CLI's indexed `search` and `research` paths search **YouTube
 transcripts**—the actual spoken words, not merely titles or descriptions.
 Direct `yt-search` is a separate recent-upload metadata discovery path; it
 attaches transcript matches only when `--transcript` is requested. `yt-video`
-fetches current public metadata for known IDs, and `yt-data` maintains the
-YouTube-owned fields that were saved with transcripts. The indexed transcript
-search is powerful because:
+fetches current public metadata for known IDs. `yt-playlists` and `yt-playlist`
+follow channel-curated paths without a search-ranking call, and `yt-data`
+maintains the YouTube-owned fields that were saved with transcripts. The
+indexed transcript search is powerful because:
 
 1. You can find discussions that aren't in video titles
 2. You get the exact context of what was said
@@ -726,6 +727,10 @@ filmot yt-search "fresh AI safety" --pages 2 --max-results 75 --raw \
 # Exact-ID YouTube metadata is the same pipeline shape
 filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw \
   | filmot download -t exact-sources -n 2
+
+# A bounded curated playlist exposes a current-video candidate array
+filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw \
+  | filmot download -t curated-sources -n 10 --dedupe
 ```
 
 The provider-neutral boundary accepts bare candidate arrays and
@@ -738,6 +743,11 @@ mapping. The exact decoded stdin text receives a `sha256:` discovery reference.
 Each successfully saved direct-YouTube row then registers the fields owned by
 that observation; a registration failure keeps the transcript, marks the
 aggregate partial, and leaves explicit provenance for later lifecycle adoption.
+For playlist discovery, `playlist_items` preserves curator order and item-level
+provenance while the top-level `videos` array contains only distinct resources
+actually returned by completed metadata calls. Only `yt-playlist` has that
+pipeline array; `yt-playlists` returns playlist-shelf rows and must first hand
+one playlist ID to `yt-playlist`.
 
 For one selected video, preserve the exact discovery handoff explicitly:
 
@@ -776,6 +786,39 @@ returned; `not_returned` was omitted by a completed batch for an unspecified
 reason; `unprocessed` never received a completed response. Earlier batches
 survive a later failure. Missing counters are null and an observed zero stays
 zero.
+
+### Curated playlist discovery
+
+Use one exact channel identity to list its public playlists, then inspect a
+deliberately bounded playlist slice:
+
+```bash
+filmot yt-playlists @exact_handle --pages 1 --max-results 25 --raw \
+  > playlist-shelf.json
+filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw \
+  > playlist-videos.json
+filmot download -t curated-topic -n 10 --dedupe < playlist-videos.json
+```
+
+Both commands default to one page and 25 rows; `--pages` accepts 1–100 and
+`--max-results` accepts 1–5000. A playlist-shelf row is one playlist, while a
+playlist row is one ordered item—not necessarily one distinct current video.
+An item can lack a usable ID, a video can appear at several positions, and a
+completed `videos.list` call can omit an ID without explaining why. Preserve
+those distinctions instead of treating the counts as interchangeable or
+inferring deletion/privacy.
+
+Before retries, a one-page shelf normally costs two calls (`channels.list` and
+`playlists.list`); a nonempty one-page playlist normally costs three
+(`playlists.list`, `playlistItems.list`, and one batched `videos.list`). Defaults
+are 5/20-second connect/read timeouts and two transient retries. Raw results
+expose actual `api_calls`, coverage, a stopping reason, and a copyable
+`continuation.argv`; replay the opaque token only with the same identity and
+bounds. All returned fields are 30-day API observations. Playlist curation is
+useful discovery provenance, not proof of credibility, completeness, or source
+independence.
+
+### Saved-data maintenance
 
 Audit and maintain direct-YouTube fields after they enter the transcript
 library:
@@ -1108,19 +1151,18 @@ When a search is unnecessary because the IDs are already known, use
 returns one ordered, pipeline-compatible result with per-ID
 `observed`/`not_returned`/`unprocessed` coverage.
 
-For a curated research path, Python agents can call
-`filmot.youtube_resources.get_playlist_detailed()` with an exact playlist ID
-or HTTPS YouTube playlist URL. It returns ordered `playlist_items`, a
-pipeline-safe `videos` projection enriched once per distinct ID, explicit
-page/result budgets, API-call accounting, partial-failure state, and an opaque
-continuation token. Use
-`list_channel_playlists_detailed()` with an exact channel ID or handle to
-inspect the channel's public playlist shelf first. Resume tokens only with the
-same bounds. Do not infer deletion or privacy from an ID-less or omitted item,
-and treat all returned YouTube metadata as a 30-day observation. Playlist URL
-input is canonicalized before it reaches result metadata, so query parameters
-do not become research provenance. This provider surface is currently Python
-only; use existing CLI commands for transcript acquisition and persistence.
+For a curated research path, run `yt-playlists CHANNEL` with an exact channel
+ID, handle, or canonical URL. Then pass one returned ID as the `PLAYLIST`
+argument to `yt-playlist`. The latter returns ordered `playlist_items`, a
+pipeline-safe `videos` projection enriched once per distinct ID, explicit page/result
+budgets, API-call accounting, partial-failure state, and an opaque continuation
+token. Resume only with the same identity and bounds. Do not infer deletion or
+privacy from an ID-less or omitted item, and treat all returned YouTube
+metadata as a 30-day observation. Playlist URL input is canonicalized before
+it reaches result metadata, so unrelated query parameters do not become
+research provenance. Python agents may use
+`filmot.youtube_resources.get_playlist_detailed()` and
+`list_channel_playlists_detailed()` for the same provider contracts.
 
 ### Pattern 3: Deep Discovery (Probe)
 ```bash
@@ -1252,9 +1294,9 @@ Requires: `yt-dlp`, `boto3`, `requests`, and AWS profile `APIBoss` configured.
 
 ### Direct YouTube API failures and credentials
 
-`yt-search`, `yt-video`, and `yt-data refresh` default to a 5-second connect
-timeout, a 20-second read timeout, and two retries for transient
-network/timeout/server/rate-limit failures. Use `--connect-timeout`,
+`yt-search`, `yt-video`, `yt-playlist`, `yt-playlists`, and `yt-data refresh`
+default to a 5-second connect timeout, a 20-second read timeout, and two retries
+for transient network/timeout/server/rate-limit failures. Use `--connect-timeout`,
 `--read-timeout`, and `--retries` to make each request tighter. There is not yet
 one wall-clock deadline across every page and detail batch. Authentication,
 invalid-request, and ordinary quota errors fail without retrying. Search keeps
@@ -1268,6 +1310,10 @@ fields and URL parameters; native request/response objects that could retain a
 key are not propagated. This boundary is defense in depth—never put secrets in
 queries, titles, notes, or committed artifacts, and rotate a key if exposure is
 suspected.
+
+Run `filmot config` for a credential-safe preflight. It reports the Filmot and
+YouTube API keys separately as `configured` or `not configured`; it never
+prints either value or a fragment.
 
 ### IP Blocked
 YouTube may block your IP for transcript requests:
@@ -1342,7 +1388,11 @@ use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
   `--transcript`, every video carries the shared `transcript_search` outcome
   and per-video failures are partial too. `transcript --grep --raw` returns stable
   seconds/timestamp/link/excerpt match rows, typed `empty` misses, and typed
-  preflight parse failures. `library echoes` adds `clusters`, `method`, and
+  preflight parse failures. `yt-playlists` uses `channel`, `playlists`,
+  `request`, `coverage`, `api_calls`, and `continuation`. `yt-playlist` adds
+  `playlist`, ordered `playlist_items`, current `videos`, and per-ID outcomes;
+  only that current-video projection can feed `download`. `library echoes`
+  adds `clusters`, `method`, and
   `artifact_hash`. Claim commands use `rows`, and all four accept `--raw`.
   `sessions NAME --raw` exposes its replay in `events`, while
   `sessions NAME --summary --raw` uses `summary`; every replayed event uses the
@@ -1368,6 +1418,8 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Breaking news research** | `filmot research "topic" --scout-days 3 --depth 10` |
 | **Search latest YouTube uploads** | `filmot yt-search "topic" --days 7 --pages 2 --max-results 75 --raw` |
 | **Fetch exact YouTube metadata** | `filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw` |
+| **List an exact channel's playlists** | `filmot yt-playlists @handle --pages 1 --max-results 25 --raw` |
+| **Inspect/download a curated playlist** | `filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw` |
 | **Audit saved YouTube expiry** | `filmot yt-data status --expired --raw` |
 | **Refresh expired YouTube fields** | `filmot yt-data refresh --dry-run` then `filmot yt-data refresh` |
 | **Purge expired YouTube fields** | `filmot yt-data purge --dry-run` then `filmot yt-data purge --yes` |

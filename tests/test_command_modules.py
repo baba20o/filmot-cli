@@ -32,6 +32,8 @@ def test_top_level_command_topology_is_stable():
         "watchlist",
         "yt-search",
         "yt-data",
+        "yt-playlist",
+        "yt-playlists",
         "yt-video",
     }
     assert set(cli.commands["library"].commands) == {
@@ -80,6 +82,8 @@ def test_major_commands_are_owned_by_domain_modules():
         "library": "filmot.commands.library",
         "sessions": "filmot.commands.library",
         "proxy": "filmot.commands.proxy",
+        "yt-playlist": "filmot.commands.youtube",
+        "yt-playlists": "filmot.commands.youtube",
     }
     assert {
         name: cli.commands[name].callback.__module__

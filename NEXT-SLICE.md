@@ -1,9 +1,9 @@
 # Filmot: next implementation slice and follow-up backlog
 
-Updated 2026-09-12. **Status: implemented but unreleased; live API and policy
-operator checks remain before release.** The current work builds on `main` at
-`bb33246`; none of the status statements in this file should be read as a
-released-version claim.
+Updated 2026-09-12. **Status: implemented but unreleased; the live playlist
+handoff is complete, while the remaining API/policy operator checks still
+precede release.** The current work builds on `main` at `597b7c9`; none of the
+status statements in this file should be read as a released-version claim.
 
 The implementation direction remains **preserving fresh discovery metadata
 through library persistence**, now accompanied by exact-ID metadata retrieval,
@@ -48,6 +48,7 @@ Research's internal scout already maps those fields for selected candidates. Reu
 | N06 bounded transport | Partial | Per-request connect/read timeouts and retries exist; one overall wall-clock operation deadline does not. |
 | N07 pagination/coverage | Implemented | Live continuation check and quota-aware operational review. |
 | Bounded channel enumeration | Implemented | Live `--page-token` continuation/checkpoint check. |
+| Public playlist CLI bridge | Implemented | The bounded five-call shelf → playlist → transcript handoff passed live; retain broader continuation checks. |
 
 ## Slice 1: fresh discovery to durable evidence
 
@@ -158,10 +159,12 @@ persisted with the saved record. Old records remain incomplete by design.
   enrichment behavior. Focused and repository-wide deterministic suites were
   green during integration; historical test counts are not acceptance criteria.
 
-The remaining release check is a small live recent-upload plus search/channel
-page-continuation run and operator review of its provenance and preservation.
-Keep network-dependent checks separate from deterministic tests. No AWS
-fallback is needed for this slice.
+The playlist release check is complete: a bounded live shelf and playlist read
+used five regular API calls total, then the unchanged raw result saved two
+transcripts with playlist-position and metadata-lifecycle provenance. The
+remaining release check is a small live recent-upload plus search/channel
+page-continuation run and operator review. Keep network-dependent checks
+separate from deterministic tests. No AWS fallback is needed for this slice.
 
 ## Follow-up backlog
 
@@ -206,6 +209,7 @@ No semantic verifier or credibility score is proposed as a substitute for source
 | Direct YouTube discovery, transport, enrichment, and absolute dates | [youtube_search.py](filmot/youtube_search.py) |
 | Shared provider-neutral candidate boundary | [discovery.py](filmot/discovery.py) |
 | Bulk candidate consumption, `yt-search`, and `yt-video` | [commands/search.py](filmot/commands/search.py) |
+| Public playlist providers and `yt-playlist`/`yt-playlists` | [youtube_resources.py](filmot/youtube_resources.py), [commands/youtube.py](filmot/commands/youtube.py) |
 | `download`, explicit discovery handoff, and manual transcript save | [commands/transcript.py](filmot/commands/transcript.py) |
 | Existing scout normalization and persistence | [commands/research.py](filmot/commands/research.py) |
 | Library normalization, provider ownership, lifecycle, and atomic record writes | [library.py](filmot/library.py) |
@@ -221,6 +225,11 @@ These captures are ignored local research artifacts, not Git-tracked fixtures. T
 - [Freshness investigation: observations](Insights/astra-fresh-reactions-2026-09-06/FRESHNESS-AND-REACTIONS.md) and [manifest with exact video-ID metadata joins](Insights/astra-fresh-reactions-2026-09-06/MANIFEST.json).
 - Concrete metadata examples: `fEvXSrHPzb4`, `KM_AIwCT5Dc`, `Spuza-KwTJ4`, and `vm_R4uT8ntE` saved with unknown identity fields; direct discovery supplied their titles/channels. `GGzT7zVrRTU` retained metadata and is a useful contrasting case.
 - Freshness session: `astra-fresh-reactions-2026-09-06`; insight session: `astra-insight-understanding-2026-09-06`. The live session summaries are preserved under each artifact folder's `runs/` directory.
+- Playlist session: `curated-active-inference-2026-09-12`. Its bounded shelf
+  returned 20 public playlists in two calls; “Active Inference / CogSci”
+  returned ten ordered items and ten current video resources in three calls.
+  The unchanged raw result saved two transcripts under
+  `curated-active-inference` with exact playlist and lifecycle provenance.
 
 The September 6 worktree note about 22 dirty files described historical local
 state and is not a current status report. Use `git status` and a
@@ -253,15 +262,12 @@ detection, and the Atlas adapter does not enable paid AWS fallback.
 - Consolidate direct YouTube request/retry/redaction/paging mechanics behind a
   shared transport where doing so reduces duplicated policy without weakening
   endpoint-specific contracts.
-- Expose the landed bounded public-playlist and channel-playlist-shelf provider
-  through typed CLI commands and pipeline handoff; keep its independent
-  page/result budgets, opaque continuation, canonical request identity, and
-  partial-preservation semantics intact.
 - Add further research bridges such as comment discovery and channel/catalog
   views only with explicit quotas, bounded output, and the same
   provenance/lifecycle semantics.
 - Decide whether useful read-only endpoints such as video categories and
   supported i18n regions/languages belong in the CLI; keep OAuth/write APIs out
   unless a separately authorized use case requires them.
-- Run a small live recent-upload and page-continuation check, inspect the
-  resulting provenance, and complete the operator policy review before release.
+- Run a small live recent-upload and search/channel page-continuation check,
+  inspect the resulting provenance, and complete the operator policy review
+  before release. The equivalent bounded playlist handoff has passed live.

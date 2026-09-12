@@ -270,6 +270,25 @@ attach a typed `transcript_search` result to each video; individual caption or
 search failures make the aggregate result `partial` instead of silently
 skipping the requested work.
 
+A known expert channel may also provide a useful intentional path through a
+topic. Inspect that curation without paying for a search-ranking call, then
+hand the chosen playlist directly to the transcript pipeline:
+
+```bash
+filmot yt-playlists @exact_handle --pages 1 --max-results 25 --raw \
+  > playlist-shelf.json
+filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw \
+  | filmot download -t your-topic -n 10 --dedupe
+```
+
+The first command returns playlist metadata, not video candidates. The second
+preserves ordered playlist-item evidence and exposes only currently returned
+video resources to `download`. Treat membership and order as the channel
+curator's selection, not as completeness, credibility, or independent
+corroboration. An ID-less or omitted item does not establish deletion or
+privacy. Record the playlist identity and position when it helps explain why a
+source entered the corpus, then verify claim-bearing passages normally.
+
 Before treating the downloaded videos as independent sources, run
 `filmot library echoes "your topic" --raw` and inspect the strongest pairs.
 Use `--persist` only when you need a reproducible artifact under
@@ -518,6 +537,18 @@ what they emphasize*; use the original document to nail *what it actually
 says*. Multiple independent reporters can raise confidence, but a count does
 not substitute for a primary source when the original is inspectable.
 
+### Trap 8: Curated means verified
+
+A focused playlist can feel pre-vetted because someone intentionally grouped
+and ordered its videos. That establishes a curator and a path, not accuracy,
+coverage, or independence. A channel may include its own interviews, repeated
+versions, promotional material, or only one side of a dispute.
+
+**Fix**: Keep playlist ID and position as discovery provenance, inspect source
+lineage, run counter-searches outside the playlist, and close important claims
+on primary sources. Never count playlist membership itself as supporting
+evidence.
+
 ---
 
 ## 7. Reporting What You Find
@@ -588,6 +619,19 @@ These are patterns we discovered the hard way.
 - **Twistronics** (magic-angle graphene) is the strongest legitimate pathway — well-documented, Nobel-adjacent, and progressing steadily.
 - **Update (2026-06-10):** PDM remains *unreplicated but undisputed* — still one Nature paper (FeTe₀.₅₅Se₀.₄₅, 40% gap modulation), no published independent confirmation 16 months on. Twistronics coverage went quiet (zero transcript hits Feb–Jun 2026). No new LK-99-style hype wave emerged; the slop ecosystem migrated to quantum-computing chips instead (same announcement-vs-evidence pattern, see Majorana 2). Lesson reinforced: **quiet science is underrepresented on YouTube exactly as press-release claims are overrepresented** — a stale field note can mean "nothing happened," not "you missed it." Check primary literature before assuming either.
 
+### Active-inference curated path
+
+- **A five-call discovery path was enough:** one bounded Machine Learning Street
+  Talk shelf exposed 20 public playlists, and one ten-item slice of “Active
+  Inference / CogSci” returned ten current video resources plus a continuation.
+- **The raw handoff preserved the curator's path:** the first two downloaded
+  transcripts retained playlist ID, item ID, zero-based position, and addition
+  time alongside the normal content-addressed discovery reference.
+- **Curation did not answer the comparison by itself:** the two transcripts
+  contained 17 exact “active inference” matches but zero exact “reinforcement
+  learning” matches. That makes them useful active-inference material, not a
+  balanced comparison corpus. A counter-search is still required.
+
 ### Key Takeaway
 The tool's real power isn't finding information — any search engine does that. **The power is combining scout freshness + Filmot depth + NEAR/N precision + multilingual reach + probe discovery to triangulate evidence and test claims.** No single query gives you the answer. The methodology does.
 
@@ -599,6 +643,7 @@ The tool's real power isn't finding information — any search engine does that.
 Before reporting any claim:
 [ ] Found 2+ independent credible sources?
 [ ] Checked full-transcript echo/lineage candidates before counting independence?
+[ ] Treated playlist membership/order as curator provenance, not evidence?
 [ ] Named researchers/experts involved?
 [ ] Checked for counter-narrative (debunked/criticism)?
 [ ] Verified institutional claims exist?

@@ -823,7 +823,7 @@ capture, polymerization, and compartmentalization may impose different
 environmental requirements, and the current Filmot corpus does not show that
 one setting completed the entire sequence alone.
 
-## Final verification and operational assessment
+## 2026-08-30 verification and operational assessment (historical snapshot)
 
 ### Verification gate
 
@@ -894,3 +894,175 @@ manual-save events cannot acquire titles or originating queries that were never
 recorded; future saves preserve best-effort title/channel, while old rows remain
 honestly `Unknown`. These constraints remain visible instead of being hidden by
 automation.
+
+## Investigation 4 — A curated path through active inference — 2026-09-12
+
+### Research question
+
+What does Machine Learning Street Talk's own “Active Inference / CogSci”
+playlist foreground about active inference, and do its opening sources directly
+compare the framework with reinforcement learning?
+
+### Why this question
+
+The first investigation left a genuine conceptual interest in the boundary
+between active inference as a broad account of adaptive systems and active
+inference as an implementable alternative to reinforcement-learning control.
+A channel-curated sequence also exercises a different discovery primitive:
+intentional grouping and order rather than Filmot relevance ranking or a fresh
+YouTube query. The tool should preserve that difference without making the
+curator's choice look like independent evidence.
+
+### Bounded live trail
+
+The named session was `curated-active-inference-2026-09-12`. Transient retries
+were disabled so the YouTube Data API ceiling was knowable before the run.
+
+```bash
+filmot --session curated-active-inference-2026-09-12 \
+  yt-playlists UCMLtBahI5DMrt0NPvDSoIRQ \
+  --pages 1 --max-results 25 --retries 0 --raw > shelf.json
+
+filmot --session curated-active-inference-2026-09-12 \
+  yt-playlist \
+  "https://www.youtube.com/playlist?list=PLwFLAA-F1PgoUOiQagOczWYPFMQJSB08J&index=1&utm_source=field-test" \
+  --pages 1 --max-results 10 --retries 0 --raw > playlist.json
+
+filmot --session curated-active-inference-2026-09-12 \
+  download -t curated-active-inference -n 2 --dedupe < playlist.json
+```
+
+- The exact-channel shelf returned all 20 reported public playlists in one
+  page: one `channels.list` plus one `playlists.list` attempt. Its terminal
+  reason was `exhausted`, with no duplicate, malformed, warning, or error row.
+- “Active Inference / CogSci” was selected deliberately rather than silently
+  taking the first shelf row. Its metadata reported 19 items. The bounded slice
+  retained ten ordered items, ten distinct usable IDs, and ten current video
+  resources, with no omission, duplicate, malformed row, or error. One
+  `playlists.list`, one `playlistItems.list`, and one batched `videos.list`
+  attempt brought the complete discovery budget to five calls. It stopped at
+  the explicit result budget and exposed a continuation for the remaining
+  items; the continuation was inspected but not executed.
+- The playlist URL normalization path was exercised with harmless extra index
+  and tracking parameters. The returned request and ledger retained only the
+  playlist ID and canonical playlist URL.
+- The unchanged `yt-playlist --raw` artifact passed directly into `download`.
+  Both selected transcripts were saved successfully. Their records and session
+  events retain the playlist ID, playlist-item ID, zero-based position, item
+  addition time, content-addressed input reference, current YouTube metadata
+  observation, and 30-day expiry. No manual field translation was required.
+- Offline `library compare "active inference" --topic
+  curated-active-inference --sort density --raw` found 17 exact phrase matches
+  across both saved transcripts: 15 in `V_VXOdf1NMw` and two in
+  `PNYWi996Beg`. The same comparison for `reinforcement learning` was empty.
+  This small opening slice is useful active-inference material but does not yet
+  answer the intended comparison; a counter-search outside the curated path is
+  still necessary.
+
+### Friction and recovery log
+
+#### F-019 — Configuration preflight conflates two independent API keys
+
+- Status: fixed and regression-tested.
+- Stage: credential-safe live preflight.
+- Command: `filmot config`.
+- Expected: determine whether both the Filmot transcript-index API and YouTube
+  Data API are ready without viewing either secret.
+- Observed: the inventory showed one generic `API Key: configured` row. That
+  referred to the Filmot/RapidAPI credential and said nothing about
+  `YOUTUBE_API_KEY`, forcing an agent to inspect configuration internals before
+  it could predict whether `yt-playlists` would run.
+- Cognitive cost: a basic readiness question required remembering which key
+  owned which command and leaving the supported status surface.
+- Classification: ambiguous state / missing preflight signal.
+- Severity: medium for any direct-YouTube workflow.
+- Resolution: `filmot config` now reports `Filmot API Key` and `YouTube API
+  Key` independently as only `configured` or `not configured`; no value or
+  fragment is exposed.
+
+#### F-020 — Rich can hard-wrap the copyable playlist continuation
+
+- Status: fixed and regression-tested.
+- Stage: bounded playlist continuation.
+- Command: the continuation printed after the ten-item `yt-playlist` slice.
+- Expected: copy one exact command containing the opaque token and matching
+  page/result/retry controls.
+- Observed: the long command was semantically complete, but normal Rich layout
+  could insert hard wrapping into copied terminal text.
+- Cognitive cost: the researcher had to distinguish a visual wrap from token
+  content and repair a command the tool already knew exactly.
+- Classification: copy/paste ergonomics / resumability.
+- Severity: medium when an opaque token is present.
+- Resolution: continuation text uses soft wrapping, and raw output also keeps
+  the directly executable arguments as `continuation.argv`.
+
+#### F-021 — Failure events rely on downstream redaction
+
+- Status: fixed with credential-safety regressions.
+- Stage: rejected references and provider/configuration failure logging.
+- Expected: every diagnostic is credential-safe before it crosses into the
+  session logger.
+- Observed: final artifacts were protected by the ledger sanitizer, but some
+  playlist command failure paths passed exception text to `log_event` before
+  applying the command's explicit safe-summary boundary.
+- Cognitive cost: verifying a failure path required reasoning about a second
+  component's implementation rather than one local invariant.
+- Classification: defense in depth / security auditability.
+- Severity: high as an invariant, even though no credential exposure was
+  observed in the live run.
+- Resolution: failure text is now summarized and redacted before `log_event`;
+  rejected identities and provider failures are detached from credential-
+  bearing input and traceback state before propagation.
+
+#### F-022 — Downloader help calls every compatible input “search results”
+
+- Status: fixed and regression-tested.
+- Stage: playlist-to-transcript handoff discovery.
+- Command: `filmot download --help`.
+- Expected: help should make the new `yt-playlist --raw` handoff discoverable.
+- Observed: the argument description referred only to piped “search results,”
+  even though the provider-neutral boundary already accepted exact-video and
+  playlist candidate envelopes.
+- Cognitive cost: a user could reasonably infer that playlist output needed a
+  conversion step or was unsupported.
+- Classification: stale help / hidden compatible path.
+- Severity: low-medium; the working path itself was smooth once attempted.
+- Resolution: help now says “discovery results” and includes an unchanged
+  `yt-playlist --raw | filmot download ...` example.
+
+### Working synthesis and cognitive load
+
+The live workflow itself was smooth: exact channel → compact public shelf →
+deliberate playlist choice → bounded ordered slice → unchanged raw download →
+offline phrase comparison. Filmot carried the identity, quota accounting,
+stopping reason, continuation, playlist position, and metadata lifecycle. The
+only research judgment in the discovery handoff was choosing the relevant
+playlist; no source code, API response shape, or manual metadata join was
+needed.
+
+The remaining load was appropriately epistemic. A channel title and curator
+order do not show that two videos are independent or that the slice represents
+the strongest counterarguments. The empty reinforcement-learning comparison
+was a useful scope diagnosis, not evidence that the broader playlist never
+discusses it. Continuing the playlist or running an explicit counter-search is
+therefore a research decision rather than recovery from tool ambiguity.
+
+### 2026-09-12 playlist-slice verification
+
+- The authoritative session contains one completed shelf result (20 rows, two
+  calls), one completed playlist result (ten items/videos, three calls), two
+  completed transcript saves, two completed metadata-enrichment events, and a
+  completed two-of-two bulk/download outcome with no failure or skip.
+- Both saved records carry `filmot.result/v1` `yt-playlist` artifact provenance,
+  exact playlist-item context, and YouTube metadata observations expiring on
+  2026-10-12. The raw discovery files themselves are not managed by `yt-data`
+  and must not be retained past their API-data window without refresh.
+- F-001 through F-018 and the 584-pass suite above remain a historical
+  2026-08-30 snapshot. F-019 through F-022 belong to this later playlist slice;
+  current release verification is reported independently rather than rewriting
+  the historical count.
+- Final 2026-09-12 integration gate: `python3 -m compileall -q filmot tests
+  main.py` completed successfully; the complete deterministic suite passed
+  **928 tests** with one upstream Google Python 3.10 lifecycle warning; and
+  `git diff --check`, command-help smoke checks, and the changed-diff Google
+  API-key-shape scan passed.

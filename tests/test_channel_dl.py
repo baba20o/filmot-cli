@@ -131,6 +131,20 @@ def _assert_channel_traceback_is_credential_free(error):
         (f"https://www.youtube.com/channel/{CHANNEL_ID}/", "id", CHANNEL_ID),
         ("@Exact.Handle", "forHandle", "Exact.Handle"),
         ("https://youtube.com/@Exact.Handle/", "forHandle", "Exact.Handle"),
+        ("@王", "forHandle", "王"),
+        ("@日本", "forHandle", "日本"),
+        ("@研究·lab", "forHandle", "研究·lab"),
+        ("@Cafe\u0301", "forHandle", "Caf\u00e9"),
+        (
+            "https://youtube.com/%40Cafe%CC%81/",
+            "forHandle",
+            "Caf\u00e9",
+        ),
+        (
+            "@" + "e\u0301" * 16,
+            "forHandle",
+            "\u00e9" * 16,
+        ),
     ],
 )
 def test_get_channel_info_resolves_only_exact_id_handle_or_canonical_url(
@@ -171,6 +185,11 @@ def test_get_channel_info_resolves_only_exact_id_handle_or_canonical_url(
         "http://youtube.com/@ResearchChannel",
         "https://example.com/@ResearchChannel",
         "https://youtube.com/@ResearchChannel?feature=shared",
+        "@safe&key=credential",
+        "@safe=credential",
+        "@foo:bar",
+        "@_leading",
+        "@trailing-",
         "UC-too-short",
     ],
 )

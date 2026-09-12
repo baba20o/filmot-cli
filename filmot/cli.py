@@ -38,12 +38,19 @@ def config():
         user_config_dir,
         user_state_dir,
     )
+    from .youtube_search import validate_youtube_api
 
     # Configuration inventory should never disclose credential fragments.
     key_status = "configured" if API_KEY else "not configured"
+    try:
+        validate_youtube_api()
+        youtube_key_status = "configured"
+    except ValueError:
+        youtube_key_status = "not configured"
     rows = (
         ("API Host", API_HOST),
-        ("API Key", key_status),
+        ("Filmot API Key", key_status),
+        ("YouTube API Key", youtube_key_status),
         ("Base URL", BASE_URL),
         ("Project Data", str(project_data_dir())),
         ("User Config", str(user_config_dir())),
@@ -586,6 +593,7 @@ from .commands.transcript import (
     transcript,
     transcript_search,
 )
+from .commands.youtube import yt_playlist, yt_playlists
 
 for command in (
     search,
@@ -597,6 +605,8 @@ for command in (
     transcript_search,
     yt_search,
     yt_video,
+    yt_playlist,
+    yt_playlists,
     yt_data,
     claims,
     library,

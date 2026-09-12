@@ -2693,15 +2693,16 @@ def download(
     dedupe: bool,
     no_proxy: bool,
 ):
-    """Download transcripts from piped search results.
+    """Download transcripts from piped discovery results.
 
-    Reads JSON search results from stdin and downloads transcripts
+    Reads JSON discovery results from stdin and downloads transcripts
     to the library. Enables pipeline workflows.
 
     Examples:
 
     \b
         filmot search "deep sea mining" --title "deep sea mining" --raw | filmot download -t deep-sea
+        filmot yt-playlist PLAYLIST_ID --raw | filmot download -t curated-topic
         filmot search "AI safety" --pages 5 --raw > results.json
         type results.json | filmot download -t ai-safety --dedupe
     """
@@ -2740,7 +2741,7 @@ def download(
             },
         )
         _command_error(
-            f"Invalid JSON from stdin: {e}. Pipe search results with --raw."
+            f"Invalid JSON from stdin: {e}. Pipe discovery results with --raw."
         )
 
     # Wrap in expected format if needed

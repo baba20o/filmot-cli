@@ -172,6 +172,38 @@ class YouTubeVideoDetailsResultData(TypedDict, total=False):
     show_description: bool
 
 
+class YouTubePlaylistResultData(TypedDict, total=False):
+    """Bounded public-playlist inspection returned by ``yt-playlist``."""
+
+    provider: str
+    playlist: Optional[Dict[str, Any]]
+    playlist_items: List[Dict[str, Any]]
+    videos: List[Dict[str, Any]]
+    video_id_outcomes: List[Dict[str, Any]]
+    request: Dict[str, Any]
+    coverage: Dict[str, Any]
+    api_calls: Dict[str, Any]
+    continuation: Dict[str, Any]
+    observed_at: Optional[str]
+    expires_at: Optional[str]
+    show_description: bool
+
+
+class YouTubePlaylistShelfResultData(TypedDict, total=False):
+    """Bounded channel playlist shelf returned by ``yt-playlists``."""
+
+    provider: str
+    channel: Optional[Dict[str, Any]]
+    playlists: List[Dict[str, Any]]
+    request: Dict[str, Any]
+    coverage: Dict[str, Any]
+    api_calls: Dict[str, Any]
+    continuation: Dict[str, Any]
+    observed_at: Optional[str]
+    expires_at: Optional[str]
+    show_description: bool
+
+
 class TranscriptResultData(TypedDict, total=False):
     """Normalized transcript outcome used by raw and human renderers."""
 

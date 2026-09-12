@@ -17,6 +17,8 @@ boundaries, and never intentionally includes the key in discovery output.
 Provider errors do not retain native request/response objects or full request
 URIs that could carry the key. These controls are defense in depth: restrict
 and rotate keys, and never place credentials in free-form queries or notes.
+`filmot config` reports the Filmot and YouTube credentials independently as
+only `configured` or `not configured`; it never displays a key fragment.
 
 Results come from YouTube and retain canonical YouTube watch URLs. Use of this
 integration is subject to the [YouTube Terms of Service](https://www.youtube.com/t/terms),
@@ -94,10 +96,12 @@ not a promise of byte-identical results.
 
 ## Discovery and library handoff
 
-The unchanged versioned output from `yt-search --raw` or `yt-video --raw` can
-feed `filmot download`. The provider-neutral boundary also accepts Filmot
-candidates and bare arrays or `result`/`videos`/`items` envelopes. It validates
-the complete candidate batch before transcript acquisition or storage,
+The unchanged versioned output from `yt-search --raw`, `yt-video --raw`, or
+`yt-playlist --raw` can feed `filmot download`. A `yt-playlists` shelf does not
+contain video candidates and is not a download envelope. The provider-neutral
+boundary also accepts Filmot candidates and bare arrays or
+`result`/`videos`/`items` envelopes. It validates the complete candidate batch
+before transcript acquisition or storage,
 preserves observed zero separately from missing values, and retains unknown
 native fields only in a bounded credential-scrubbed mapping. Freshness,
 disclosure, status, and topic provenance is copied before bulky native extras
@@ -180,10 +184,58 @@ The compatibility `list_all_video_ids()` API retains its historical unbounded,
 fail-fast, list-returning behavior for older Python callers; the CLI uses the
 bounded detailed API.
 
-## Public playlist provider APIs
+## Public playlist CLI and provider APIs
 
-Python integrations can inspect an exact public playlist or enumerate a
-channel's public playlist shelf without using `search.list`:
+`yt-playlists` enumerates the public playlist shelf for an exact channel;
+`yt-playlist` reads an ordered slice from one exact playlist and enriches its
+distinct usable video IDs. Neither command uses `search.list`:
+
+```bash
+# CHANNEL is an exact UC ID, @handle, or canonical HTTPS channel URL
+filmot yt-playlists CHANNEL --pages 1 --max-results 25
+
+# PLAYLIST is a bare playlist ID or supported HTTPS YouTube URL
+filmot yt-playlist PLAYLIST --pages 1 --max-results 25 --raw \
+  | filmot download -t curated-topic -n 10 --dedupe
+```
+
+Both CLI commands default to one page, 25 rows, a 5-second connect timeout, a
+20-second read timeout, and two transient retries. `--pages` accepts 1–100,
+`--max-results` accepts 1–5000, and the budgets are independent. For
+`yt-playlists`, a row is a playlist; for `yt-playlist`, a row is a retained
+playlist item, including one without a usable video ID. `--show-description`
+expands human output. `--page-token` is opaque and must be replayed with the
+same resource identity and bounds. Human output prints a copyable continuation;
+raw output exposes the same token and argument vector in `continuation`.
+
+Before retries, `yt-playlists` spends one `channels.list` request plus up to one
+`playlists.list` request per requested page. `yt-playlist` spends one
+`playlists.list` request, up to one `playlistItems.list` request per page, and
+enough `videos.list` requests to cover distinct usable IDs in batches of 50.
+The returned `api_calls` records actual attempts, including retries. A completed
+one-page, 25-row shelf therefore normally uses two calls, while a nonempty
+one-page playlist normally uses three.
+
+`yt-playlist --raw` is a `filmot.result/v1` object with `playlist`, ordered
+`playlist_items`, current `videos`, `video_id_outcomes`, effective `request`,
+`coverage`, `api_calls`, `continuation`, and observation/expiry timestamps.
+Repeated videos remain at each item position but are enriched once. Items
+without a usable video ID remain item evidence. Top-level `videos` contains
+only resources returned by completed `videos.list` calls, so that projection
+is safe for transcript download; item, unique-ID, and video counts can differ.
+Omitted and ID-less resources are neutral observations, not proof of deletion,
+privacy, or unavailability. A playlist or channel metadata omission is also
+reported without inferring why.
+
+A failed outer `channels.list`/`playlists.list` identity request fails the
+command. Once the channel or playlist identity is known, a page or video-detail
+failure preserves completed work, reports a typed partial result, and retains
+the current continuation when one is usable. Repeated page tokens stop safely.
+Returned playlist URLs are canonicalized before request metadata is logged, so
+unrelated input query parameters are not retained.
+
+Python integrations can call the same provider layer directly. Its defaults
+remain two pages and 100 rows, so explicit bounds are recommended:
 
 ```python
 from filmot.youtube_resources import (
@@ -206,28 +258,20 @@ shelf = list_channel_playlists_detailed(
 )
 ```
 
-Both APIs validate controls before quota use and return credential-free
+Both provider APIs validate controls before quota use and return credential-free
 request, coverage, warning, error, API-call, and 30-day observation envelopes.
 Playlist input accepts a bare bounded ID or a supported HTTPS YouTube URL; only
 the parsed ID and a canonical playlist URL are retained, so unrelated URL
-parameters do not enter output. Shelf lookup accepts the same exact channel
-forms as channel download.
+parameters do not enter output. Google API-key-shaped values are rejected as
+playlist identities before quota use or logging. Shelf lookup accepts the same
+exact channel forms as channel download.
 
-`get_playlist_detailed()` spends one `playlists.list` request, up to the
-explicit number of `playlistItems.list` pages, and enough `videos.list` calls
-to cover distinct video IDs in the retained slice. The full ordered slice stays
-in `playlist_items`, including an item that no longer exposes a usable video
-ID. Repeated videos remain visible at each playlist position but are enriched
-once. Top-level `videos` contains only resources returned by completed
-`videos.list` calls, making that projection safe for a later transcript
-pipeline. Omitted resources and ID-less items are neutral observations, not
-proof of deletion, privacy, or unavailability.
-
-A later playlist-item or video-detail failure preserves usable completed work
-and marks coverage partial. Page and result budgets are independent; resume
-with the opaque `next_page_token` and the same bounds. These are provider APIs,
-not yet top-level CLI commands, and their returned metadata has the same
-30-day refresh-or-delete responsibility as other YouTube API observations.
+The provider envelopes use `coverage.next_page_token`; CLI results additionally
+provide `continuation.argv`. All returned metadata has the same 30-day
+refresh-or-delete responsibility as other YouTube API observations. Session
+events keep bounded request/coverage/call summaries rather than playlist or
+video descriptions; raw files saved elsewhere remain the operator's
+responsibility.
 
 ## Interpretation
 

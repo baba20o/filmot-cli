@@ -45,6 +45,7 @@ PLAYLIST_ITEM_PARTS = ("snippet", "contentDetails", "status")
 CHANNEL_PARTS = ("snippet", "contentDetails", "statistics", "topicDetails")
 
 _PLAYLIST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{2,200}$")
+_GOOGLE_API_KEY_RE = re.compile(r"^AIza[A-Za-z0-9_-]{35}$")
 _PLAYLIST_HOSTS = {
     "youtube.com",
     "www.youtube.com",
@@ -52,6 +53,29 @@ _PLAYLIST_HOSTS = {
     "music.youtube.com",
     "youtu.be",
 }
+
+_SAFE_VALUE_ERROR_MESSAGES = frozenset({
+    "max_pages must be a positive integer",
+    "max_results must be a positive integer",
+    "page_token must be non-empty text when provided",
+    "timeout and retry_backoff values must be numeric",
+    "timeouts must be finite and greater than zero",
+    "retry_backoff must be finite and non-negative",
+    "retries must be a non-negative integer",
+    "timeout must be seconds or a (connect, read) pair",
+    "A YouTube channel ID, @handle, or canonical URL is required",
+    "Invalid YouTube @handle",
+    (
+        "Unsupported YouTube channel reference; use a UC channel ID, "
+        "@handle, /channel/UC... URL, or /@handle URL"
+    ),
+    "Unsupported YouTube channel URL; use /channel/UC... or /@handle",
+    "playlist_reference must be a playlist ID or supported YouTube URL",
+    (
+        "Missing YOUTUBE_API_KEY in .env file. Get one from "
+        "https://console.cloud.google.com/apis/credentials"
+    ),
+})
 
 
 def youtube_playlist_id(value: Any) -> Optional[str]:
@@ -64,7 +88,10 @@ def youtube_playlist_id(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
     candidate = value.strip()
-    if _PLAYLIST_ID_RE.fullmatch(candidate):
+    if (
+        _PLAYLIST_ID_RE.fullmatch(candidate)
+        and not _GOOGLE_API_KEY_RE.fullmatch(candidate)
+    ):
         return candidate
 
     try:
@@ -85,7 +112,56 @@ def youtube_playlist_id(value: Any) -> Optional[str]:
     if len(values) != 1:
         return None
     playlist_id = unquote(values[0]).strip()
-    return playlist_id if _PLAYLIST_ID_RE.fullmatch(playlist_id) else None
+    if (
+        _PLAYLIST_ID_RE.fullmatch(playlist_id)
+        and not _GOOGLE_API_KEY_RE.fullmatch(playlist_id)
+    ):
+        return playlist_id
+    return None
+
+
+def _safe_public_value_error(error: ValueError) -> str:
+    """Retain only known static validation/configuration diagnostics."""
+    message = str(error)
+    if message in _SAFE_VALUE_ERROR_MESSAGES:
+        return message
+    return "Invalid YouTube playlist resource request"
+
+
+def _detached_youtube_error(error: YouTubeAPIError) -> YouTubeAPIError:
+    """Copy only bounded scalar diagnostics into a fresh public exception."""
+    category = str(getattr(error, "category", "unknown"))
+    if not re.fullmatch(r"[a-z_]{1,40}", category):
+        category = "unknown"
+    reason = str(getattr(error, "reason", "requestFailed"))
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", reason):
+        reason = "requestFailed"
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, bool) or not isinstance(status_code, int):
+        status_code = None
+    attempts = getattr(error, "attempts", 1)
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+        attempts = 1
+    status = ", HTTP {}".format(status_code) if status_code is not None else ""
+    return YouTubeAPIError(
+        "YouTube API {} error ({}{})".format(category, reason, status),
+        category=category,
+        reason=reason,
+        status_code=status_code,
+        retryable=bool(getattr(error, "retryable", False)),
+        attempts=attempts,
+    )
+
+
+def _unexpected_resource_error() -> YouTubeAPIError:
+    """Return a generic error that retains no unexpected exception material."""
+    return YouTubeAPIError(
+        "YouTube API client failed before a safe resource response was available",
+        category="unknown",
+        reason="unexpectedException",
+        retryable=False,
+        attempts=0,
+    )
 
 
 def _text(value: Any) -> Optional[str]:
@@ -373,8 +449,6 @@ def _enumerate_playlists(
             result = _request_json(YOUTUBE_PLAYLISTS_URL, params, **request_options)
         except YouTubeAPIError as error:
             api_attempts += error.attempts
-            if not rows:
-                raise
             errors.append(_error_row(error, stage="playlists", page=page))
             stopping_reason = "partial_failure"
             partial = True
@@ -387,8 +461,6 @@ def _enumerate_playlists(
                 YOUTUBE_PLAYLISTS_URL,
                 "playlists.items is not an array",
             )
-            if not rows:
-                raise error
             errors.append(_error_row(error, stage="playlists", page=page))
             stopping_reason = "partial_failure"
             partial = True
@@ -451,8 +523,8 @@ def _enumerate_playlists(
     warnings = []
     if errors:
         warnings.append(
-            "Playlist enumeration stopped after a later failure; earlier rows "
-            "were preserved."
+            "Playlist enumeration was incomplete; usable completed rows were "
+            "preserved."
         )
     if malformed:
         warnings.append("Malformed playlist resources were skipped.")
@@ -479,7 +551,7 @@ def _enumerate_playlists(
     }
 
 
-def list_channel_playlists_detailed(
+def _list_channel_playlists_detailed(
     channel_reference: str,
     *,
     max_pages: int = 2,
@@ -510,6 +582,9 @@ def list_channel_playlists_detailed(
         retry_backoff=retry_backoff,
     )
     filter_name, filter_value = _parse_channel_reference(channel_reference)
+    channel_reference = (
+        filter_value if filter_name == "id" else "@{}".format(filter_value)
+    )
     requested_at_dt = _clock_now(now)
     observed_at = _format_rfc3339(requested_at_dt)
     expires_at = _format_rfc3339(
@@ -649,6 +724,62 @@ def list_channel_playlists_detailed(
             "total": channel_result.attempts + playlist_calls,
         },
     }
+
+
+def list_channel_playlists_detailed(
+    channel_reference: str,
+    *,
+    max_pages: int = 2,
+    max_results: int = 100,
+    page_token: Optional[str] = None,
+    timeout: Optional[Any] = None,
+    retries: Optional[int] = None,
+    session: Optional[Any] = None,
+    retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Return a bounded shelf while detaching credential-bearing failures."""
+    youtube_failure = None
+    value_failure_message = None
+    unexpected_failure = False
+    try:
+        return _list_channel_playlists_detailed(
+            channel_reference,
+            max_pages=max_pages,
+            max_results=max_results,
+            page_token=page_token,
+            timeout=timeout,
+            retries=retries,
+            session=session,
+            retry_backoff=retry_backoff,
+            sleep=sleep,
+            now=now,
+        )
+    except YouTubeAPIError as error:
+        youtube_failure = _detached_youtube_error(error)
+    except ValueError as error:
+        value_failure_message = _safe_public_value_error(error)
+    except Exception:
+        unexpected_failure = True
+
+    channel_reference = ""
+    max_pages = 0
+    max_results = 0
+    page_token = None
+    timeout = None
+    retries = None
+    session = None
+    retry_backoff = 0.0
+    sleep = None
+    now = None
+    if youtube_failure is not None:
+        raise youtube_failure from None
+    if value_failure_message is not None:
+        raise ValueError(value_failure_message) from None
+    if unexpected_failure:
+        raise _unexpected_resource_error() from None
+    raise RuntimeError("unreachable YouTube playlist resource state")
 
 
 def _enumerate_playlist_items(
@@ -864,7 +995,7 @@ def _video_with_playlist_context(
     return output
 
 
-def get_playlist_detailed(
+def _get_playlist_detailed(
     playlist_reference: str,
     *,
     max_pages: int = 2,
@@ -1102,6 +1233,62 @@ def get_playlist_detailed(
             "total": total_calls,
         },
     }
+
+
+def get_playlist_detailed(
+    playlist_reference: str,
+    *,
+    max_pages: int = 2,
+    max_results: int = 100,
+    page_token: Optional[str] = None,
+    timeout: Optional[Any] = None,
+    retries: Optional[int] = None,
+    session: Optional[Any] = None,
+    retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Return one playlist while detaching credential-bearing failures."""
+    youtube_failure = None
+    value_failure_message = None
+    unexpected_failure = False
+    try:
+        return _get_playlist_detailed(
+            playlist_reference,
+            max_pages=max_pages,
+            max_results=max_results,
+            page_token=page_token,
+            timeout=timeout,
+            retries=retries,
+            session=session,
+            retry_backoff=retry_backoff,
+            sleep=sleep,
+            now=now,
+        )
+    except YouTubeAPIError as error:
+        youtube_failure = _detached_youtube_error(error)
+    except ValueError as error:
+        value_failure_message = _safe_public_value_error(error)
+    except Exception:
+        unexpected_failure = True
+
+    playlist_reference = ""
+    max_pages = 0
+    max_results = 0
+    page_token = None
+    timeout = None
+    retries = None
+    session = None
+    retry_backoff = 0.0
+    sleep = None
+    now = None
+    if youtube_failure is not None:
+        raise youtube_failure from None
+    if value_failure_message is not None:
+        raise ValueError(value_failure_message) from None
+    if unexpected_failure:
+        raise _unexpected_resource_error() from None
+    raise RuntimeError("unreachable YouTube playlist resource state")
 
 
 __all__ = [

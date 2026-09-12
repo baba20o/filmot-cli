@@ -129,12 +129,17 @@ stance, agreement, contradiction, independence, credibility, or truth.
 
 ### 7. Pipeline/Stdin Mode
 
-**What it does:** Accept search results from stdin to feed into bulk download,
-enabling: `filmot search ... --raw | filmot download --topic "mining"`
+**What it does:** Accept discovery results from stdin to feed into bulk
+download. This works for both indexed search and curated-playlist output.
+
+```bash
+filmot search ... --raw | filmot download --topic "mining"
+filmot yt-playlist PLAYLIST --raw | filmot download --topic "curated"
+```
 
 **Implementation:**
-- `download` reads a piped raw search value from stdin
-- Reads JSON from stdin, expects same format as search `--raw` output
+- `download` reads a piped raw discovery value from stdin
+- Reads JSON from stdin through the shared provider-neutral candidate boundary
 - Passes to existing `_bulk_download_transcripts()` logic
 - Options: `--topic` (required), `--count N`, `--fallback`, `--dedupe`
 
@@ -250,6 +255,28 @@ forms in the `--title` parameter.
 
 **Current owners:** `filmot/commands/search.py`, `filmot/commands/library.py`,
 `filmot/ledger.py`
+
+### Bounded curated-playlist discovery and handoff
+
+- `yt-playlists` resolves one exact channel ID/handle/URL and enumerates a
+  bounded public-playlist shelf; `yt-playlist` retains an ordered bounded item
+  slice and enriches each distinct usable video ID once.
+- Both commands default to one page/25 rows, accept independent page and row
+  budgets plus opaque continuation tokens, expose actual API-call accounting,
+  and return typed empty/partial/completed results. Human and raw continuation
+  forms preserve the same controls.
+- Only `yt-playlist --raw` is a download-candidate envelope. Its top-level
+  `videos` contains resources returned by completed metadata calls, while
+  `playlist_items` preserves repeated and ID-less curator evidence.
+- A 2026-09-12 live active-inference run enumerated 20 channel playlists in two
+  calls, read ten items/videos in three calls, and passed the unchanged raw
+  result through `download`; saved sources retained content-addressed artifact
+  and playlist-position provenance.
+- `filmot config` now distinguishes Filmot and YouTube credential readiness
+  without revealing either key.
+
+**Current owners:** `filmot/commands/youtube.py`,
+`filmot/youtube_resources.py`, `filmot/discovery.py`
 
 ### Named search routing and session summaries
 
@@ -395,7 +422,7 @@ forms in the `--title` parameter.
 | 5 | `filmot research` | DONE | Single compound command for full workflow |
 | 6 | Deduplication | DONE | `--dedupe` flag on search and research commands |
 | 7 | Structured context | DONE | `--format structured` outputs markdown |
-| 8 | Pipeline/stdin | DONE | `filmot download` reads a piped raw search value |
+| 8 | Pipeline/stdin | DONE | `filmot download` reads a piped raw discovery value |
 | 9 | `--title` operators | DONE | Confirmed working, documented in README |
 | 10 | Speaker labels | NOT POSSIBLE | youtube-transcript-api only provides text/start/duration |
 
@@ -439,3 +466,5 @@ snapshot for this field-tested follow-on batch: all 584 tests passed on
 | N | Parallel download (`--workers`) | DONE | ThreadPoolExecutor with thread-safe manifest saves. 3x speedup at 4 workers. |
 | O | `--no-proxy` flag | DONE | Bypass Webshare proxy for direct connections. |
 | P | Proximity search in `channel-search` | DONE | `_parse_proximity_query()` parses NEAR/N and `"words"~N`. `_find_near_matches()` / `_find_tilde_matches()` do word-distance matching. |
+| Q | `yt-playlists` command | DONE | Bounded exact-channel public shelf with API accounting and copyable continuation. |
+| R | `yt-playlist` command | DONE | Ordered playlist evidence plus a pipeline-safe current-video projection. |

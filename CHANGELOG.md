@@ -65,6 +65,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   provenance, enrich each distinct returned video ID once, preserve usable
   earlier pages after later failures, expose opaque continuation tokens, and
   canonicalize supplied playlist URLs before recording request metadata.
+- `yt-playlists` and `yt-playlist` for bounded channel-shelf and curated-playlist
+  inspection. Both expose independent page/row budgets, actual API-call
+  accounting, typed partial/empty states, and copyable continuations;
+  `yt-playlist --raw` adds an ordered item ledger and a pipeline-compatible
+  current-video projection.
 - A provider-neutral discovery candidate contract for Filmot, direct YouTube,
   and bare/list/result/videos/items artifacts. It provides all-row preflight,
   strict YouTube identities, zero-vs-missing preservation, bounded sanitized
@@ -92,6 +97,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inspection, claim display, and session inspection are read-only. Echo
   analysis never logs even when `--persist` writes its artifact; context file
   writes and compact claim mutations remain logged.
+- `filmot config` labels Filmot and YouTube API credential readiness separately
+  while still revealing only `configured` or `not configured`.
+- `download --help` describes its input as general discovery results and
+  includes a direct `yt-playlist --raw` pipeline example.
+- Exact channel-handle validation accepts bounded international letters and
+  combining marks plus a narrow separator set while rejecting query, fragment,
+  shell-control, and other unsafe punctuation before API use.
 - Claim persistence is strict: write failures fail the command. Session logging
   remains a compact, best-effort activity trail and omits claim text/excerpts.
 - Claim mutations hold a per-topic, crash-releasing OS lock across the complete
@@ -159,6 +171,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Playlist command/provider boundaries reject API-key-shaped identities,
+  detach unexpected transport exceptions without retaining caller state, and
+  reject cross-resource rows before they can enter the transcript pipeline.
 - `claims cite --at` accepts the timestamps Filmot displays (`M:SS` and
   `H:MM:SS`) as well as numeric seconds, eliminating manual time conversion
   while preserving canonical evidence identity and typed raw failures.
@@ -181,6 +196,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   native request/response objects or credential-bearing URLs. Common API keys,
   tokens, signatures, authorization fields, URL userinfo, and credential query
   parameters are redacted again at typed result and ledger boundaries.
+- Playlist command failures now pass through explicit credential-safe
+  summarization before `log_event`, rather than relying only on the downstream
+  ledger boundary. Rejected references are detached before errors propagate.
+- Long playlist continuation commands are emitted with soft wrapping and are
+  also retained as argument arrays in raw output, so terminal layout does not
+  insert hard line breaks into the copyable command.
+- A playlist-shelf page failure after successful channel resolution now keeps
+  the channel and any completed rows as a typed partial result, including when
+  the failed page returned no rows.
 - Channel upload pagination detects repeated continuation tokens, unavailable
   playlist rows retain usable video identities, and absent public counters are
   no longer fabricated as zero.
