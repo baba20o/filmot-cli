@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# Keep Windows command files native when the project adds them.
+*.bat text eol=crlf
+*.cmd text eol=crlf

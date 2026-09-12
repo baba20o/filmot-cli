@@ -21,12 +21,209 @@ import os
 import re
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable
+from urllib.parse import unquote, urlsplit
 
 # Importing config runs the explicit process/user/project environment sequence.
 from . import config as _config  # noqa: F401
 from .paths import project_data_dir
+from .redaction import redact_sensitive_text
+
+
+CHANNEL_METADATA_TTL_DAYS = 30
+_CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+_YOUTUBE_CHANNEL_HOSTS = {"youtube.com", "www.youtube.com"}
+
+
+class YouTubeChannelAPIError(RuntimeError):
+    """Credential-safe failure from a YouTube channel API operation.
+
+    ``googleapiclient.errors.HttpError`` retains the HTTP response and the full
+    request URI. YouTube puts API keys in that URI, so allowing the native
+    exception to escape can leak a credential through logs, tracebacks, or
+    callers inspecting the exception. This domain error deliberately retains
+    only small, sanitized scalar diagnostics.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        status: Optional[int] = None,
+        reason: str = "request failed",
+    ) -> None:
+        self.endpoint = str(endpoint)
+        self.status = status
+        self.reason = str(reason)
+        details = [f"HTTP {status}" if status is not None else None, self.reason]
+        rendered = "; ".join(detail for detail in details if detail)
+        super().__init__(f"YouTube Data API {self.endpoint} failed ({rendered})")
+
+
+def _utc_now() -> datetime:
+    """Return a timezone-aware UTC clock value (split out for deterministic tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _isoformat_utc(value: datetime) -> str:
+    """Render an aware datetime in the API's compact UTC spelling."""
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _optional_int(value: object) -> Optional[int]:
+    """Parse an API counter while preserving absent or malformed values as unknown."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _safe_api_failure(
+    error: Exception,
+    endpoint: str,
+    api_key: str,
+) -> YouTubeChannelAPIError:
+    """Copy useful diagnostics out of an API exception without retaining it."""
+    status = getattr(error, "status_code", None)
+    response = getattr(error, "resp", None)
+    if status is None and response is not None:
+        status = getattr(response, "status", None)
+        if status is None and isinstance(response, dict):
+            status = response.get("status")
+    status = _optional_int(status)
+
+    reason_code = ""
+    message = ""
+    content = getattr(error, "content", None)
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8", errors="replace")
+        except Exception:
+            content = None
+    if isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            body = payload.get("error")
+            if isinstance(body, dict):
+                raw_message = body.get("message")
+                if isinstance(raw_message, str):
+                    message = raw_message
+                errors = body.get("errors")
+                if isinstance(errors, list):
+                    for detail in errors:
+                        if isinstance(detail, dict) and isinstance(detail.get("reason"), str):
+                            reason_code = detail["reason"]
+                            break
+
+    if not message:
+        raw_reason = getattr(error, "reason", None)
+        if isinstance(raw_reason, str):
+            message = raw_reason
+    if not message:
+        message = str(error)
+
+    if reason_code and reason_code.lower() not in message.lower():
+        message = f"{reason_code}: {message}"
+    safe_reason = redact_sensitive_text(message, (api_key,))
+    safe_reason = " ".join(safe_reason.split())[:1000] or "request failed"
+    return YouTubeChannelAPIError(endpoint, status=status, reason=safe_reason)
+
+
+def _execute_youtube_request(request_factory, endpoint: str, api_key: str) -> dict:
+    """Build and execute one API request behind a credential-erasing boundary."""
+    request = None
+    failure = None
+    try:
+        request = request_factory()
+        result = request.execute()
+        if not isinstance(result, dict):
+            raise TypeError("malformed response: expected a JSON object")
+        return result
+    except Exception as error:
+        failure = _safe_api_failure(error, endpoint, api_key)
+
+    # Raise after leaving the except suite so the original exception is not
+    # retained as ``__context__``. Clear objects whose internals can hold the
+    # developer key before this frame becomes part of the safe traceback.
+    request = None
+    request_factory = None
+    api_key = ""
+    raise failure
+
+
+def _build_youtube_client(api_key: str):
+    """Create the discovery client while applying the same safe error boundary."""
+    from googleapiclient.discovery import build
+
+    failure = None
+    try:
+        return build("youtube", "v3", developerKey=api_key)
+    except Exception as error:
+        failure = _safe_api_failure(error, "client initialization", api_key)
+    api_key = ""
+    raise failure
+
+
+def _parse_channel_reference(channel_reference: str) -> tuple[str, str]:
+    """Return ``(channels.list filter, value)`` for an exact channel reference.
+
+    Accepted forms are a canonical ``UC...`` identifier, ``@handle``, and the
+    corresponding canonical YouTube channel or handle URL. Legacy custom-name
+    and user URLs are intentionally rejected because resolving them would
+    require fuzzy guessing.
+    """
+    if not isinstance(channel_reference, str) or not channel_reference.strip():
+        raise ValueError("A YouTube channel ID, @handle, or canonical URL is required")
+
+    value = channel_reference.strip()
+    if _CHANNEL_ID_RE.fullmatch(value):
+        return "id", value
+    if value.startswith("@"):
+        handle = value[1:]
+        if handle and not re.search(r"[\s/?#]", handle):
+            return "forHandle", handle
+        raise ValueError("Invalid YouTube @handle")
+
+    parsed = urlsplit(value)
+    hostname = (parsed.hostname or "").lower()
+    try:
+        has_port = parsed.port is not None
+    except ValueError:
+        has_port = True
+    if (
+        parsed.scheme != "https"
+        or hostname not in _YOUTUBE_CHANNEL_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or has_port
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "Unsupported YouTube channel reference; use a UC channel ID, "
+            "@handle, /channel/UC... URL, or /@handle URL"
+        )
+
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) == 2 and parts[0] == "channel" and _CHANNEL_ID_RE.fullmatch(parts[1]):
+        return "id", parts[1]
+    if len(parts) == 1 and parts[0].startswith("@"):
+        handle = parts[0][1:]
+        if handle and not re.search(r"[\s/?#]", handle):
+            return "forHandle", handle
+
+    raise ValueError(
+        "Unsupported YouTube channel URL; use /channel/UC... or /@handle"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -241,35 +438,134 @@ def _slugify(name: str) -> str:
 
 def get_channel_info(channel_id: str) -> dict:
     """
-    Get channel metadata from YouTube Data API.
-    
+    Resolve an exact channel ID/handle/URL and fetch public channel metadata.
+
+    ``channel_id`` retains its historic parameter name for keyword-call
+    compatibility, but accepts a canonical ``UC...`` ID, ``@handle``,
+    ``youtube.com/channel/UC...`` URL, or ``youtube.com/@handle`` URL.
+
     Returns:
-        dict with channel_id, name, uploads_playlist_id, subscriber_count, video_count, description
+        Channel identity, public snippet/statistics/topic metadata, uploads
+        playlist ID, and 30-day observation freshness timestamps.
     """
-    from googleapiclient.discovery import build
-    
+    failure = None
+    try:
+        return _get_channel_info(channel_id)
+    except YouTubeChannelAPIError as error:
+        # The implementation necessarily owns the developer key and discovery
+        # client while it talks to Google. Strip all of those implementation
+        # frames before exposing the small domain error to callers.
+        failure = error.with_traceback(None)
+    except ValueError as error:
+        # Configuration, exact-reference validation, and not-found conditions
+        # intentionally remain ValueError for backward compatibility. Rebuild
+        # the scalar exception so it cannot retain the sensitive helper frame.
+        failure = ValueError(redact_sensitive_text(error))
+    except Exception as error:
+        # Unexpected implementation exceptions must not expose their text or
+        # object graph: either may contain a discovery client or request URI.
+        failure = YouTubeChannelAPIError(
+            "channel lookup",
+            reason="unexpected {}".format(type(error).__name__),
+        )
+    raise failure
+
+
+def _get_channel_info(channel_id: str) -> dict:
+    """Sensitive implementation for :func:`get_channel_info`."""
     api_key = os.getenv("YOUTUBE_API_KEY", "")
     if not api_key:
         raise ValueError("YOUTUBE_API_KEY not found in .env")
-    
-    yt = build('youtube', 'v3', developerKey=api_key)
-    
-    response = yt.channels().list(
-        part='snippet,contentDetails,statistics',
-        id=channel_id
-    ).execute()
-    
-    if not response.get('items'):
-        raise ValueError(f"Channel not found: {channel_id}")
-    
-    ch = response['items'][0]
+
+    filter_name, filter_value = _parse_channel_reference(channel_id)
+    yt = _build_youtube_client(api_key)
+    params = {
+        "part": "snippet,contentDetails,statistics,topicDetails",
+        filter_name: filter_value,
+    }
+    response = _execute_youtube_request(
+        lambda: yt.channels().list(**params),
+        "channels.list",
+        api_key,
+    )
+
+    items = response.get("items")
+    if not isinstance(items, list):
+        raise YouTubeChannelAPIError(
+            "channels.list",
+            reason="malformed response: items is not an array",
+        )
+    if not items:
+        safe_reference = redact_sensitive_text(channel_id, (api_key,))
+        raise ValueError(f"Channel not found: {safe_reference}")
+    ch = items[0]
+    if not isinstance(ch, dict):
+        raise YouTubeChannelAPIError(
+            "channels.list",
+            reason="malformed response: channel item is not an object",
+        )
+
+    resolved_channel_id = ch.get("id")
+    if not isinstance(resolved_channel_id, str) or not resolved_channel_id:
+        raise YouTubeChannelAPIError(
+            "channels.list",
+            reason="malformed response: channel ID is missing",
+        )
+    if filter_name == "id" and resolved_channel_id != filter_value:
+        raise YouTubeChannelAPIError(
+            "channels.list",
+            reason="response channel ID did not match the requested ID",
+        )
+
+    snippet = ch.get("snippet") if isinstance(ch.get("snippet"), dict) else {}
+    content_details = (
+        ch.get("contentDetails") if isinstance(ch.get("contentDetails"), dict) else {}
+    )
+    related_playlists = content_details.get("relatedPlaylists")
+    if not isinstance(related_playlists, dict):
+        related_playlists = {}
+    uploads_playlist_id = related_playlists.get("uploads")
+    if not isinstance(uploads_playlist_id, str) or not uploads_playlist_id:
+        raise YouTubeChannelAPIError(
+            "channels.list",
+            reason="malformed response: uploads playlist ID is missing",
+        )
+
+    statistics = ch.get("statistics") if isinstance(ch.get("statistics"), dict) else {}
+    topic_details = ch.get("topicDetails") if isinstance(ch.get("topicDetails"), dict) else {}
+    topic_ids = topic_details.get("topicIds")
+    topic_categories = topic_details.get("topicCategories")
+    observed = _utc_now()
+    expires = observed + timedelta(days=CHANNEL_METADATA_TTL_DAYS)
+
     return {
-        'channel_id': channel_id,
-        'name': ch['snippet']['title'],
-        'description': ch['snippet'].get('description', ''),
-        'uploads_playlist_id': ch['contentDetails']['relatedPlaylists']['uploads'],
-        'subscriber_count': int(ch['statistics'].get('subscriberCount', 0)),
-        'video_count': int(ch['statistics'].get('videoCount', 0)),
+        # Original public interface (with unknown counters now preserved as None).
+        "channel_id": resolved_channel_id,
+        "name": snippet.get("title", ""),
+        "description": snippet.get("description", ""),
+        "uploads_playlist_id": uploads_playlist_id,
+        "subscriber_count": _optional_int(statistics.get("subscriberCount")),
+        "video_count": _optional_int(statistics.get("videoCount")),
+        # Additional public metadata useful for cataloging and cache freshness.
+        "view_count": _optional_int(statistics.get("viewCount")),
+        "hidden_subscriber_count": (
+            statistics.get("hiddenSubscriberCount")
+            if isinstance(statistics.get("hiddenSubscriberCount"), bool)
+            else None
+        ),
+        "custom_url": snippet.get("customUrl"),
+        "published_at": snippet.get("publishedAt"),
+        "country": snippet.get("country"),
+        "default_language": snippet.get("defaultLanguage"),
+        "topic_ids": [item for item in topic_ids if isinstance(item, str)]
+        if isinstance(topic_ids, list)
+        else [],
+        "topic_categories": [item for item in topic_categories if isinstance(item, str)]
+        if isinstance(topic_categories, list)
+        else [],
+        "resolved_by": "channel_id" if filter_name == "id" else "handle",
+        "observed_at": _isoformat_utc(observed),
+        "expires_at": _isoformat_utc(expires),
     }
 
 
@@ -280,46 +576,169 @@ def list_all_video_ids(uploads_playlist_id: str, progress_callback: Optional[Cal
     Returns:
         list of dicts with video_id, title, published_at, description
     """
-    from googleapiclient.discovery import build
-    
+    failure = None
+    try:
+        return _list_all_video_ids(uploads_playlist_id, progress_callback)
+    except YouTubeChannelAPIError as error:
+        # Playlist pagination keeps one credential-bearing discovery client
+        # alive across pages. Never retain that implementation frame on a
+        # public exception traceback.
+        failure = error.with_traceback(None)
+    except ValueError as error:
+        # Missing-key validation remains a ValueError, detached from the
+        # sensitive paginator implementation.
+        failure = ValueError(redact_sensitive_text(error))
+    except Exception as error:
+        failure = YouTubeChannelAPIError(
+            "playlist enumeration",
+            reason="unexpected {}".format(type(error).__name__),
+        )
+    # A caller callback can retain arbitrary state. Do not leave it attached
+    # to the only provider frame exposed by the detached public traceback.
+    progress_callback = None
+    raise failure
+
+
+def _list_all_video_ids(
+    uploads_playlist_id: str,
+    progress_callback: Optional[Callable] = None,
+) -> list[dict]:
+    """Sensitive implementation for :func:`list_all_video_ids`."""
     api_key = os.getenv("YOUTUBE_API_KEY", "")
     if not api_key:
         raise ValueError("YOUTUBE_API_KEY not found in .env")
-    
-    yt = build('youtube', 'v3', developerKey=api_key)
-    
+
+    yt = _build_youtube_client(api_key)
+
     videos = []
     next_page_token = None
+    seen_page_tokens = set()
     page = 0
-    
+
     while True:
         page += 1
-        request = yt.playlistItems().list(
-            part='snippet',
-            playlistId=uploads_playlist_id,
-            maxResults=50,  # Maximum allowed
-            pageToken=next_page_token,
+        params = {
+            "part": "snippet,contentDetails,status",
+            "playlistId": uploads_playlist_id,
+            "maxResults": 50,
+            "pageToken": next_page_token,
+        }
+        response = _execute_youtube_request(
+            lambda: yt.playlistItems().list(**params),
+            "playlistItems.list",
+            api_key,
         )
-        response = request.execute()
-        
-        for item in response.get('items', []):
-            snippet = item['snippet']
-            vid = snippet['resourceId']['videoId']
+
+        items = response.get("items")
+        if not isinstance(items, list):
+            raise YouTubeChannelAPIError(
+                "playlistItems.list",
+                reason="malformed response: items is not an array",
+            )
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else {}
+            content_details = (
+                item.get("contentDetails")
+                if isinstance(item.get("contentDetails"), dict)
+                else {}
+            )
+            status = item.get("status") if isinstance(item.get("status"), dict) else {}
+            resource = (
+                snippet.get("resourceId")
+                if isinstance(snippet.get("resourceId"), dict)
+                else {}
+            )
+            content_video_id = content_details.get("videoId")
+            resource_video_id = resource.get("videoId")
+            if isinstance(content_video_id, str) and content_video_id:
+                vid = content_video_id
+            elif isinstance(resource_video_id, str) and resource_video_id:
+                vid = resource_video_id
+            else:
+                # Deleted or malformed playlist items sometimes omit one or
+                # both metadata containers. A missing ID cannot be downloaded,
+                # so skip it while retaining every usable unavailable item.
+                continue
+            description = snippet.get("description", "")
+            if not isinstance(description, str):
+                description = ""
             videos.append({
-                'video_id': vid,
-                'title': snippet.get('title', ''),
-                'published_at': snippet.get('publishedAt', ''),
-                'description': snippet.get('description', '')[:500],  # Truncate long descriptions
+                # Original keys and semantics.
+                "video_id": vid,
+                "title": snippet.get("title", "")
+                if isinstance(snippet.get("title", ""), str)
+                else "",
+                "published_at": snippet.get("publishedAt", "")
+                if isinstance(snippet.get("publishedAt", ""), str)
+                else "",
+                "description": description[:500],
+                # Exact playlist provenance and channel ownership metadata.
+                "playlist_item_id": item.get("id")
+                if isinstance(item.get("id"), str)
+                else None,
+                "playlist_id": snippet.get("playlistId")
+                if isinstance(snippet.get("playlistId"), str)
+                and snippet.get("playlistId")
+                else uploads_playlist_id,
+                "position": _optional_int(snippet.get("position")),
+                "channel_id": snippet.get("channelId")
+                if isinstance(snippet.get("channelId"), str)
+                else None,
+                "channel_title": snippet.get("channelTitle")
+                if isinstance(snippet.get("channelTitle"), str)
+                else None,
+                "video_owner_channel_id": snippet.get("videoOwnerChannelId")
+                if isinstance(snippet.get("videoOwnerChannelId"), str)
+                else None,
+                "video_owner_channel_title": snippet.get("videoOwnerChannelTitle")
+                if isinstance(snippet.get("videoOwnerChannelTitle"), str)
+                else None,
+                "video_published_at": content_details.get("videoPublishedAt")
+                if isinstance(content_details.get("videoPublishedAt"), str)
+                else None,
+                "privacy_status": status.get("privacyStatus")
+                if isinstance(status.get("privacyStatus"), str)
+                else None,
             })
-        
+
         if progress_callback:
-            total = response['pageInfo']['totalResults']
-            progress_callback(len(videos), total, page)
-        
-        next_page_token = response.get('nextPageToken')
-        if not next_page_token:
+            page_info = response.get("pageInfo")
+            if not isinstance(page_info, dict):
+                page_info = {}
+            total = _optional_int(page_info.get("totalResults"))
+            if total is None:
+                total = len(videos)
+            callback_failure = None
+            try:
+                progress_callback(len(videos), total, page)
+            except Exception as error:
+                callback_failure = _safe_api_failure(
+                    error,
+                    "playlist progress callback",
+                    api_key,
+                )
+            if callback_failure is not None:
+                progress_callback = None
+                raise callback_failure
+
+        next_page_token = response.get("nextPageToken")
+        if next_page_token is None or next_page_token == "":
             break
-    
+        if not isinstance(next_page_token, str):
+            raise YouTubeChannelAPIError(
+                "playlistItems.list",
+                reason="malformed response: nextPageToken is not a string",
+            )
+        if next_page_token in seen_page_tokens:
+            raise YouTubeChannelAPIError(
+                "playlistItems.list",
+                reason="pagination returned a repeated nextPageToken",
+            )
+        seen_page_tokens.add(next_page_token)
+
     return videos
 
 
@@ -562,7 +981,9 @@ class ChannelDownloader:
                         'title': title,
                         'published_at': v['published_at'],
                         'channel': channel_info['name'],
-                        'channel_id': channel_id,
+                        # Persist the canonical ID returned by channels.list;
+                        # ``channel_id`` input may be an @handle or URL.
+                        'channel_id': channel_info['channel_id'],
                         'language': result.get('language', ''),
                         'is_generated': result.get('is_generated', True),
                         'duration_seconds': result.get('duration_seconds', 0),

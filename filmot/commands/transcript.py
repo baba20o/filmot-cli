@@ -1,6 +1,7 @@
 """Transcript retrieval, pipeline download, and channel-corpus commands."""
 
 import json as json_mod
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -31,6 +32,84 @@ from .search import (
     _evaluate_transcript_grep,
     _render_transcript_grep,
 )
+
+
+def _load_discovery_candidate(
+    path: Path,
+    expected_video_id: str,
+) -> tuple[dict, str]:
+    """Load one exact candidate and return it with a content-addressed ref."""
+    from ..discovery import normalize_candidates
+
+    raw = path.read_bytes()
+
+    def reject_constant(value: str):
+        raise ValueError("non-finite JSON constant: {}".format(value))
+
+    artifact = json_mod.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+    candidates = normalize_candidates(artifact)
+    matches = [
+        candidate for candidate in candidates
+        if candidate["video_id"] == expected_video_id
+    ]
+    if not matches:
+        raise ValueError(
+            "Discovery artifact has no candidate matching video {}".format(
+                expected_video_id
+            )
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            "Discovery artifact contains multiple candidates matching video {}".format(
+                expected_video_id
+            )
+        )
+    reference = "sha256:{}".format(hashlib.sha256(raw).hexdigest())
+    candidate = dict(matches[0])
+    provenance = dict(candidate.get("provenance") or {})
+    provenance.update({
+        "discovery_ref": reference,
+        "artifact_path": str(path),
+    })
+    candidate["provenance"] = provenance
+    return candidate, reference
+
+
+def _metadata_candidate_from_response(
+    payload: object,
+    expected_video_id: str,
+) -> Optional[dict]:
+    """Select one exact Filmot metadata row from bare/list/envelope shapes."""
+    from ..discovery import normalize_candidate, normalize_candidates
+
+    if isinstance(payload, dict) and payload.get("error"):
+        raise ValueError(str(payload["error"]))
+    if isinstance(payload, list) or (
+        isinstance(payload, dict)
+        and any(field in payload for field in ("result", "videos", "items"))
+    ):
+        candidates = normalize_candidates(payload)
+    elif isinstance(payload, dict):
+        row = dict(payload)
+        if not any(
+            row.get(field) is not None
+            for field in ("video_id", "videoid", "videoId", "id")
+        ):
+            # ``get_videos`` was called with exactly one ID, and older Filmot
+            # deployments returned that one record without echoing the ID.
+            row["video_id"] = expected_video_id
+        candidates = [normalize_candidate(row)]
+    else:
+        raise TypeError("metadata lookup returned an unsupported response shape")
+    matches = [
+        candidate for candidate in candidates
+        if candidate["video_id"] == expected_video_id
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise ValueError("metadata lookup returned duplicate matching records")
+    return matches[0]
 
 
 def _validate_transcript_response(
@@ -429,6 +508,13 @@ def _route_progress_for(context: Optional[str] = None):
     return lambda event: _transcript_route_progress(event, context=context)
 
 
+def _format_optional_count(value: object) -> str:
+    """Format an observed API count without turning unknown into a false zero."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "unknown"
+    return f"{value:,}"
+
+
 def _render_transcript(
     outcome: CommandResult[dict],
     *,
@@ -720,11 +806,19 @@ def _render_download(outcome: CommandResult[dict]) -> None:
 @click.option("--proxy", default=None, help="HTTP/HTTPS proxy URL (e.g., http://user:pass@host:port)")
 @click.option("--no-proxy", is_flag=True, help="Disable proxy (ignore env vars, connect directly)")
 @click.option("--save-to", default=None, help="Save transcript to library under TOPIC (e.g., --save-to prompt-injection)")
+@click.option(
+    "--discovery",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Use exact metadata from a supplied search/discovery JSON artifact",
+)
 @click.option("--fallback/--no-fallback", default=False, help="Use AWS Transcribe if YouTube captions unavailable")
 @click.option("--grep", default=None, help="Search within the transcript using proximity operators (NEAR/N, ~N) — prints timestamped matches")
 @click.pass_context
 def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
-               raw: bool, output: str, full: bool, proxy: str, no_proxy: bool, save_to: str, fallback: bool, grep: str):
+               raw: bool, output: str, full: bool, proxy: str, no_proxy: bool,
+               save_to: str, discovery: Optional[Path], fallback: bool,
+               grep: str):
     """Download full YouTube transcript for deep analysis.
 
     This command fetches the complete transcript of a YouTube video,
@@ -778,6 +872,8 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
         filmot transcript VIDEO_ID --save-to my-investigation
 
+        filmot transcript VIDEO_ID --save-to topic --discovery yt-results.json
+
         filmot transcript VIDEO_ID --fallback  # AWS fallback if no captions
     """
     from ..transcript import (
@@ -798,6 +894,8 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         raise click.UsageError("--raw and --output cannot be combined")
     if chunk is not None and fallback:
         raise click.UsageError("--chunk and --fallback cannot be combined")
+    if discovery is not None and not save_to:
+        raise click.UsageError("--discovery requires --save-to")
     if grep is not None and any(
         (save_to, output, full, timestamps, chunk is not None, fallback)
     ):
@@ -815,6 +913,34 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         )
 
     expected_video_id = extract_video_id(video_id)
+    discovery_candidate = None
+    discovery_ref = None
+    if discovery is not None:
+        try:
+            discovery_candidate, discovery_ref = _load_discovery_candidate(
+                discovery,
+                expected_video_id,
+            )
+        except Exception as error:
+            from ..ledger import log_event
+
+            log_event(
+                "transcript",
+                topic=save_to,
+                video_id=expected_video_id,
+                save_to=save_to,
+                discovery_path=str(discovery),
+                status="failed",
+                failure_stage="discovery",
+                error="{}: {}".format(type(error).__name__, error),
+            )
+            _command_error(
+                "Invalid discovery artifact: {}".format(error),
+                command="transcript",
+                raw=raw,
+                error_type=type(error).__name__,
+                stage="discovery",
+            )
     if grep is not None:
         # Query validity is independent of transcript contents. Reject it
         # before library lookup, route configuration, or any network request so
@@ -1067,6 +1193,12 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             "route": transcript_data.get("route"),
             "routes_tried": transcript_data.get("routes_tried"),
             "routing_plan": route_plan,
+            "discovery_ref": discovery_ref,
+            "discovery_provider": (
+                discovery_candidate.get("provider")
+                if discovery_candidate is not None
+                else None
+            ),
         }
 
     def log_final(
@@ -1126,6 +1258,52 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
             # Check if already cached
             if library.exists(transcript_data['video_id'], save_to):
+                if discovery_candidate is not None:
+                    try:
+                        enrichment = library.enrich_metadata(
+                            transcript_data["video_id"],
+                            save_to,
+                            discovery_candidate,
+                            provenance={
+                                "discovery_ref": discovery_ref,
+                                "artifact_path": str(discovery),
+                            },
+                        )
+                        log_event(
+                            "metadata_enrichment",
+                            topic=save_to,
+                            video_id=transcript_data["video_id"],
+                            status=(
+                                "completed"
+                                if enrichment.get("status") == "updated"
+                                else "skipped"
+                            ),
+                            discovery_ref=discovery_ref,
+                            provider=discovery_candidate.get("provider"),
+                            filled_fields=enrichment.get("filled_fields"),
+                            conflicts=enrichment.get("conflicts"),
+                        )
+                        if enrichment.get("status") == "updated":
+                            deferred_diagnostics.append(
+                                "[green]Updated missing metadata from discovery "
+                                "artifact.[/green]"
+                            )
+                    except Exception as metadata_error:
+                        message = "Discovery metadata enrichment failed: {}".format(
+                            _whole_word_summary(metadata_error, 500)
+                        )
+                        outcome.warnings.append(message)
+                        deferred_diagnostics.append(
+                            "[yellow]{}[/yellow]".format(message)
+                        )
+                        log_event(
+                            "metadata_enrichment",
+                            topic=save_to,
+                            video_id=transcript_data["video_id"],
+                            status="failed",
+                            discovery_ref=discovery_ref,
+                            error=message,
+                        )
                 deferred_diagnostics.append(
                     f"[yellow]Already in library: "
                     f"{save_to}/{transcript_data['video_id']}[/yellow]"
@@ -1138,40 +1316,74 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                     reason="already_exists",
                 )
             else:
-                # Fetch video metadata so library entries have title/channel
-                video_title = "Unknown"
-                video_channel = "Unknown"
-                video_metadata = {}
-                try:
-                    client = FilmotClient()
-                    video_info = client.get_videos(transcript_data['video_id'])
-                    if isinstance(video_info, list) and video_info:
-                        video_metadata = dict(video_info[0])
-                        video_title = video_metadata.get("title", "Unknown")
-                        video_channel = video_metadata.get(
-                            "channelname", "Unknown"
+                # Prefer the explicitly supplied discovery record. Only fill
+                # still-missing fields from Filmot's best-effort lookup.
+                video_metadata = dict(discovery_candidate or {})
+                video_title = video_metadata.get("title") or "Unknown"
+                video_channel = (
+                    video_metadata.get("channel_title") or "Unknown"
+                )
+                if video_title == "Unknown" or video_channel == "Unknown":
+                    try:
+                        client = FilmotClient()
+                        video_info = client.get_videos(
+                            transcript_data['video_id']
                         )
-                    elif (
-                        isinstance(video_info, dict)
-                        and "error" not in video_info
-                    ):
-                        video_metadata = dict(video_info)
-                        video_title = video_metadata.get("title", "Unknown")
-                        video_channel = video_metadata.get(
-                            "channelname", "Unknown"
+                        lookup = _metadata_candidate_from_response(
+                            video_info,
+                            transcript_data['video_id'],
                         )
-                except Exception:
-                    pass  # Metadata fetch is best-effort
+                        if lookup is not None:
+                            if video_title == "Unknown" and lookup.get("title"):
+                                video_title = lookup["title"]
+                            if (
+                                video_channel == "Unknown"
+                                and lookup.get("channel_title")
+                            ):
+                                video_channel = lookup["channel_title"]
+                            for key, value in lookup.items():
+                                if video_metadata.get(key) in (None, "", "Unknown"):
+                                    video_metadata[key] = value
+                    except Exception as metadata_error:
+                        message = "Filmot metadata lookup failed: {}".format(
+                            _whole_word_summary(metadata_error, 500)
+                        )
+                        outcome.warnings.append(message)
+                        deferred_diagnostics.append(
+                            "[yellow]{}[/yellow]".format(message)
+                        )
+                        log_event(
+                            "metadata_lookup",
+                            topic=save_to,
+                            video_id=transcript_data["video_id"],
+                            status="failed",
+                            error=message,
+                        )
+
+                provider_fields = video_metadata.get("provider_fields")
+                if not isinstance(provider_fields, dict):
+                    provider_fields = {}
 
                 metadata = {
                     "title": video_title,
                     "channel": video_channel,
-                    "channel_id": video_metadata.get("channelid"),
-                    "published_at": (
-                        video_metadata.get("uploaddate")
-                        or video_metadata.get("published_at")
+                    "channel_id": video_metadata.get("channel_id"),
+                    "published_at": video_metadata.get("published_at"),
+                    "views": video_metadata.get("views"),
+                    "likes": video_metadata.get("likes"),
+                    "comments": video_metadata.get("comments"),
+                    "youtube_duration": video_metadata.get("duration"),
+                    "discovery_provider": video_metadata.get("provider"),
+                    "discovery_provenance": (
+                        video_metadata.get("provenance") or {}
                     ),
-                    "views": video_metadata.get("viewcount"),
+                    "provider_fields": provider_fields,
+                    "views_observed_at": provider_fields.get(
+                        "metadata_observed_at"
+                    ),
+                    "metadata_expires_at": provider_fields.get(
+                        "metadata_expires_at"
+                    ),
                     "source": source,
                     "language": transcript_data.get("language"),
                     "is_generated": transcript_data.get("is_generated"),
@@ -1193,6 +1405,8 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                     video_id=transcript_data["video_id"],
                     title=video_title,
                     channel=video_channel,
+                    discovery_ref=discovery_ref,
+                    discovery_provider=video_metadata.get("provider"),
                     status="saved",
                     path=str(saved_path),
                     chars=len(transcript_data.get("full_text", "")),
@@ -1369,10 +1583,10 @@ def transcript_search(video_id: str, query: str, context: int, lang: str):
 
 @click.command("channel-download")
 @session_option
-@click.argument("channel_id")
+@click.argument("channel_id", metavar="CHANNEL")
 @click.option("--delay", "-d", default=1.0, type=click.FloatRange(min=0), help="Seconds between downloads (rate limiting, default: 1.0)")
 @click.option("--lang", "-l", default="en", help="Preferred language code (default: en)")
-@click.option("--limit", default=None, type=click.IntRange(1), help="Limit number of transcripts to download (for testing)")
+@click.option("--limit", default=None, type=click.IntRange(1), help="Limit transcripts selected after full upload enumeration")
 @click.option("--workers", "-w", default=1, type=click.IntRange(1), help="Parallel download workers (default: 1, try 4 for speed)")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy, connect directly with your IP")
 @click.option("--fresh", is_flag=True, help="Ignore existing manifest, start fresh")
@@ -1383,13 +1597,17 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     each transcript. Keeps a manifest for resume — if interrupted, re-run the
     same command to pick up where you left off (delta sync).
 
+    CHANNEL must be an exact 24-character UC ID, @handle, or canonical HTTPS
+    youtube.com/channel/UC... or youtube.com/@handle URL. Use ``filmot
+    channels "display name"`` first when only a display name is known.
+
     Transcripts are stored in .filmot_data/channels/<channel-name>/
 
     \b
     Examples:
         filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg
-        filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg --delay 2
-        filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg --limit 5
+        filmot channel-download @GoogleDevelopers --delay 2
+        filmot channel-download https://youtube.com/@GoogleDevelopers --limit 5
         filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg --workers 4
     """
     from rich.progress import Progress, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
@@ -1397,10 +1615,14 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     from ..ledger import log_event, log_result
     import shutil
 
+    requested_channel = channel_id
     downloader = ChannelDownloader()
     log_event(
         "channel_download_start",
-        channel_id=channel_id,
+        # Resolution has not happened yet, so retain the historic channel_id
+        # field as the supplied reference and make its provenance explicit.
+        channel_id=requested_channel,
+        requested_channel=requested_channel,
         lang=lang,
         limit=limit,
         workers=workers,
@@ -1412,7 +1634,7 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     # If --fresh, remove existing channel dir
     if fresh:
         try:
-            info = get_channel_info(channel_id)
+            info = get_channel_info(requested_channel)
             _, channel_dir = downloader._resolve_channel_dir(info)
             if (channel_dir / "manifest.json").exists():
                 stderr_console.print(f"[yellow]Removing existing data for {info['name']}...[/yellow]")
@@ -1421,7 +1643,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
             detail = f"{type(error).__name__}: {_whole_word_summary(error, 500)}"
             log_event(
                 "channel_download_end",
-                channel_id=channel_id,
+                channel_id=requested_channel,
+                requested_channel=requested_channel,
                 status="failed",
                 phase="fresh_reset",
                 error=detail,
@@ -1429,7 +1652,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
             outcome = CommandResult.failed(
                 "channel-download",
                 {
-                    "channel_id": channel_id,
+                    "channel_id": requested_channel,
+                    "requested_channel": requested_channel,
                     "phase": "fresh_reset",
                 },
                 ErrorDetail.from_exception(error, stage="fresh_reset"),
@@ -1438,7 +1662,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 "channel_download_end",
                 outcome,
                 data={
-                    "channel_id": channel_id,
+                    "channel_id": requested_channel,
+                    "requested_channel": requested_channel,
                     "phase": "fresh_reset",
                     "fresh": fresh,
                 },
@@ -1448,17 +1673,19 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     # Phase 1: Channel info
     with console.status("[bold blue]Fetching channel info..."):
         try:
-            info = get_channel_info(channel_id)
+            info = get_channel_info(requested_channel)
         except Exception as e:
             log_event(
-                "channel_download_end", channel_id=channel_id,
+                "channel_download_end", channel_id=requested_channel,
+                requested_channel=requested_channel,
                 status="failed", phase="channel_info",
                 error=f"{type(e).__name__}: {e}",
             )
             outcome = CommandResult.failed(
                 "channel-download",
                 {
-                    "channel_id": channel_id,
+                    "channel_id": requested_channel,
+                    "requested_channel": requested_channel,
                     "phase": "channel_info",
                 },
                 ErrorDetail.from_exception(e, stage="channel_info"),
@@ -1467,17 +1694,28 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 "channel_download_end",
                 outcome,
                 data={
-                    "channel_id": channel_id,
+                    "channel_id": requested_channel,
+                    "requested_channel": requested_channel,
                     "phase": "channel_info",
                 },
             )
             _command_error(f"Error fetching channel: {e}")
 
+    # ``get_channel_info`` resolves handles and URLs to a durable UC identity.
+    # Keep the fallback for callers/tests supplying the legacy minimal shape.
+    canonical_channel_id = info.get("channel_id") or requested_channel
+    requested_line = (
+        f"\nRequested as: {requested_channel}"
+        if requested_channel != canonical_channel_id
+        else ""
+    )
+
     console.print(Panel(
         f"[bold]{info['name']}[/bold]\n"
-        f"Channel ID: {channel_id}\n"
-        f"Videos: {info['video_count']:,}\n"
-        f"Subscribers: {info['subscriber_count']:,}",
+        f"Channel ID: {canonical_channel_id}"
+        f"{requested_line}\n"
+        f"Videos: {_format_optional_count(info.get('video_count'))}\n"
+        f"Subscribers: {_format_optional_count(info.get('subscriber_count'))}",
         title="Channel",
         border_style="blue",
     ))
@@ -1496,14 +1734,16 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         )
     except Exception as e:
         log_event(
-            "channel_download_end", channel_id=channel_id,
+            "channel_download_end", channel_id=canonical_channel_id,
+            requested_channel=requested_channel,
             status="failed", phase="enumerate",
             error=f"{type(e).__name__}: {e}",
         )
         outcome = CommandResult.failed(
             "channel-download",
             {
-                "channel_id": channel_id,
+                "channel_id": canonical_channel_id,
+                "requested_channel": requested_channel,
                 "channel": info,
                 "phase": "enumerate",
             },
@@ -1513,7 +1753,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
             "channel_download_end",
             outcome,
             data={
-                "channel_id": channel_id,
+                "channel_id": canonical_channel_id,
+                "requested_channel": requested_channel,
                 "phase": "enumerate",
             },
         )
@@ -1525,6 +1766,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     # resume in place and same-name channels never merge
     slug, channel_dir = downloader._resolve_channel_dir(info)
     manifest = downloader._load_manifest(channel_dir)
+    manifest["channel"] = info
+    manifest["requested_channel"] = requested_channel
     existing = manifest.get('videos', {})
     already_done = {k for k, v in existing.items() if v.get('status') == 'done'}
 
@@ -1537,7 +1780,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         outcome = CommandResult.completed(
             "channel-download",
             {
-                "channel_id": channel_id,
+                "channel_id": canonical_channel_id,
+                "requested_channel": requested_channel,
                 "channel": info,
                 "slug": slug,
                 "enumerated": len(all_videos),
@@ -1551,11 +1795,13 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 "already_synced": True,
             },
         )
+        downloader._save_manifest(channel_dir, manifest)
         log_result(
             "channel_download_end",
             outcome,
             data={
-                "channel_id": channel_id,
+                "channel_id": canonical_channel_id,
+                "requested_channel": requested_channel,
                 "slug": slug,
                 "enumerated": len(all_videos),
                 "selected": 0,
@@ -1642,7 +1888,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                     })
                     failed += 1
                     log_event(
-                        "channel_download_item", channel_id=channel_id,
+                        "channel_download_item", channel_id=canonical_channel_id,
+                        requested_channel=requested_channel,
                         slug=slug, video_id=vid_id, status="failed",
                         error=str(result["error"]),
                         routes_tried=result.get("routes_tried"),
@@ -1653,7 +1900,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                         'title': v_item['title'],
                         'published_at': v_item['published_at'],
                         'channel': info['name'],
-                        'channel_id': channel_id,
+                        'channel_id': canonical_channel_id,
+                        'requested_channel': requested_channel,
                         'language': result.get('language', ''),
                         'is_generated': result.get('is_generated', True),
                         'duration_seconds': result.get('duration_seconds', 0),
@@ -1679,7 +1927,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                     })
                     downloaded += 1
                     log_event(
-                        "channel_download_item", channel_id=channel_id,
+                        "channel_download_item", channel_id=canonical_channel_id,
+                        requested_channel=requested_channel,
                         slug=slug, video_id=vid_id, status="saved",
                         words=wc, route=result.get("route"),
                     )
@@ -1704,7 +1953,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 })
                 failed += 1
                 log_event(
-                    "channel_download_item", channel_id=channel_id,
+                    "channel_download_item", channel_id=canonical_channel_id,
+                    requested_channel=requested_channel,
                     slug=slug, video_id=vid_id, status="failed",
                     error=f"{type(e).__name__}: {e}",
                 )
@@ -1812,7 +2062,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         command="channel-download",
         status=status,
         data={
-            "channel_id": channel_id,
+            "channel_id": canonical_channel_id,
+            "requested_channel": requested_channel,
             "channel": info,
             "slug": slug,
             "enumerated": len(all_videos),
@@ -1835,7 +2086,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         outcome,
         topic=None,
         data={
-            "channel_id": channel_id,
+            "channel_id": canonical_channel_id,
+            "requested_channel": requested_channel,
             "slug": slug,
             "enumerated": len(all_videos),
             "selected": len(to_download),
@@ -2157,7 +2409,12 @@ def download(
             },
         )
         _render_download(outcome)
-        raise
+        _command_error(
+            str(error),
+            command="download",
+            error_type=type(error).__name__,
+            stage="download",
+        )
     except Exception as error:
         outcome = CommandResult.failed(
             "download",
@@ -2185,7 +2442,12 @@ def download(
             },
         )
         _render_download(outcome)
-        raise
+        _command_error(
+            str(error),
+            command="download",
+            error_type=type(error).__name__,
+            stage="download",
+        )
 
     summary = dict(summary or {})
     selected = int(summary.get("selected", 0))

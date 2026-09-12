@@ -29,6 +29,8 @@ from typing import (
     Union,
 )
 
+from .redaction import redact_sensitive_text, redact_sensitive_value
+
 RESULT_SCHEMA = "filmot.result/v1"
 EVENT_SCHEMA = "filmot.event/v1"
 LEGACY_CLAIM_SCHEMA = "filmot.claim/v1"
@@ -80,6 +82,82 @@ class SearchResultData(TypedDict, total=False):
     results_returned: int
     duplicates_skipped: int
     page_error: str
+
+
+class YouTubeRequestData(TypedDict, total=False):
+    """Credential-free effective request sent to YouTube discovery."""
+
+    query: str
+    requested_at: str
+    published_after: Optional[str]
+    published_before: Optional[str]
+    days: int
+    order: str
+    max_results: int
+    max_pages: int
+    page_token: Optional[str]
+    result_budget: int
+    page_budget: int
+    initial_page_token: Optional[str]
+    timeout: Dict[str, float]
+    retries: int
+    filters: Dict[str, Any]
+
+
+class YouTubeCoverageData(TypedDict, total=False):
+    """Token-pagination and quota-call accounting for direct discovery."""
+
+    pages_fetched: int
+    candidates_fetched: int
+    unique_candidates: int
+    unique_results: int
+    returned: int
+    approximate_total: Optional[int]
+    next_page_token: Optional[str]
+    stopping_reason: str
+    search_calls: int
+    detail_calls: int
+    api_calls: int
+    duplicates_skipped: int
+    malformed_items_skipped: int
+    page_info: Dict[str, Optional[int]]
+    partial: bool
+
+
+class YouTubeEnrichmentData(TypedDict, total=False):
+    """Best-effort videos.list metadata observation state."""
+
+    status: str
+    requested: int
+    requested_count: int
+    returned: int
+    matched_count: int
+    missing_count: int
+    api_calls: int
+    batches_completed: int
+    missing_video_ids: List[str]
+    unprocessed_video_ids: List[str]
+    observed_at: Optional[str]
+    expires_at: Optional[str]
+    error: Optional[Dict[str, Any]]
+    partial: bool
+
+
+class YouTubeSearchResultData(TypedDict, total=False):
+    """Direct YouTube discovery outcome shared by CLI and ledger."""
+
+    query: str
+    videos: List[Dict[str, Any]]
+    days: int
+    max_results: int
+    order: str
+    filters: Dict[str, Any]
+    request: YouTubeRequestData
+    coverage: YouTubeCoverageData
+    enrichment: YouTubeEnrichmentData
+    transcript: bool
+    transcript_query: Optional[str]
+    show_description: bool
 
 
 class TranscriptResultData(TypedDict, total=False):
@@ -262,7 +340,7 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_json_value(item) for item in value]
     if isinstance(value, Exception):
-        return str(value)
+        return redact_sensitive_text(value)
     return value
 
 
@@ -275,6 +353,14 @@ class ErrorDetail:
     stage: Optional[str] = None
     details: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "message", redact_sensitive_text(self.message))
+        object.__setattr__(
+            self,
+            "details",
+            redact_sensitive_value(dict(self.details)),
+        )
+
     @classmethod
     def from_exception(
         cls,
@@ -285,7 +371,7 @@ class ErrorDetail:
     ) -> "ErrorDetail":
         return cls(
             type=type(error).__name__,
-            message=str(error),
+            message=redact_sensitive_text(error),
             stage=stage,
             details=dict(details or {}),
         )

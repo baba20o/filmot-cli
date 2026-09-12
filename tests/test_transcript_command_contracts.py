@@ -548,6 +548,147 @@ def test_channel_download_already_synced_shares_aggregate_and_keeps_start_event(
     )
 
 
+def test_channel_download_renders_unknown_counts_and_keeps_resolution_provenance(
+    runner,
+    tmp_path,
+):
+    requested_channel = "@Requested.Handle"
+    canonical_channel_id = "UC1234567890123456789012"
+    downloader = MagicMock()
+    channel_dir = Path(tmp_path) / "example"
+    downloader._resolve_channel_dir.return_value = ("example", channel_dir)
+    downloader._load_manifest.return_value = {"videos": {}}
+    info = {
+        "channel_id": canonical_channel_id,
+        "name": "Example",
+        "video_count": None,
+        "subscriber_count": None,
+        "uploads_playlist_id": "uploads",
+    }
+    with (
+        patch(
+            "filmot.channel_dl.ChannelDownloader",
+            return_value=downloader,
+        ),
+        patch("filmot.channel_dl.get_channel_info", return_value=info),
+        patch("filmot.channel_dl.list_all_video_ids", return_value=[]),
+        patch("filmot.ledger.log_event") as mock_log_event,
+        patch("filmot.ledger.log_result") as mock_log_result,
+        patch(
+            "filmot.commands.transcript._render_channel_download"
+        ) as mock_renderer,
+    ):
+        result = runner.invoke(cli, ["channel-download", requested_channel])
+
+    assert result.exit_code == 0, result.output
+    assert f"Channel ID: {canonical_channel_id}" in result.output
+    assert f"Requested as: {requested_channel}" in result.output
+    assert "Videos: unknown" in result.output
+    assert "Subscribers: unknown" in result.output
+
+    outcome = _shared_outcome(mock_log_result, mock_renderer)
+    assert outcome.data["channel_id"] == canonical_channel_id
+    assert outcome.data["requested_channel"] == requested_channel
+    assert mock_log_result.call_args.kwargs["data"]["channel_id"] == (
+        canonical_channel_id
+    )
+    assert mock_log_result.call_args.kwargs["data"]["requested_channel"] == (
+        requested_channel
+    )
+
+    start = next(
+        call for call in mock_log_event.call_args_list
+        if call.args[0] == "channel_download_start"
+    )
+    assert start.kwargs["channel_id"] == requested_channel
+    assert start.kwargs["requested_channel"] == requested_channel
+
+    saved_manifest = downloader._save_manifest.call_args.args[1]
+    assert saved_manifest["channel"]["channel_id"] == canonical_channel_id
+    assert saved_manifest["requested_channel"] == requested_channel
+
+
+def test_channel_download_persists_canonical_identity_for_handle_input(
+    runner,
+    tmp_path,
+):
+    requested_channel = "@Requested.Handle"
+    canonical_channel_id = "UC1234567890123456789012"
+    channel_dir = Path(tmp_path) / "example"
+    downloader = MagicMock()
+    downloader._resolve_channel_dir.return_value = ("example", channel_dir)
+    downloader._load_manifest.return_value = {"videos": {}}
+    info = {
+        "channel_id": canonical_channel_id,
+        "name": "Example",
+        "video_count": 1,
+        "subscriber_count": 12,
+        "uploads_playlist_id": "uploads",
+    }
+    videos = [{
+        "video_id": "video-one",
+        "title": "Video",
+        "published_at": "2026-01-01T00:00:00Z",
+    }]
+    transcript = {
+        "language": "en",
+        "is_generated": False,
+        "duration_seconds": 5.0,
+        "segment_count": 1,
+        "full_text": "two words",
+        "segments": [{"start": 0.0, "duration": 5.0, "text": "two words"}],
+        "route": "direct",
+    }
+    with (
+        patch(
+            "filmot.channel_dl.ChannelDownloader",
+            return_value=downloader,
+        ),
+        patch("filmot.channel_dl.get_channel_info", return_value=info),
+        patch("filmot.channel_dl.list_all_video_ids", return_value=videos),
+        patch("filmot.transcript.get_transcript", return_value=transcript),
+        patch("filmot.transcript.routing_plan", return_value=_route_plan()),
+        patch("filmot.transcript.describe_routing_plan", return_value="direct"),
+        patch("filmot.ledger.log_event") as mock_log_event,
+        patch("filmot.ledger.log_result") as mock_log_result,
+        patch(
+            "filmot.commands.transcript._render_channel_download"
+        ) as mock_renderer,
+    ):
+        result = runner.invoke(
+            cli,
+            ["channel-download", requested_channel, "--delay", "0"],
+        )
+
+    assert result.exit_code == 0, result.output
+    outcome = _shared_outcome(mock_log_result, mock_renderer)
+    assert outcome.status_value == ResultStatus.COMPLETED.value
+    assert outcome.data["channel_id"] == canonical_channel_id
+    assert outcome.data["requested_channel"] == requested_channel
+
+    transcript_payload = downloader._save_transcript.call_args.args[2]
+    assert transcript_payload["channel_id"] == canonical_channel_id
+    assert transcript_payload["requested_channel"] == requested_channel
+
+    saved_manifest = downloader._save_manifest.call_args.args[1]
+    assert saved_manifest["channel"]["channel_id"] == canonical_channel_id
+    assert saved_manifest["requested_channel"] == requested_channel
+
+    item_event = next(
+        call for call in mock_log_event.call_args_list
+        if call.args[0] == "channel_download_item"
+        and call.kwargs["status"] == "saved"
+    )
+    assert item_event.kwargs["channel_id"] == canonical_channel_id
+    assert item_event.kwargs["requested_channel"] == requested_channel
+    assert mock_log_result.call_args.kwargs["data"]["channel_id"] == (
+        canonical_channel_id
+    )
+    assert mock_log_result.call_args.kwargs["data"]["requested_channel"] == (
+        requested_channel
+    )
+
+
 def test_channel_download_all_failed_preserves_item_event_and_nonzero_exit(
     runner,
     tmp_path,

@@ -10,6 +10,7 @@ from rich.console import Console
 
 from filmot.cli import cli
 from filmot.ledger import (
+    SESSION_PROVENANCE_ROW_LIMIT,
     SESSION_SEARCH_CHANNEL_LIMIT,
     SESSION_SEARCH_FILTER_CHARS,
     summarize_events,
@@ -29,6 +30,39 @@ def search_event(**scope):
             "post_filter_count": 5,
             **scope,
         },
+    }
+
+
+def youtube_event(**overrides):
+    data = {
+        "query": "fresh battery research",
+        "request": {
+            "query": "fresh battery research",
+            "requested_at": "2026-09-06T12:00:00Z",
+            "published_after": "2026-09-01T12:00:00Z",
+            "published_before": "2026-09-06T12:00:00Z",
+            "days": 5,
+            "order": "date",
+            "max_results": 75,
+            "filters": {"region": "US", "caption": "closedCaption"},
+        },
+        "coverage": {
+            "pages_fetched": 2,
+            "candidates_fetched": 75,
+            "returned": 72,
+            "approximate_total": 900,
+            "next_page_token": "continuation-token",
+            "stopping_reason": "result_limit",
+        },
+        "enrichment": {"status": "partial"},
+        "results": 72,
+    }
+    data.update(overrides)
+    return {
+        "kind": "yt-search",
+        "status": "partial",
+        "ts": "2026-09-06T12:00:00",
+        "data": data,
     }
 
 
@@ -81,6 +115,65 @@ def test_identical_queries_keep_distinct_recorded_scopes_in_raw_summary(monkeypa
         {"title": "agent", "channel_id": None, "lang": "en"},
         {"title": None, "channel_id": "UCexample", "lang": "en"},
     ]
+
+
+def test_direct_youtube_searches_have_a_separate_bounded_universe():
+    events = [search_event()]
+    events.extend(
+        youtube_event(query="fresh {}".format(index))
+        for index in range(SESSION_PROVENANCE_ROW_LIMIT + 3)
+    )
+
+    summary = summarize_events("investigation", events)
+    direct = summary["youtube_searches"]
+
+    assert summary["searches"]["events"] == 1
+    assert summary["searches"]["candidate_fetches"] == 10
+    assert direct["events"] == SESSION_PROVENANCE_ROW_LIMIT + 3
+    assert direct["shown"] == SESSION_PROVENANCE_ROW_LIMIT
+    assert direct["omitted"] == 3
+    assert direct["candidate_fetches"] == 75 * (
+        SESSION_PROVENANCE_ROW_LIMIT + 3
+    )
+    assert direct["returned_results"] == 72 * (
+        SESSION_PROVENANCE_ROW_LIMIT + 3
+    )
+    row = direct["scope_rows"][-1]
+    assert row["published_after"] == "2026-09-01T12:00:00Z"
+    assert row["published_before"] == "2026-09-06T12:00:00Z"
+    assert row["pages_fetched"] == 2
+    assert row["continuation_available"] is True
+    assert row["enrichment_status"] == "partial"
+    assert row["effective_filters"] == {
+        "region": "US",
+        "caption": "closedCaption",
+    }
+    assert "never added" in direct["counting_note"]
+
+
+def test_legacy_youtube_event_is_summarized_without_inventing_bounds_or_secrets():
+    event = youtube_event()
+    event["data"] = {
+        "query": "legacy",
+        "days": 7,
+        "order": "relevance",
+        "max_results": 25,
+        "results": 4,
+        "region": "GB",
+        "key": "must-not-enter-summary",
+    }
+
+    row = summarize_events("legacy", [event])["youtube_searches"][
+        "scope_rows"
+    ][0]
+
+    assert row["query"] == "legacy"
+    assert row["days"] == 7
+    assert row["published_after"] is None
+    assert row["approximate_total"] is None
+    assert row["returned"] == 4
+    assert row["effective_filters"] == {"region": "GB"}
+    assert "must-not-enter-summary" not in json.dumps(row)
 
 
 def test_legacy_rows_do_not_gain_invented_default_filters():
@@ -177,6 +270,34 @@ def test_human_summary_shows_filters_as_literal_text_and_reports_missing_scope(m
     assert '2. Scope: channel_id="UCexample"; manual_subs=true' in text
     assert "3. Scope: Filters not recorded" in text
     assert "Truncated fields: title. Replay the session for full values." in text
+
+
+def test_human_summary_labels_direct_youtube_scope_separately(monkeypatch):
+    module = importlib.import_module("filmot.commands.library")
+    output = io.StringIO()
+    monkeypatch.setattr(
+        module,
+        "console",
+        Console(file=output, width=220, color_system=None),
+    )
+    module._render_sessions(CommandResult(
+        command="sessions",
+        status=ResultStatus.COMPLETED,
+        data={
+            "name": "investigation",
+            "summary": summarize_events(
+                "investigation", [search_event(), youtube_event()]
+            ),
+        },
+    ))
+
+    text = output.getvalue()
+    assert "Direct YouTube searches: 1 (1 unique queries)" in text
+    assert "Direct YouTube search universes" in text
+    assert "2026-09-01T12:00:00Z" in text
+    assert "2026-09-06T12:00:00Z" in text
+    assert "region=\"US\"" in text
+    assert "Standalone search universes" in text
 
 
 def test_filter_projection_ignores_unknown_and_non_scalar_payloads():

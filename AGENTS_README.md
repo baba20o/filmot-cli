@@ -10,7 +10,11 @@
 
 ## What This Tool Does
 
-Filmot CLI searches **YouTube transcripts** (not titles, not descriptions—the actual spoken words in videos). This is incredibly powerful because:
+Filmot CLI's indexed `search` and `research` paths search **YouTube
+transcripts**—the actual spoken words, not merely titles or descriptions.
+Direct `yt-search` is a separate recent-upload metadata discovery path; it
+attaches transcript matches only when `--transcript` is requested. The indexed
+transcript search is powerful because:
 
 1. You can find discussions that aren't in video titles
 2. You get the exact context of what was said
@@ -21,7 +25,8 @@ Filmot CLI searches **YouTube transcripts** (not titles, not descriptions—the 
 7. You can keep a strict claim/evidence register with explicit human assessments
 8. You can route follow-up searches into named, resumable investigation sessions
 
-**Think of it as:** Google for what people *say* in YouTube videos.
+**Think of it as:** Google for what people *say* in YouTube videos, with direct
+YouTube discovery available when the transcript index has not caught up yet.
 
 ---
 
@@ -640,9 +645,13 @@ Partial runs therefore retain enough state to inspect completed work and resume
 deliberately.
 
 `--summary` folds one named session while keeping unlike universes separate:
-standalone-search API/fetched/post-filter counts, staged research-search counts
-after their explicit gates, selected-download and probe outcomes, unique saved
-transcripts, failed attempts and unique failed videos, and claim mutations. A
+standalone Filmot-search API/fetched/post-filter counts, direct YouTube search
+universes, staged research-search counts after their explicit gates,
+selected-download and probe outcomes, unique saved transcripts, failed
+attempts and unique failed videos, and claim mutations. Direct YouTube rows
+stay separate from Filmot totals and record their exact UTC bounds, order,
+cap, filters, pages, fetched/returned counts, enrichment/partial state,
+stopping reason, and continuation availability. A
 bounded provenance view links scout gates, probe queries, and saved sources to
 their discovery stage/query; older probe downloads without that field say
 `query not recorded` instead of guessing. Successful manual
@@ -694,7 +703,8 @@ therefore deliberately absent from this project ledger.
 
 ## Pipeline Mode
 
-For advanced workflows, pipe search results into the download command:
+For advanced workflows, pipe Filmot or direct YouTube discovery results into
+the same download command:
 
 ```bash
 # Search with raw output, pipe to download
@@ -706,7 +716,36 @@ filmot search-all "AI safety" --pages 5 --output results.json --format json
 filmot download -t ai-safety --dedupe -n 20 < results.json
 # PowerShell:
 Get-Content -Raw results.json | filmot download -t ai-safety --dedupe -n 20
+
+# Fresh YouTube discovery is accepted unchanged
+filmot yt-search "fresh AI safety" --pages 2 --max-results 75 --raw \
+  | filmot download -t ai-safety -n 20
 ```
+
+The provider-neutral boundary accepts bare candidate arrays and
+`result`/`videos`/`items` envelopes, normalizes Filmot and YouTube aliases, and
+preflights the complete input before any transcript request or library write.
+Missing, malformed, or conflicting identities reject the batch; zero-valued
+counters remain observed zeroes and unknown values remain null. Unknown native
+fields survive only in a bounded, credential-scrubbed `provider_fields`
+mapping.
+
+For one selected video, preserve the exact discovery handoff explicitly:
+
+```bash
+filmot yt-search "fresh topic" --raw > discovery.json
+filmot transcript VIDEO_ID --save-to TOPIC --discovery discovery.json
+```
+
+`--discovery` selects exactly one matching ID, hashes the supplied bytes into
+a `sha256:` discovery reference, and never infers metadata from adjacent
+session history. New records keep the supplied metadata. Existing records use
+atomic fill-only enrichment: missing/`Unknown` fields can be filled, known
+values and observed zeroes are never replaced, conflicts are reported, and a
+repeat is a no-op. Transcript text, caption segments, `saved_at`, acquisition,
+citations, and unrelated fields stay unchanged. This route currently still
+acquires the transcript before its existing-record check; there is no
+metadata-only refresh command yet.
 
 ---
 
@@ -961,18 +1000,37 @@ filmot library context brain-computer-interfaces --format structured
 # research command auto-scouts YouTube for latest uploads
 filmot research "TOPIC" --scout-days 3 --depth 10
 
-# Or manually: reproduce the scout first, then use Filmot for transcript depth
+# Or manually: preserve a reusable discovery artifact, then search Filmot depth
 filmot yt-search "TOPIC" --days 3 --max-results 10 \
-  --order relevance --show-description --raw
+  --order relevance --show-description --raw > discovery.json
 filmot search 'TOPIC' --start-date 2026-01-01 --end-date 2026-02-01 --full --lang en
-filmot transcript VIDEO_ID --full
+filmot transcript VIDEO_ID --save-to TOPIC --discovery discovery.json
 ```
 
 **Key insight:** Filmot indexes transcripts ~24-48 hours after upload. For same-day events, `yt-search` (YouTube Data API) finds videos that Filmot can't see yet. The `research` command's `--scout` phase handles this automatically. If you're investigating something that happened today, always start with `yt-search` or use `--scout-days 1`.
 
-Direct `yt-search` defaults to date order and 25 results; the research scout
-uses and records relevance order with 10. `yt-search --raw` returns one
-`filmot.result/v1` object with `videos`. Add `--transcript` (and optionally
+Direct `yt-search` defaults to the last 7 days, date order, 25 distinct
+results, one page, and public metadata enrichment; an explicit
+`--published-after` replaces that relative lower bound. The research scout uses
+and records relevance order with 10. Widen explicitly with `--pages` (maximum 10) and
+`--max-results` (maximum 500), or resume an opaque continuation with
+`--page-token`. Each page is another search quota call. Exact RFC3339
+`--published-after`/`--published-before` values freeze the time scope;
+relative `--days` does not. A date-only `--published-before` includes that UTC
+date by sending the next UTC midnight because the API upper bound is exclusive.
+Replay a continuation token only with the exact emitted bounds and filters.
+
+`yt-search --raw` returns one `filmot.result/v1` object with `videos`, the
+credential-free effective `request`, `coverage`, and optional `enrichment`.
+Treat the API total as approximate and use the recorded `next_page_token` and
+`stopping_reason`, not that total, for coverage decisions. A first-page failure
+fails; a later-page or optional detail failure preserves earlier discovery and
+returns `partial`. Missing counters are null, not zero. Enriched metadata is a
+time-stamped observation with a 30-day expiry; Filmot does not automatically
+refresh/delete exported JSON or persisted provider fields, so the operator
+must do so. See [YouTube Data API behavior](YOUTUBE_API.md).
+
+Add `--transcript` (and optionally
 `--transcript-query`) to attach the same per-video `transcript_search` object to
 each video in human and raw mode: `query`, `status`, `match_count`, `matches`,
 and available language/generation metadata. The transcript query is a
@@ -998,11 +1056,16 @@ using automatic scout/probe frontier records as new seeds.
 
 ### Pattern 3b: Channel Corpus Mining (Deep Knowledge Base)
 
-Download an entire channel's transcripts and mine them offline. This is the most powerful approach when a single channel is a rich source of domain knowledge (e.g., 300+ episodes of a trading podcast).
+Enumerate a channel's uploads playlist, download available transcripts, and
+mine that local corpus offline. Private/deleted videos, unavailable captions,
+malformed playlist rows, and later upstream changes can leave gaps.
 
 ```bash
-# 1. Download the full channel (runs in parallel, resumable)
-filmot channel-download "Chat With Traders" --workers 4
+# 1. Enumerate uploads and download available transcripts (parallel/resumable)
+filmot channel-download @exact_handle --workers 4
+# Equivalent exact forms: a 24-character UC... ID or canonical
+# https://[www.]youtube.com/channel/UC... or
+# https://[www.]youtube.com/@handle URL
 
 # 2. Check status
 filmot channel-status
@@ -1018,10 +1081,23 @@ filmot channel-search excess-returns "blew up"
 filmot channel-search excess-returns '"risk management" NEAR/10 "position sizing"'
 ```
 
+`channel-download` does not resolve arbitrary display names. `/c/` and
+`/user/` URLs and URLs with query/fragment components are rejected too. If you
+only know a name, run `filmot channels "display name"`, inspect the returned
+identity, and pass its exact `UC...` ID or `@handle`. The command records the
+requested reference separately from the resolved canonical channel ID.
+
+Enumeration uses the channel's uploads playlist, retains available playlist,
+owner, publication, privacy, locale, statistics, and topic metadata, and
+guards repeated page tokens. `--limit` applies after the uploads playlist has
+been enumerated; it is not a YouTube API page budget. Channel observations get
+30-day `observed_at`/`expires_at` timestamps, but current manifests have no
+automatic expiry refresh/purge.
+
 **Proximity terms match whole words.** `"account"` will not match "accounts" or "accountability" — add explicit alternatives for inflections: `("account" | "accounts")`. Terms must be double-quoted; unquoted operands like `risk NEAR/10 position` are rejected with an error explaining the supported forms.
 
 **When to use this over `filmot search`:**
-- You want to mine a **specific channel** exhaustively (not just videos that match a query)
+- You want to mine a **specific channel's downloaded corpus broadly** (not just videos that match a query)
 - You need **offline search** — no API calls, no rate limits, no quota
 - You want **cross-channel comparisons** — run the same query across different corpora
 - You're building a knowledge base for an agent to reason over
@@ -1068,6 +1144,24 @@ Use AWS Transcribe fallback:
 filmot transcript VIDEO_ID --fallback --full
 ```
 Requires: `yt-dlp`, `boto3`, `requests`, and AWS profile `APIBoss` configured.
+
+### Direct YouTube API failures and credentials
+
+`yt-search` defaults to a 5-second connect timeout, a 20-second read timeout,
+and two retries for transient network/timeout/server/rate-limit failures. Use
+`--connect-timeout`, `--read-timeout`, and `--retries` to make each request
+tighter. There is not yet one wall-clock deadline across every page and detail
+batch. Authentication, invalid-request, and ordinary quota errors fail without
+retrying. A failure after a usable page, or during optional enrichment,
+preserves candidate rows and is typed `partial`.
+
+Keep `YOUTUBE_API_KEY` in the process environment, per-user `config.env`, or
+project `.env`, and restrict it in Google Cloud. Provider/transport errors,
+typed outcomes, candidate extras, and session events scrub common credential
+fields and URL parameters; native request/response objects that could retain a
+key are not propagated. This boundary is defense in depth—never put secrets in
+queries, titles, notes, or committed artifacts, and rotate a key if exposure is
+suspected.
 
 ### IP Blocked
 YouTube may block your IP for transcript requests:
@@ -1136,9 +1230,11 @@ use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
   keys and add `_filmot` metadata (`schema`, `command`, `status`, `errors`,
   `warnings`). Library list/search/compare use `rows`; local search and compare
   rows include citation details, with timestamps and deep links when saved
-  segments exist. `yt-search` uses `videos`; with `--transcript`, every video
-  carries the shared `transcript_search` outcome and per-video failures make
-  the top-level result `partial`. `transcript --grep --raw` returns stable
+  segments exist. `yt-search` uses `videos` plus effective `request`,
+  token/call `coverage`, and `enrichment`; later-page or optional-detail
+  failures preserve video rows and make the top-level result `partial`. With
+  `--transcript`, every video carries the shared `transcript_search` outcome
+  and per-video failures are partial too. `transcript --grep --raw` returns stable
   seconds/timestamp/link/excerpt match rows, typed `empty` misses, and typed
   preflight parse failures. `library echoes` adds `clusters`, `method`, and
   `artifact_hash`. Claim commands use `rows`, and all four accept `--raw`.
@@ -1164,7 +1260,7 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Preview initial research scope** | `filmot research "topic" --no-scout --depth 0` |
 | **Deep discovery research** | `filmot research "topic" --probe --depth 12 --dedupe` |
 | **Breaking news research** | `filmot research "topic" --scout-days 3 --depth 10` |
-| **Search latest YouTube uploads** | `filmot yt-search "topic" --days 7 --order relevance` |
+| **Search latest YouTube uploads** | `filmot yt-search "topic" --days 7 --pages 2 --max-results 75 --raw` |
 | **Named follow-up search** | `filmot search "query" --session TOPIC` |
 | **Locate a phrase across sources** | `filmot library compare "claim phrase" --sort density` |
 | **Raw local citations** | `filmot library compare "claim phrase" --topic TOPIC --raw` |
@@ -1183,6 +1279,7 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Get transcript** | `filmot transcript VIDEO_ID --full` |
 | **Search one transcript** | `filmot transcript VIDEO_ID --grep '"term A" NEAR/15 "term B"'` |
 | **Save to library** | `filmot transcript VIDEO_ID --full --save-to TOPIC` |
+| **Save with discovery metadata** | `filmot transcript VIDEO_ID --save-to TOPIC --discovery discovery.json` |
 | **Bulk download (dedupe)** | `filmot search "query" --bulk-download TOPIC:10 --dedupe` |
 | **Pipeline download** | `filmot search "query" --raw \| filmot download -t TOPIC --dedupe` |
 | **List library** | `filmot library list` |
@@ -1199,7 +1296,7 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Search Hindi** | `filmot search "कृत्रिम बुद्धिमत्ता" --lang hi --full` |
 | **Search Russian** | `filmot search "нейросеть" --lang ru --full` |
 | **Limit search output** | `filmot search "query" --limit 20 --max-hits 5` |
-| **Download channel corpus** | `filmot channel-download "Channel Name" --workers 4` |
+| **Download channel corpus** | `filmot channel-download @exact_handle --workers 4` |
 | **Check channel status** | `filmot channel-status` |
 | **Search channel corpus** | `filmot channel-search SLUG "query"` |
 | **Proximity search (channel)** | `filmot channel-search SLUG '"A" NEAR/10 "B"'` |

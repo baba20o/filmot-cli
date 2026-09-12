@@ -1624,6 +1624,7 @@ def _render_sessions(
     summary = data.get("summary")
     if isinstance(summary, dict):
         searches = summary.get("searches") or {}
+        youtube_searches = summary.get("youtube_searches") or {}
         research_searches = summary.get("research_searches") or {}
         transcripts = summary.get("transcripts") or {}
         research = summary.get("research") or {}
@@ -1639,6 +1640,8 @@ def _render_sessions(
             Panel(
                 "Events: {events}\n"
                 "Standalone searches: {searches} ({queries} unique queries)\n"
+                "Direct YouTube searches: {youtube_searches} "
+                "({youtube_queries} unique queries)\n"
                 "Research search stages: {research_stages}\n"
                 "Saved transcripts: {saved} unique\n"
                 "Transcript failures: {attempts} attempts / {failed} unique videos\n"
@@ -1652,6 +1655,10 @@ def _render_sessions(
                     events=summary.get("event_count", 0),
                     searches=searches.get("events", 0),
                     queries=len(searches.get("unique_queries") or []),
+                    youtube_searches=youtube_searches.get("events", 0),
+                    youtube_queries=len(
+                        youtube_searches.get("unique_queries") or []
+                    ),
                     research_stages=research_searches.get("stages", 0),
                     saved=transcripts.get("saved_unique", 0),
                     attempts=transcripts.get("failed_attempts", 0),
@@ -1721,6 +1728,66 @@ def _render_sessions(
                         ),
                         style="dim",
                     ))
+        youtube_scope_rows = youtube_searches.get("scope_rows") or []
+        if youtube_scope_rows:
+            table = Table(title="Direct YouTube search universes")
+            table.add_column("#", justify="right")
+            table.add_column("Query", max_width=38)
+            table.add_column("UTC publication window", max_width=39)
+            table.add_column("Pages", justify="right")
+            table.add_column("Fetched", justify="right")
+            table.add_column("Returned", justify="right")
+            table.add_column("Enrichment")
+            table.add_column("Status")
+            for index, row in enumerate(youtube_scope_rows, 1):
+                after = row.get("published_after") or "-"
+                before = row.get("published_before") or "-"
+                table.add_row(
+                    str(index),
+                    Text(str(row.get("query", ""))),
+                    Text("{} .. {}".format(after, before)),
+                    str(row.get("pages_fetched", 0)),
+                    str(row.get("candidates_fetched", 0)),
+                    str(row.get("returned", 0)),
+                    str(row.get("enrichment_status") or "not recorded"),
+                    str(row.get("status", "")),
+                )
+            console.print(table)
+            for index, row in enumerate(youtube_scope_rows, 1):
+                details = [
+                    "order={}".format(row.get("order") or "not recorded"),
+                    "cap={}".format(
+                        row.get("max_results")
+                        if row.get("max_results") is not None
+                        else "not recorded"
+                    ),
+                    "stop={}".format(
+                        row.get("stopping_reason") or "not recorded"
+                    ),
+                    "continuation={}".format(
+                        "available"
+                        if row.get("continuation_available")
+                        else "none"
+                    ),
+                ]
+                filters = row.get("effective_filters")
+                if isinstance(filters, dict):
+                    details.extend(
+                        "{}={}".format(
+                            key, json_mod.dumps(value, ensure_ascii=False)
+                        )
+                        for key, value in filters.items()
+                        if value is not None and value != ""
+                    )
+                console.print(Text(
+                    "{}. Scope: {}".format(index, "; ".join(details))
+                ))
+            omitted = int(youtube_searches.get("omitted", 0) or 0)
+            if omitted:
+                console.print(
+                    "[dim]{} older direct YouTube search row(s) omitted from "
+                    "this bounded summary.[/dim]".format(omitted)
+                )
         research_scope_rows = research_searches.get("scope_rows") or []
         if research_scope_rows:
             table = Table(title="Research search universes (kept by stage)")

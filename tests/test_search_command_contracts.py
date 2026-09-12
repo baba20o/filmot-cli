@@ -8,6 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from filmot.cli import cli
+from filmot.commands.search import _youtube_cli_bound
 
 
 def _search_client(mock_client_type, response):
@@ -373,7 +374,7 @@ def test_yt_search_logs_and_renders_the_same_outcome():
     }]
     with (
         patch("filmot.youtube_search.validate_youtube_api"),
-        patch("filmot.youtube_search.search_recent", return_value=videos),
+        patch("filmot.youtube_search.search_recent_detailed", return_value=videos),
         patch("filmot.ledger.log_result") as log_result,
         patch(
             "filmot.commands.search._render_yt_search_result"
@@ -407,7 +408,7 @@ def test_yt_search_raw_emits_the_logged_candidate_set_and_effective_request():
     with (
         patch("filmot.youtube_search.validate_youtube_api"),
         patch(
-            "filmot.youtube_search.search_recent",
+            "filmot.youtube_search.search_recent_detailed",
             return_value=videos,
         ) as search_recent,
         patch("filmot.ledger.log_result") as log_result,
@@ -452,6 +453,157 @@ def test_yt_search_raw_emits_the_logged_candidate_set_and_effective_request():
     renderer.assert_not_called()
 
 
+def test_yt_search_propagates_native_provider_scope_and_partial_error():
+    videos = [{
+        "video_id": "video-id",
+        "title": "Recent result",
+        "channel_title": "Channel",
+        "published_at": "2026-07-25T00:00:00Z",
+        "views": None,
+        "duration": None,
+        "metadata_status": "enrichment_failed",
+    }]
+    provider = {
+        "provider": "youtube-data-api-v3",
+        "videos": videos,
+        "request": {
+            "query": "alpha",
+            "requested_at": "2026-07-26T00:00:00Z",
+            "published_after": "2026-07-23T00:00:00Z",
+            "published_before": "2026-07-26T00:00:00Z",
+            "days": 3,
+            "max_results": 75,
+            "max_pages": 2,
+            "page_token": "START",
+        },
+        "coverage": {
+            "pages_fetched": 2,
+            "candidates_fetched": 1,
+            "returned": 1,
+            "approximate_total": 500,
+            "next_page_token": "NEXT",
+            "stopping_reason": "page_budget",
+            "partial": True,
+        },
+        "enrichment": {
+            "status": "failed",
+            "requested": 1,
+            "returned": 0,
+            "partial": True,
+        },
+        "warnings": ["Optional metadata enrichment failed."],
+        "errors": [{
+            "stage": "enrichment",
+            "type": "YouTubeAPIError",
+            "message": "YouTube API timeout error (timeout)",
+            "category": "timeout",
+            "reason": "timeout",
+            "attempts": 3,
+        }],
+    }
+    with (
+        patch("filmot.youtube_search.validate_youtube_api"),
+        patch(
+            "filmot.youtube_search.search_recent_detailed",
+            return_value=provider,
+        ) as search_recent,
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "yt-search", "alpha", "--days", "3", "--max-results", "75",
+                "--pages", "2", "--page-token", "START",
+                "--published-before", "2026-07-25", "--paid-promotion", "true",
+                "--connect-timeout", "2", "--read-timeout", "8",
+                "--retries", "1", "--raw",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["videos"] == videos
+    assert payload["request"] == provider["request"]
+    assert payload["coverage"] == provider["coverage"]
+    assert payload["enrichment"] == provider["enrichment"]
+    assert payload["_filmot"]["status"] == "partial"
+    assert payload["_filmot"]["warnings"] == provider["warnings"]
+    assert payload["_filmot"]["errors"][0]["stage"] == "enrichment"
+    assert payload["_filmot"]["errors"][0]["details"]["category"] == "timeout"
+    request_kwargs = search_recent.call_args.kwargs
+    assert request_kwargs["max_pages"] == 2
+    assert request_kwargs["page_token"] == "START"
+    assert request_kwargs["published_before"] == "2026-07-26T00:00:00Z"
+    assert request_kwargs["video_paid_product_placement"] == "true"
+    assert request_kwargs["timeout"] == (2.0, 8.0)
+    assert request_kwargs["retries"] == 1
+    event = log_result.call_args.kwargs["data"]
+    assert event["coverage"] == provider["coverage"]
+    assert event["enrichment"] == provider["enrichment"]
+    assert event["next_page_token"] == "NEXT"
+    assert event["partial"] is True
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        "not-an-object",
+        {"videos": "not-a-list"},
+        {"videos": ["not-an-object"]},
+        {"videos": [], "coverage": []},
+        {"videos": [], "warnings": {}},
+        {"videos": [], "errors": ["not-an-object"]},
+    ],
+)
+def test_yt_search_rejects_malformed_provider_envelopes(provider):
+    with (
+        patch("filmot.youtube_search.validate_youtube_api"),
+        patch(
+            "filmot.youtube_search.search_recent_detailed",
+            return_value=provider,
+        ),
+        patch("filmot.ledger.log_event") as log_event,
+    ):
+        result = CliRunner().invoke(
+            cli, ["yt-search", "alpha", "--raw"],
+        )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["status"] == "failed"
+    assert payload["_filmot"]["errors"][0]["stage"] == "invalid-response"
+    assert log_event.call_count == 1
+    assert log_event.call_args.kwargs["failure_stage"] == "invalid-response"
+
+
+def test_yt_search_human_renderer_tolerates_sparse_legacy_rows():
+    with (
+        patch("filmot.youtube_search.validate_youtube_api"),
+        patch(
+            "filmot.youtube_search.search_recent_detailed",
+            return_value=[{"video_id": "video-id"}],
+        ),
+        patch("filmot.ledger.log_result"),
+    ):
+        result = CliRunner().invoke(cli, ["yt-search", "alpha"])
+
+    assert result.exit_code == 0, result.output
+    assert "Untitled video" in result.output
+    assert "Unknown channel" in result.output
+    assert "Views: unknown | Duration: unknown" in result.output
+
+
+def test_youtube_cli_date_bounds_honor_exclusive_published_before():
+    assert _youtube_cli_bound("2026-07-25", end_of_day=False) == (
+        "2026-07-25T00:00:00Z"
+    )
+    assert _youtube_cli_bound("2026-07-25", end_of_day=True) == (
+        "2026-07-26T00:00:00Z"
+    )
+    exact = "2026-07-25T23:59:59.999999Z"
+    assert _youtube_cli_bound(exact, end_of_day=True) == exact
+
+
 @pytest.mark.parametrize("raw", [False, True])
 def test_yt_search_transcript_search_is_shared_by_human_and_raw(raw):
     videos = [{
@@ -487,7 +639,7 @@ def test_yt_search_transcript_search_is_shared_by_human_and_raw(raw):
         arguments.append("--raw")
     with (
         patch("filmot.youtube_search.validate_youtube_api"),
-        patch("filmot.youtube_search.search_recent", return_value=videos),
+        patch("filmot.youtube_search.search_recent_detailed", return_value=videos),
         patch(
             "filmot.transcript.search_in_transcript",
             return_value=transcript_result,
@@ -519,7 +671,7 @@ def test_yt_search_raw_transcript_failure_is_typed_partial():
     videos = [{"video_id": "video-id", "title": "Recent result"}]
     with (
         patch("filmot.youtube_search.validate_youtube_api"),
-        patch("filmot.youtube_search.search_recent", return_value=videos),
+        patch("filmot.youtube_search.search_recent_detailed", return_value=videos),
         patch(
             "filmot.transcript.search_in_transcript",
             return_value={
@@ -553,7 +705,7 @@ def test_yt_search_raw_transcript_failure_is_typed_partial():
 def test_yt_search_raw_empty_is_a_successful_typed_result():
     with (
         patch("filmot.youtube_search.validate_youtube_api"),
-        patch("filmot.youtube_search.search_recent", return_value=[]),
+        patch("filmot.youtube_search.search_recent_detailed", return_value=[]),
         patch("filmot.ledger.log_result") as log_result,
     ):
         result = CliRunner().invoke(
@@ -585,7 +737,7 @@ def test_yt_search_raw_failure_is_one_typed_json_result(
 ):
     with (
         patch("filmot.youtube_search.validate_youtube_api") as validate,
-        patch("filmot.youtube_search.search_recent") as search_recent,
+        patch("filmot.youtube_search.search_recent_detailed") as search_recent,
         patch("filmot.ledger.log_event") as log_event,
     ):
         if failure_stage == "configuration":
@@ -616,7 +768,7 @@ def test_yt_search_raw_serialization_failure_is_the_logged_outcome():
     }]
     with (
         patch("filmot.youtube_search.validate_youtube_api"),
-        patch("filmot.youtube_search.search_recent", return_value=videos),
+        patch("filmot.youtube_search.search_recent_detailed", return_value=videos),
         patch("filmot.ledger.log_result") as log_result,
     ):
         result = CliRunner().invoke(

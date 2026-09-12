@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 from filmot.cli import cli
 from filmot.proxy_pool import redact_sensitive_text
+from filmot.schemas import ErrorDetail
 from filmot import youtube_search
 
 
@@ -75,6 +76,65 @@ class TestRedactSensitiveText:
         assert "SECRET1" not in redacted
         assert "SECRET2" not in redacted
         assert "other=keep-me" in redacted
+
+    def test_error_detail_redacts_message_and_nested_details(self):
+        leaking = (
+            "https://www.googleapis.com/youtube/v3/channels?part=snippet"
+            f"&key={DUMMY_API_KEY}"
+        )
+        detail = ErrorDetail.from_exception(
+            RuntimeError(leaking),
+            stage="channel-info",
+            details={"nested": [{"uri": leaking}]},
+        )
+
+        rendered = json.dumps(detail.to_dict())
+        assert DUMMY_API_KEY not in rendered
+        assert "key=***" in rendered
+
+    def test_error_detail_redacts_values_under_credential_field_names(self):
+        detail = ErrorDetail(
+            type="TransportError",
+            message="request failed",
+            details={
+                "api_key": DUMMY_API_KEY,
+                "headers": {"Authorization": "Bearer " + DUMMY_API_KEY},
+                "safe": "retained",
+            },
+        )
+
+        assert detail.to_dict()["details"] == {
+            "api_key": "***",
+            "headers": {"Authorization": "***"},
+            "safe": "retained",
+        }
+
+    def test_real_ledger_write_redacts_compact_data_and_errors(
+        self, tmp_path
+    ):
+        from filmot.ledger import log_event, read_events
+
+        leaking = (
+            "403 forbidden for "
+            "https://www.googleapis.com/youtube/v3/channels?"
+            f"part=snippet&key={DUMMY_API_KEY}"
+        )
+        log_event(
+            "yt-channel",
+            data_dir=tmp_path,
+            status="failed",
+            failure_stage="request",
+            error=leaking,
+            nested={"transport": leaking},
+        )
+
+        events = read_events(
+            __import__("datetime").date.today().isoformat(),
+            data_dir=tmp_path,
+        )
+        rendered = json.dumps(events)
+        assert DUMMY_API_KEY not in rendered
+        assert "key=***" in rendered
 
 
 class TestYoutubeSearchNativeBoundary:

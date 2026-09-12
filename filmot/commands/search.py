@@ -5,6 +5,7 @@ import json as json_mod
 import math
 import os
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -37,6 +38,7 @@ from ..schemas import (
     ResultStatus,
     SearchResultData,
     VideoResultData,
+    YouTubeSearchResultData,
 )
 
 
@@ -67,20 +69,6 @@ class SearchAllResultData(TypedDict, total=False):
     exported_path: Optional[str]
     format: str
     effective_filters: Dict[str, Any]
-
-
-class YouTubeSearchResultData(TypedDict, total=False):
-    """Recent YouTube discovery outcome and its effective presentation flags."""
-
-    query: str
-    videos: List[Dict[str, Any]]
-    days: int
-    max_results: int
-    order: str
-    filters: Dict[str, Any]
-    transcript: bool
-    transcript_query: Optional[str]
-    show_description: bool
 
 
 def _result_videos(results: dict) -> list:
@@ -1182,6 +1170,7 @@ def _bulk_download_transcripts(
     import hashlib
     from ..library import get_library
     from ..ledger import log_event
+    from ..discovery import normalize_candidates
     from ..transcript import (
         describe_routing_plan,
         get_transcript,
@@ -1192,7 +1181,10 @@ def _bulk_download_transcripts(
     # Parse bulk_download format: "topic:10" or just "topic".
     topic, max_count = _parse_bulk_download_spec(bulk_download)
 
-    videos = results.get("result", results.get("videos", results.get("items", [])))
+    # Normalize the complete batch before touching transcript routes or local
+    # storage. A malformed later row therefore cannot leave a partially
+    # mutated corpus, and unchanged ``yt-search --raw`` output is accepted.
+    videos = normalize_candidates(results)
 
     if not videos:
         console.print("[yellow]No videos to download.[/yellow]")
@@ -1241,9 +1233,9 @@ def _bulk_download_transcripts(
     console.print(f"\n[bold]Bulk downloading {len(videos_to_download)} transcripts to '{topic}'...[/bold]\n")
 
     for i, video in enumerate(videos_to_download, 1):
-        video_id = video.get("id") or video.get("videoid")
-        title = video.get("title", "Unknown")
-        channel = video.get("channelname", video.get("channeltitle", video.get("channel", "Unknown")))
+        video_id = video["video_id"]
+        title = video.get("title") or "Unknown"
+        channel = video.get("channel_title") or "Unknown"
 
         # Backfill missing metadata from Filmot video API
         title, channel = _backfill_metadata(video_id, title, channel)
@@ -1346,17 +1338,32 @@ def _bulk_download_transcripts(
                 continue
 
             # Save to library
+            provider_fields = video.get("provider_fields")
+            if not isinstance(provider_fields, dict):
+                provider_fields = {}
             metadata = {
                 "title": title,
                 "channel": channel,
-                "channel_id": video.get("channelid"),
-                "published_at": video.get("uploaddate"),
+                "channel_id": video.get("channel_id"),
+                "published_at": video.get("published_at"),
                 "source": result.get("source", "youtube"),
                 "language": result.get("language"),
                 "is_generated": result.get("is_generated"),
                 "duration_seconds": result.get("duration_seconds"),
                 "segment_count": result.get("segment_count"),
-                "views": video.get("viewcount"),
+                "views": video.get("views"),
+                "likes": video.get("likes"),
+                "comments": video.get("comments"),
+                "youtube_duration": video.get("duration"),
+                "discovery_provider": video.get("provider"),
+                "discovery_provenance": video.get("provenance") or {},
+                "provider_fields": provider_fields,
+                "views_observed_at": provider_fields.get(
+                    "metadata_observed_at"
+                ),
+                "metadata_expires_at": provider_fields.get(
+                    "metadata_expires_at"
+                ),
                 "route": result.get("route"),
                 "routes_tried": result.get("routes_tried"),
             }
@@ -1371,6 +1378,8 @@ def _bulk_download_transcripts(
                 "transcript_save", topic=topic, video_id=video_id,
                 status="saved", source="bulk_download",
                 chars=len(full_text), route=result.get("route"),
+                discovery_provider=video.get("provider"),
+                discovery_provenance=video.get("provenance") or None,
             )
             success_count += 1
             console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {title[:50]}...")
@@ -2266,6 +2275,140 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
 # ========== TRANSCRIPT DOWNLOAD ==========
 
 
+def _youtube_cli_bound(value: Optional[str], *, end_of_day: bool) -> Optional[str]:
+    """Expand a date-only CLI bound while preserving exact RFC3339 input."""
+    if not value:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        if end_of_day:
+            # YouTube's publishedBefore bound is exclusive. The next UTC
+            # midnight includes the entire requested calendar day, including
+            # fractional timestamps during its final second.
+            try:
+                next_day = date.fromisoformat(value) + timedelta(days=1)
+            except (ValueError, OverflowError):
+                raise ValueError(
+                    "published_before must be a valid date with a following day"
+                ) from None
+            return "{}T00:00:00Z".format(next_day.isoformat())
+        return "{}T00:00:00Z".format(value)
+    return value
+
+
+def _youtube_error_details(errors: object) -> List[ErrorDetail]:
+    """Convert provider diagnostics into the shared typed error contract."""
+    output = []
+    if not isinstance(errors, list):
+        return output
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        details = {
+            key: value
+            for key, value in error.items()
+            if key not in {"type", "message", "stage"}
+        }
+        output.append(ErrorDetail(
+            type=str(error.get("type") or "YouTubeAPIError"),
+            message=_whole_word_summary(
+                error.get("message") or "YouTube API operation was incomplete",
+                500,
+            ),
+            stage=str(error.get("stage") or "youtube-api"),
+            details=details,
+        ))
+    return output
+
+
+def _normalize_youtube_provider_result(
+    provider_result: object,
+    *,
+    query: str,
+    published_after: Optional[str],
+    published_before: Optional[str],
+    days: int,
+    order: str,
+    max_results: int,
+    pages: int,
+    page_token: Optional[str],
+    filters: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate the provider boundary and adapt the historical list shape."""
+    if isinstance(provider_result, list):
+        provider_result = {
+            "provider": "youtube-data-api-v3-legacy-list",
+            "videos": provider_result,
+            "request": {
+                "query": query,
+                "published_after": published_after,
+                "published_before": published_before,
+                "days": days,
+                "order": order,
+                "max_results": max_results,
+                "max_pages": pages,
+                "page_token": page_token,
+                "filters": filters,
+            },
+            "coverage": {
+                "pages_fetched": 1,
+                "candidates_fetched": len(provider_result),
+                "unique_candidates": len(provider_result),
+                "returned": len(provider_result),
+                "stopping_reason": "legacy_provider",
+                "partial": False,
+            },
+            "enrichment": {
+                "status": "not_recorded",
+                "requested": 0,
+                "returned": 0,
+                "partial": False,
+            },
+            "warnings": [],
+            "errors": [],
+        }
+    if not isinstance(provider_result, dict):
+        raise TypeError("YouTube discovery provider returned a non-object result")
+
+    normalized = dict(provider_result)
+    videos = normalized.get("videos")
+    if videos is None:
+        videos = []
+    if not isinstance(videos, list) or any(
+        not isinstance(video, dict) for video in videos
+    ):
+        raise TypeError("YouTube discovery provider videos must be a list of objects")
+    normalized["videos"] = [dict(video) for video in videos]
+
+    for section in ("request", "coverage", "enrichment"):
+        value = normalized.get(section)
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise TypeError(
+                "YouTube discovery provider {} must be an object".format(section)
+            )
+        normalized[section] = dict(value)
+
+    warnings = normalized.get("warnings")
+    if warnings is None:
+        warnings = []
+    if not isinstance(warnings, list) or any(
+        not isinstance(warning, str) for warning in warnings
+    ):
+        raise TypeError("YouTube discovery provider warnings must be a list of strings")
+    normalized["warnings"] = list(warnings)
+
+    errors = normalized.get("errors")
+    if errors is None:
+        errors = []
+    if not isinstance(errors, list) or any(
+        not isinstance(error, dict) for error in errors
+    ):
+        raise TypeError("YouTube discovery provider errors must be a list of objects")
+    normalized["errors"] = [dict(error) for error in errors]
+    return normalized
+
+
 def _render_yt_search_result(
     outcome: CommandResult[YouTubeSearchResultData],
 ) -> None:
@@ -2278,6 +2421,9 @@ def _render_yt_search_result(
     order = str(data.get("order", "date"))
     videos = data.get("videos") or []
     filters = data.get("filters") or {}
+    request = data.get("request") or {}
+    coverage = data.get("coverage") or {}
+    enrichment = data.get("enrichment") or {}
 
     if not videos:
         console.print(
@@ -2299,30 +2445,57 @@ def _render_yt_search_result(
             filter_labels.append(f"{label}: {filters[key]}")
     filter_text = " | ".join(filter_labels)
 
+    published_after = request.get("published_after")
+    published_before = request.get("published_before")
+    if published_after or published_before:
+        period = "{} .. {}".format(
+            published_after or "unbounded",
+            published_before or "now",
+        )
+    else:
+        period = "Last {} days".format(days)
+    approximate_total = coverage.get("approximate_total")
+    total_label = (
+        "~{:,}".format(approximate_total)
+        if isinstance(approximate_total, int)
+        else "unknown"
+    )
+    scope_line = (
+        f"Pages: {coverage.get('pages_fetched', 1)} | "
+        f"Returned: {coverage.get('returned', len(videos))} | "
+        f"Approx. total: {total_label} | "
+        f"Stopped: {coverage.get('stopping_reason', 'not recorded')}"
+    )
     console.print(
         Panel(
             f"[bold]Found {len(videos)} videos for:[/bold] {query}\n"
-            f"[bold]Period:[/bold] Last {days} days | "
-            f"[bold]Order:[/bold] {order}"
+            f"[bold]UTC period:[/bold] {period} | "
+            f"[bold]Order:[/bold] {order}\n"
+            f"[bold]Coverage:[/bold] {scope_line}\n"
+            f"[bold]Metadata:[/bold] "
+            f"{enrichment.get('status', 'not recorded')}"
             + (
                 f"\n[bold]Filters:[/bold] {filter_text}"
                 if filter_text
                 else ""
             ),
-            title="YouTube Search Results",
+            title="YouTube Data API Search Results",
         )
     )
 
     for index, video in enumerate(videos, 1):
-        duration_str = format_duration(video.get("duration", ""))
-        views = f"{video.get('views', 0):,}"
+        duration_str = format_duration(video.get("duration")) or "unknown"
+        view_count = video.get("views")
+        views = f"{view_count:,}" if isinstance(view_count, int) else "unknown"
         published = str(video.get("published_at", ""))[:10]
 
         console.print(
-            f"\n[bold cyan]{index}. {video['title']}[/bold cyan]"
+            f"\n[bold cyan]{index}. "
+            f"{video.get('title') or 'Untitled video'}[/bold cyan]"
         )
         console.print(
-            f"   Channel: [green]{video['channel_title']}[/green]"
+            f"   Channel: [green]"
+            f"{video.get('channel_title') or 'Unknown channel'}[/green]"
         )
         console.print(
             f"   Views: {views} | Duration: {duration_str} | "
@@ -2332,6 +2505,24 @@ def _render_yt_search_result(
             f"https://youtube.com/watch?v={video.get('video_id', '')}"
         )
         console.print(f"   [link={video_url}]{video_url}[/link]")
+
+        if video.get("metadata_status") not in (None, "observed"):
+            console.print(
+                "   [dim]Metadata: {} (search discovery preserved)[/dim]".format(
+                    video.get("metadata_status")
+                )
+            )
+        disclosures = []
+        if video.get("paid_product_placement_disclosure") == "declared":
+            disclosures.append("paid promotion declared")
+        if video.get("contains_synthetic_media") is True:
+            disclosures.append("synthetic media declared")
+        if video.get("made_for_kids") is True:
+            disclosures.append("made for kids")
+        if disclosures:
+            console.print("   [dim]Disclosures: {}[/dim]".format(
+                ", ".join(disclosures)
+            ))
 
         if data.get("show_description") and video.get("description"):
             description = str(video["description"])[:200]
@@ -2448,12 +2639,15 @@ def _evaluate_yt_search_transcripts(
 @click.command("yt-search")
 @click.argument("query")
 @click.option("--days", "-d", default=7, type=click.IntRange(1), help="Search videos from last N days (default: 7)")
-@click.option("--max-results", "-n", default=25, type=click.IntRange(1, 50), help="Maximum results (default: 25, max: 50)")
+@click.option("--max-results", "-n", default=25, type=click.IntRange(1, 500), help="Distinct-result budget across pages (default: 25, max: 500)")
+@click.option("--pages", default=1, type=click.IntRange(1, 10), show_default=True,
+              help="Maximum search pages (each page is another quota call)")
+@click.option("--page-token", default=None, help="Resume from a YouTube nextPageToken")
 @click.option("--order", "-o", default="date",
               type=click.Choice(["date", "relevance", "viewCount", "rating", "title"]),
               help="Sort order")
-@click.option("--published-after", default=None, help="Only videos after this date (YYYY-MM-DD)")
-@click.option("--published-before", default=None, help="Only videos before this date (YYYY-MM-DD)")
+@click.option("--published-after", default=None, help="UTC lower bound: YYYY-MM-DD or RFC3339")
+@click.option("--published-before", default=None, help="UTC upper bound: YYYY-MM-DD or RFC3339")
 @click.option("--channel-id", default=None, help="Filter by channel ID")
 @click.option("--region", default=None, help="Region code (e.g., US, GB, DE)")
 @click.option("--lang", "-l", default=None, help="Relevance language code (e.g., en, es, de)")
@@ -2477,6 +2671,9 @@ def _evaluate_yt_search_transcripts(
 @click.option("--license", "video_license", default=None,
               type=click.Choice(["any", "creativeCommon", "youtube"]),
               help="Video license type")
+@click.option("--paid-promotion", default=None,
+              type=click.Choice(["any", "true"]),
+              help="Filter by creator-declared paid product placement")
 @click.option("--syndicated", is_flag=True, help="Only syndicated videos")
 @click.option("--type", "video_type", default=None,
               type=click.Choice(["any", "episode", "movie"]),
@@ -2487,17 +2684,31 @@ def _evaluate_yt_search_transcripts(
 @click.option("--location", default=None, help="Lat,Long coordinates (e.g., 37.42,-122.08)")
 @click.option("--location-radius", default=None, help="Radius around location (e.g., 50km, 100mi)")
 @click.option("--topic-id", default=None, help="Freebase topic ID")
+@click.option("--enrich/--no-enrich", default=True, show_default=True,
+              help="Fetch public video details after discovery")
+@click.option("--connect-timeout", default=5.0,
+              type=click.FloatRange(min=0, min_open=True), show_default=True,
+              help="Per-request connection timeout in seconds")
+@click.option("--read-timeout", default=20.0,
+              type=click.FloatRange(min=0, min_open=True), show_default=True,
+              help="Per-request response timeout in seconds")
+@click.option("--retries", default=2, type=click.IntRange(0, 5),
+              show_default=True, help="Retries for transient failures")
 @click.option("--transcript", "-t", is_flag=True, help="Also fetch and search transcript content")
 @click.option("--transcript-query", default=None, help="Different query for transcript search")
 @click.option("--show-description", is_flag=True, help="Show video descriptions")
 @click.option("--raw", is_flag=True, help="Output one versioned JSON result")
-def yt_search(query: str, days: int, max_results: int, order: str,
+def yt_search(query: str, days: int, max_results: int, pages: int,
+              page_token: str, order: str,
               published_after: str, published_before: str, channel_id: str,
               region: str, lang: str, safe_search: str, caption: str,
               category: str, definition: str, dimension: str, duration: str,
-              embeddable: bool, video_license: str, syndicated: bool,
+              embeddable: bool, video_license: str, paid_promotion: str,
+              syndicated: bool,
               video_type: str, event_type: str, location: str,
-              location_radius: str, topic_id: str, transcript: bool,
+              location_radius: str, topic_id: str, enrich: bool,
+              connect_timeout: float, read_timeout: float, retries: int,
+              transcript: bool,
               transcript_query: str, show_description: bool, raw: bool):
     """Search YouTube directly for recent videos (bypasses Filmot).
 
@@ -2521,10 +2732,25 @@ def yt_search(query: str, days: int, max_results: int, order: str,
 
         filmot yt-search "AI" --license creativeCommon
 
+        filmot yt-search "battery recycling" --pages 3 --max-results 120
+
+        filmot yt-search "campaign analysis" --paid-promotion true
+
+        filmot yt-search "breaking research" --no-enrich --raw
+
         filmot yt-search "tech" --transcript --transcript-query "security"
     """
     from ..ledger import log_event, log_result
-    from ..youtube_search import search_recent, validate_youtube_api
+    from ..youtube_search import (
+        YouTubeAPIError,
+        search_recent_detailed,
+        validate_youtube_api,
+    )
+
+    if location_radius and not location:
+        raise click.UsageError("--location-radius requires --location")
+    if transcript_query and not transcript:
+        raise click.UsageError("--transcript-query requires --transcript")
 
     filters = {
         "lang": lang,
@@ -2540,6 +2766,7 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         "duration": duration,
         "embeddable": embeddable,
         "license": video_license,
+        "paid_promotion": paid_promotion,
         "syndicated": syndicated,
         "video_type": video_type,
         "event_type": event_type,
@@ -2552,6 +2779,12 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         "query": query,
         "days": days,
         "order": order,
+        "pages": pages,
+        "page_token": page_token,
+        "enrich": enrich,
+        "connect_timeout": connect_timeout,
+        "read_timeout": read_timeout,
+        "retries": retries,
         **filters,
         "transcript": transcript,
         "transcript_query": transcript_query,
@@ -2560,46 +2793,6 @@ def yt_search(query: str, days: int, max_results: int, order: str,
 
     try:
         validate_youtube_api()
-        pub_after = (
-            f"{published_after}T00:00:00Z"
-            if published_after
-            else None
-        )
-        pub_before = (
-            f"{published_before}T23:59:59Z"
-            if published_before
-            else None
-        )
-        with _search_status(
-            f"[bold green]Searching YouTube for '{query}' "
-            f"(last {days} days)...",
-            raw=raw,
-        ):
-            results = search_recent(
-                query=query,
-                days_back=days,
-                max_results=max_results,
-                order=order,
-                published_after=pub_after,
-                published_before=pub_before,
-                channel_id=channel_id,
-                region_code=region,
-                relevance_language=lang,
-                safe_search=safe_search,
-                video_caption=caption,
-                video_category_id=category,
-                video_definition=definition,
-                video_dimension=dimension,
-                video_duration=duration,
-                video_embeddable="true" if embeddable else None,
-                video_license=video_license,
-                video_syndicated="true" if syndicated else None,
-                video_type=video_type,
-                event_type=event_type,
-                location=location,
-                location_radius=location_radius,
-                topic_id=topic_id,
-            )
     except ValueError as error:
         log_event(
             "yt-search",
@@ -2614,6 +2807,78 @@ def yt_search(query: str, days: int, max_results: int, order: str,
             raw=raw,
             error_type=type(error).__name__,
             stage="configuration",
+        )
+
+    try:
+        pub_after = _youtube_cli_bound(published_after, end_of_day=False)
+        pub_before = _youtube_cli_bound(published_before, end_of_day=True)
+        with _search_status(
+            f"[bold green]Searching YouTube for '{query}' "
+            f"(last {days} days)...",
+            raw=raw,
+        ):
+            provider_result = search_recent_detailed(
+                query=query,
+                days_back=days,
+                max_results=max_results,
+                max_pages=pages,
+                page_token=page_token,
+                enrich=enrich,
+                timeout=(connect_timeout, read_timeout),
+                retries=retries,
+                order=order,
+                published_after=pub_after,
+                published_before=pub_before,
+                channel_id=channel_id,
+                region_code=region,
+                relevance_language=lang,
+                safe_search=safe_search,
+                video_caption=caption,
+                video_category_id=category,
+                video_definition=definition,
+                video_dimension=dimension,
+                video_duration=duration,
+                video_embeddable="true" if embeddable else None,
+                video_license=video_license,
+                video_paid_product_placement=paid_promotion,
+                video_syndicated="true" if syndicated else None,
+                video_type=video_type,
+                event_type=event_type,
+                location=location,
+                location_radius=location_radius,
+                topic_id=topic_id,
+            )
+    except ValueError as error:
+        log_event(
+            "yt-search",
+            **event_data,
+            status="failed",
+            failure_stage="validate-request",
+            error=f"{type(error).__name__}: {error}",
+        )
+        _command_error(
+            f"Invalid YouTube request: {error}",
+            raw=raw,
+            error_type=type(error).__name__,
+            stage="validate-request",
+        )
+    except YouTubeAPIError as error:
+        log_event(
+            "yt-search",
+            **event_data,
+            status="failed",
+            failure_stage="request",
+            error=f"{type(error).__name__}: {error}",
+            error_type=type(error).__name__,
+            error_category=error.category,
+            error_reason=error.reason,
+            http_status=error.status_code,
+        )
+        _command_error(
+            str(error),
+            raw=raw,
+            error_type=type(error).__name__,
+            stage="request",
         )
     except Exception as error:
         log_event(
@@ -2630,7 +2895,36 @@ def yt_search(query: str, days: int, max_results: int, order: str,
             stage="request",
         )
 
-    result_videos = list(results or [])
+    try:
+        provider_result = _normalize_youtube_provider_result(
+            provider_result,
+            query=query,
+            published_after=pub_after,
+            published_before=pub_before,
+            days=days,
+            order=order,
+            max_results=max_results,
+            pages=pages,
+            page_token=page_token,
+            filters=filters,
+        )
+    except (TypeError, ValueError) as error:
+        log_event(
+            "yt-search",
+            **event_data,
+            status="failed",
+            failure_stage="invalid-response",
+            error=f"{type(error).__name__}: {error}",
+        )
+        _command_error(
+            str(error),
+            raw=raw,
+            error_type=type(error).__name__,
+            stage="invalid-response",
+        )
+
+    result_videos = list(provider_result.get("videos") or [])
+    provider_errors = _youtube_error_details(provider_result.get("errors"))
     transcript_errors: List[ErrorDetail] = []
     if transcript and result_videos:
         result_videos, transcript_errors = _evaluate_yt_search_transcripts(
@@ -2646,6 +2940,9 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         "max_results": max_results,
         "order": order,
         "filters": filters,
+        "request": dict(provider_result.get("request") or {}),
+        "coverage": dict(provider_result.get("coverage") or {}),
+        "enrichment": dict(provider_result.get("enrichment") or {}),
         "transcript": transcript,
         "transcript_query": transcript_query,
         "show_description": show_description,
@@ -2654,13 +2951,17 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         command="yt-search",
         status=(
             ResultStatus.PARTIAL
-            if transcript_errors
+            if provider_errors
+            or transcript_errors
+            or bool(result_data["coverage"].get("partial"))
+            or bool(result_data["enrichment"].get("partial"))
             else ResultStatus.COMPLETED
             if result_videos
             else ResultStatus.EMPTY
         ),
         data=result_data,
-        errors=transcript_errors,
+        errors=[*provider_errors, *transcript_errors],
+        warnings=list(provider_result.get("warnings") or []),
     )
     if raw:
         outcome = _prepare_raw_result(outcome)
@@ -2669,6 +2970,27 @@ def yt_search(query: str, days: int, max_results: int, order: str,
         outcome,
         data={
             **event_data,
+            "request": result_data["request"],
+            "coverage": result_data["coverage"],
+            "enrichment": result_data["enrichment"],
+            "effective_published_after": result_data["request"].get(
+                "published_after"
+            ),
+            "effective_published_before": result_data["request"].get(
+                "published_before"
+            ),
+            "pages_fetched": result_data["coverage"].get("pages_fetched"),
+            "candidates_fetched": result_data["coverage"].get(
+                "candidates_fetched"
+            ),
+            "stopping_reason": result_data["coverage"].get(
+                "stopping_reason"
+            ),
+            "next_page_token": result_data["coverage"].get(
+                "next_page_token"
+            ),
+            "enrichment_status": result_data["enrichment"].get("status"),
+            "partial": outcome.status_value == ResultStatus.PARTIAL.value,
             "results": len(result_videos),
             "transcript_failures": len(transcript_errors),
         },

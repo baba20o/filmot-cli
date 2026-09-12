@@ -384,7 +384,7 @@ def test_yt_search_logs_to_ledger(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(ys, "validate_youtube_api", lambda: None)
-    monkeypatch.setattr(ys, "search_recent", lambda **kw: [
+    monkeypatch.setattr(ys, "search_recent_detailed", lambda **kw: [
         {"video_id": "abc12345678", "title": "T", "channel_title": "C",
          "published_at": "2026-06-10T00:00:00Z", "views": 1, "duration": "PT1M"},
     ])

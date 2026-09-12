@@ -35,6 +35,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `yt-search --raw` for the effective discovery request and exact candidate
   metadata. With `--transcript`, each video carries a typed transcript-search
   outcome and item failures make the aggregate result partial.
+- Bounded direct-YouTube pagination through `yt-search --pages`, a distinct
+  `--max-results` budget, opaque `--page-token` continuation, exact RFC3339
+  publication bounds, optional `--no-enrich`, paid-placement filtering, and
+  configurable per-request timeouts/retries. Raw output now carries effective
+  request, call/token coverage, stopping reason, and enrichment accounting.
+- Rich `videos.list` observations for public snippet/statistics,
+  content/status, live-stream, topic, regional/content-rating,
+  made-for-kids, synthetic-media, and `paid_product_placement` metadata, with missing
+  counters preserved as unknown and 30-day UTC observation/expiry timestamps.
+- A provider-neutral discovery candidate contract for Filmot, direct YouTube,
+  and bare/list/result/videos/items artifacts. It provides all-row preflight,
+  strict YouTube identities, zero-vs-missing preservation, bounded sanitized
+  native fields, and aggregate validation errors before pipeline mutation.
+- `transcript --save-to TOPIC --discovery FILE` for selecting the exact
+  matching discovery row, recording a content-addressed `sha256:` reference,
+  and retaining supplied metadata without guessing from neighboring events.
+- Atomic fill-only metadata enrichment for existing library records. It
+  preserves known values and transcript/citation/acquisition content, reports
+  conflicts, and makes repeated enrichment a no-op.
+- A separately bounded direct-YouTube section in session summaries, including
+  absolute UTC scope, filters, page/result counts, stopping/partial/enrichment
+  state, and continuation availability without adding it to Filmot totals.
 - `library echoes TOPIC` for deterministic, advisory full-transcript word
   n-gram Jaccard analysis. `--persist` writes and verifies a canonical,
   content-addressed artifact in `.filmot_data/analysis/TOPIC/`; method metadata
@@ -87,6 +109,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Probe planning records explicit zero-query terminal outcomes when eligible
   seeds yield no candidate terms or no supported cross-source pair. Session
   summaries expose bounded probe-run outcomes and count omitted older runs.
+- Pipeline download now normalizes and validates the complete provider-neutral
+  candidate batch before opening transcript routes or writing library data, so
+  unchanged `yt-search --raw` output is accepted and an invalid later row
+  cannot leave an unintentionally partial mutation. Its bounded native-field
+  copy prioritizes freshness, disclosure, status, and topic provenance ahead
+  of bulky provider extras.
+- `channel-download` now accepts only exact 24-character `UC...` IDs,
+  `@handles`, and canonical `https://[www.]youtube.com/channel/UC...` or
+  `https://[www.]youtube.com/@handle` URLs instead of guessing arbitrary
+  display names. It records the requested reference and
+  resolved canonical identity separately, resolves the uploads playlist with
+  `channels.list`, and retains richer channel/playlist-item provenance with
+  30-day observation/expiry timestamps.
 
 ### Fixed
 
@@ -104,6 +139,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Raw `yt-search --transcript` no longer bypasses transcript evaluation. Its
   per-video status, match count, matches, and bounded failure details are shared
   with human mode instead of being hidden inside the human renderer.
+- Direct YouTube discovery keeps all usable earlier-page rows when a later page
+  fails and keeps search rows when optional metadata enrichment fails or omits
+  an ID. These outcomes are typed partial instead of appearing empty or losing
+  the original search rank/provenance.
+- YouTube request and channel-client failures are categorized without retaining
+  native request/response objects or credential-bearing URLs. Common API keys,
+  tokens, signatures, authorization fields, URL userinfo, and credential query
+  parameters are redacted again at typed result and ledger boundaries.
+- Channel upload pagination detects repeated continuation tokens, unavailable
+  playlist rows retain usable video identities, and absent public counters are
+  no longer fabricated as zero.
 - The Click regression-test runner no longer passes the constructor option
   removed in Click 8.5, so a fresh supported development install reaches the
   product regressions.

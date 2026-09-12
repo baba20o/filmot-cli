@@ -14,7 +14,7 @@ from typing import Any, Optional
 import click
 from rich.console import Console
 
-from .proxy_pool import redact_sensitive_text
+from .redaction import redact_sensitive_text, redact_sensitive_value
 from .schemas import CommandResult, ErrorDetail
 
 
@@ -49,18 +49,7 @@ def silence_broken_pipe_streams() -> None:
 
 def redact_diagnostic(value: Any) -> Any:
     """Recursively redact credential-bearing proxy userinfo."""
-    if isinstance(value, dict):
-        return {
-            key: redact_diagnostic(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [redact_diagnostic(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_diagnostic(item) for item in value)
-    if isinstance(value, (str, Exception)):
-        return redact_sensitive_text(value)
-    return value
+    return redact_sensitive_value(value)
 
 
 def emit_raw_result(

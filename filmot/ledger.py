@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Union
 
 from .library import _legacy_normalize_topic, normalize_topic_name
 from .paths import project_data_dir
+from .redaction import redact_sensitive_value
 from .session_context import current_session
 from .schemas import (
     CommandResult,
@@ -264,6 +265,12 @@ _SEARCH_SCOPE_FILTERS = (
     "category", "exclude_category", "country", "license", "min_matches",
     "sort", "order", "page", "pages", "candidate_pool", "channel_count",
 )
+_YOUTUBE_SEARCH_SCOPE_FILTERS = (
+    "channel_id", "region", "lang", "safe_search", "caption", "category",
+    "definition", "dimension", "duration", "embeddable", "license",
+    "syndicated", "video_type", "event_type", "location",
+    "location_radius", "topic_id", "paid_promotion",
+)
 _PROBE_PROVENANCE_DETAIL_STATUSES = {
     "broad_sampled",
     "deferred",
@@ -374,6 +381,51 @@ def _compact_search_scope(data: Mapping[str, Any]) -> Dict[str, Any]:
         )
         if len(" ".join(effective_query.split())) > SESSION_PROVENANCE_QUERY_CHARS:
             scope["effective_query_truncated"] = True
+    return scope
+
+
+def _compact_youtube_search_scope(data: Mapping[str, Any]) -> Dict[str, Any]:
+    """Project a bounded direct-YouTube request without persisting secrets.
+
+    New events carry ``request``/``coverage``/``enrichment`` objects while
+    older ``yt-search`` events stored most fields flat. Supporting both keeps
+    session replay useful across upgrades. The whitelist intentionally cannot
+    include an API key.
+    """
+    request = data.get("request")
+    if not isinstance(request, Mapping):
+        request = {}
+    filters = request.get("filters")
+    if not isinstance(filters, Mapping):
+        filters = data.get("filters")
+    if not isinstance(filters, Mapping):
+        filters = {}
+
+    source = dict(data)
+    source.update(filters)
+    projected: Dict[str, Any] = {}
+    truncated = []
+    for field in _YOUTUBE_SEARCH_SCOPE_FILTERS:
+        if field not in source:
+            continue
+        value = source[field]
+        if value is None or isinstance(value, bool):
+            projected[field] = value
+        elif isinstance(value, str):
+            compact = _compact_provenance_text(
+                value, SESSION_SEARCH_FILTER_CHARS
+            )
+            projected[field] = compact
+            if compact != " ".join(value.split()):
+                truncated.append(field)
+        elif isinstance(value, int) and value.bit_length() <= 64:
+            projected[field] = value
+
+    scope: Dict[str, Any] = {}
+    if projected:
+        scope["effective_filters"] = projected
+    if truncated:
+        scope["effective_filters_truncated"] = truncated
     return scope
 
 
@@ -840,7 +892,7 @@ def _append_record(
         _normalize(selected) if selected
         else record.topic or datetime.now().strftime("%Y-%m-%d")
     )
-    payload = record.to_dict()
+    payload = redact_sensitive_value(record.to_dict())
     if selected:
         payload["data"]["session"] = name
     with open(sessions / "{}.jsonl".format(name), "a", encoding="utf-8") as f:
@@ -1038,6 +1090,11 @@ def summarize_events(name: str, events: list) -> Dict[str, Any]:
     search_rows = []
     candidate_fetches = 0
     post_filter_results = 0
+    youtube_search_rows = []
+    youtube_query_seen = set()
+    youtube_queries = []
+    youtube_candidate_fetches = 0
+    youtube_returned_results = 0
     research_search_rows: Dict[tuple, Dict[str, Any]] = {}
     saved_ids = set()
     skipped_ids = set()
@@ -1053,6 +1110,14 @@ def summarize_events(name: str, events: list) -> Dict[str, Any]:
             return int(value or 0)
         except (TypeError, ValueError):
             return 0
+
+    def optional_int(value: object) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     for event in events:
         if not isinstance(event, dict):
@@ -1100,6 +1165,107 @@ def summarize_events(name: str, events: list) -> Dict[str, Any]:
                 "partial": bool(data.get("partial")),
                 **_compact_search_scope(data),
             })
+
+        if kind == "yt-search":
+            request = data.get("request")
+            if not isinstance(request, dict):
+                request = {}
+            coverage = data.get("coverage")
+            if not isinstance(coverage, dict):
+                coverage = {}
+            enrichment = data.get("enrichment")
+            if not isinstance(enrichment, dict):
+                enrichment = {}
+
+            direct_query = request.get("query", query)
+            if isinstance(direct_query, str) and direct_query:
+                if direct_query not in youtube_query_seen:
+                    youtube_query_seen.add(direct_query)
+                    youtube_queries.append(direct_query)
+            else:
+                direct_query = ""
+
+            fetched = as_int(
+                coverage.get("candidates_fetched")
+                if coverage.get("candidates_fetched") is not None
+                else data.get("candidates_fetched")
+                if data.get("candidates_fetched") is not None
+                else data.get("results")
+            )
+            returned = as_int(
+                coverage.get("returned")
+                if coverage.get("returned") is not None
+                else coverage.get("results_returned")
+                if coverage.get("results_returned") is not None
+                else data.get("results")
+            )
+            youtube_candidate_fetches += fetched
+            youtube_returned_results += returned
+
+            def request_value(name: str, fallback: object = None) -> object:
+                value = request.get(name)
+                return fallback if value is None else value
+
+            row = {
+                "ts": event.get("ts"),
+                "status": status,
+                "query": _compact_provenance_text(
+                    direct_query, SESSION_PROVENANCE_QUERY_CHARS
+                ),
+                "requested_at": request_value(
+                    "requested_at", data.get("requested_at")
+                ),
+                "published_after": request_value(
+                    "published_after",
+                    data.get("effective_published_after")
+                    or data.get("published_after"),
+                ),
+                "published_before": request_value(
+                    "published_before",
+                    data.get("effective_published_before")
+                    or data.get("published_before"),
+                ),
+                "days": request_value("days", data.get("days")),
+                "order": request_value("order", data.get("order")),
+                "max_results": request_value(
+                    "max_results", data.get("max_results")
+                ),
+                "pages_fetched": as_int(
+                    coverage.get("pages_fetched")
+                    if coverage.get("pages_fetched") is not None
+                    else data.get("pages_fetched") or 1
+                ),
+                "candidates_fetched": fetched,
+                "returned": returned,
+                # YouTube documents this total as approximate. Preserve an
+                # unobserved value as ``None`` rather than inventing zero.
+                "approximate_total": optional_int(
+                    coverage.get("approximate_total")
+                    if coverage.get("approximate_total") is not None
+                    else data.get("approximate_total")
+                ),
+                "stopping_reason": coverage.get("stopping_reason")
+                or data.get("stopping_reason"),
+                "continuation_available": bool(
+                    coverage.get("next_page_token")
+                    or data.get("next_page_token")
+                ),
+                "partial": bool(
+                    coverage.get("partial")
+                    if coverage.get("partial") is not None
+                    else data.get("partial")
+                    or status == ResultStatus.PARTIAL.value
+                ),
+                "enrichment_status": enrichment.get("status")
+                or data.get("enrichment_status"),
+                **_compact_youtube_search_scope(data),
+            }
+            if (
+                isinstance(direct_query, str)
+                and row["query"] != " ".join(direct_query.split())
+            ):
+                row["query_truncated"] = True
+            youtube_search_rows.append(row)
 
         if kind == "research_checkpoint":
             phase = str(data.get("phase") or "")
@@ -1253,6 +1419,7 @@ def summarize_events(name: str, events: list) -> Dict[str, Any]:
     research_provenance = _fold_research_provenance(
         events, staged_search_rows
     )
+    visible_youtube_rows = youtube_search_rows[-SESSION_PROVENANCE_ROW_LIMIT:]
 
     return {
         "name": name,
@@ -1272,6 +1439,20 @@ def summarize_events(name: str, events: list) -> Dict[str, Any]:
             "counting_note": (
                 "candidate_fetches and post_filter_results are per-event totals; "
                 "they may include the same video more than once"
+            ),
+        },
+        "youtube_searches": {
+            "events": len(youtube_search_rows),
+            "shown": len(visible_youtube_rows),
+            "omitted": len(youtube_search_rows) - len(visible_youtube_rows),
+            "unique_queries": youtube_queries,
+            "candidate_fetches": youtube_candidate_fetches,
+            "returned_results": youtube_returned_results,
+            "scope_rows": visible_youtube_rows,
+            "counting_note": (
+                "direct YouTube discovery is a separate search universe; "
+                "candidate_fetches and returned_results are per-event totals "
+                "and are never added to Filmot search totals"
             ),
         },
         "research_searches": {

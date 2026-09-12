@@ -27,7 +27,11 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 
-from .paths import project_data_dir, publish_file_exclusive
+from .paths import (
+    exclusive_file_guard,
+    project_data_dir,
+    publish_file_exclusive,
+)
 
 
 _WINDOWS_RESERVED_NAMES = frozenset({
@@ -49,6 +53,15 @@ _SOURCE_METADATA_ALIASES = {
     ),
     "views": ("views", "viewcount"),
 }
+_UNKNOWN_METADATA_TEXT = frozenset({"", "unknown", "n/a", "not available"})
+
+
+def _metadata_value_missing(value: Any) -> bool:
+    """Return whether metadata is absent, preserving valid zero/False values."""
+    return value is None or (
+        isinstance(value, str)
+        and value.strip().casefold() in _UNKNOWN_METADATA_TEXT
+    )
 
 
 def _reject_json_constant(value: str) -> None:
@@ -502,42 +515,277 @@ class TranscriptLibrary:
         safe_id = self._sanitize_video_id(video_id)
         file_path = topic_dir / f"{safe_id}.json"
         
-        saved_at = datetime.now().isoformat()
-        normalized_metadata = self._normalize_metadata({
-            "metadata": metadata or {},
-        })
-        if normalized_metadata.get("segment_count") is None:
-            normalized_metadata["segment_count"] = len(segment_rows)
-        if (
-            normalized_metadata.get("views") is not None
-            and normalized_metadata.get("views_observed_at") is None
-        ):
-            normalized_metadata["views_observed_at"] = saved_at
+        guard_path = topic_dir / ".{}.metadata.guard".format(safe_id)
+        with exclusive_file_guard(guard_path):
+            saved_at = datetime.now().isoformat()
+            normalized_metadata = self._normalize_metadata({
+                "metadata": metadata or {},
+            })
+            if normalized_metadata.get("segment_count") is None:
+                normalized_metadata["segment_count"] = len(segment_rows)
+            if (
+                normalized_metadata.get("views") is not None
+                and normalized_metadata.get("views_observed_at") is None
+            ):
+                normalized_metadata["views_observed_at"] = saved_at
 
-        data = {
-            "video_id": video_id,
-            "topic": self._normalize_topic(topic),
-            "saved_at": saved_at,
-            "transcript": transcript_text,
-            "segments": segment_rows,
-            "source": self._normalize_source_metadata(
-                video_id,
-                normalized_metadata,
-            ),
-            "metadata": normalized_metadata,
-        }
-        
-        temporary = _write_json_temporary(file_path, data)
-        try:
-            _replace_with_retry(temporary, file_path)
-        finally:
-            if temporary.exists():
-                try:
-                    temporary.unlink()
-                except OSError:
-                    pass
-        
+            data = {
+                "video_id": video_id,
+                "topic": self._normalize_topic(topic),
+                "saved_at": saved_at,
+                "transcript": transcript_text,
+                "segments": segment_rows,
+                "source": self._normalize_source_metadata(
+                    video_id,
+                    normalized_metadata,
+                ),
+                "metadata": normalized_metadata,
+            }
+
+            temporary = _write_json_temporary(file_path, data)
+            try:
+                _replace_with_retry(temporary, file_path)
+            finally:
+                if temporary.exists():
+                    try:
+                        temporary.unlink()
+                    except OSError:
+                        pass
+
         return file_path
+
+    def enrich_metadata(
+        self,
+        video_id: str,
+        topic: str,
+        candidate: Dict[str, Any],
+        *,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Fill only missing source metadata on an existing transcript.
+
+        The transcript, segments, acquisition details, citations, ``saved_at``,
+        and every unrelated field are preserved verbatim. Known values are
+        never overwritten; differing observations are reported as conflicts.
+        Save and enrichment share the same per-record OS guard, preventing a
+        read/merge/write race from losing a concurrent save.
+        """
+        if not isinstance(video_id, str) or not video_id.strip():
+            raise ValueError("video_id must be non-empty text")
+        if not isinstance(candidate, dict):
+            raise ValueError("candidate must be an object")
+        candidate_id = candidate.get("video_id")
+        if candidate_id is not None and str(candidate_id) != video_id:
+            raise ValueError(
+                "candidate video_id {!r} does not match {!r}".format(
+                    candidate_id, video_id
+                )
+            )
+        if provenance is not None and not isinstance(provenance, dict):
+            raise ValueError("provenance must be an object or null")
+
+        safe_id = self._sanitize_video_id(video_id)
+        topic_dir = self.transcripts_dir / self._normalize_topic(topic)
+        file_path = topic_dir / "{}.json".format(safe_id)
+        guard_path = topic_dir / ".{}.metadata.guard".format(safe_id)
+        if not file_path.exists():
+            raise FileNotFoundError(
+                "Transcript is not saved at {}/{}".format(
+                    self._normalize_topic(topic), video_id
+                )
+            )
+
+        provider_fields = candidate.get("provider_fields")
+        provider_fields = (
+            dict(provider_fields) if isinstance(provider_fields, dict) else {}
+        )
+        # Provider-neutral discovery keeps service-specific observations under
+        # ``provider_fields``. Promote known YouTube fields into the library's
+        # metadata view while preserving that original provider payload.
+        observed_candidate = dict(provider_fields)
+        observed_candidate.update({
+            key: value
+            for key, value in candidate.items()
+            if not _metadata_value_missing(value)
+        })
+
+        aliases = {
+            "title": "title",
+            "description": "description",
+            "channel_title": "channel",
+            "channel_id": "channel_id",
+            "published_at": "published_at",
+            "views": "views",
+            "likes": "likes",
+            "comments": "comments",
+            "favorites": "favorites",
+            "duration": "duration",
+            "thumbnail": "thumbnail",
+            "thumbnails": "thumbnails",
+            "definition": "definition",
+            "dimension": "dimension",
+            "caption": "caption",
+            "licensed_content": "licensed_content",
+            "category_id": "category_id",
+            "tags": "tags",
+            "default_language": "default_language",
+            "default_audio_language": "default_audio_language",
+            "localized": "localized",
+            "live_broadcast_content": "live_broadcast_content",
+            "upload_status": "upload_status",
+            "failure_reason": "failure_reason",
+            "rejection_reason": "rejection_reason",
+            "privacy_status": "privacy_status",
+            "scheduled_publish_at": "scheduled_publish_at",
+            "license": "youtube_license",
+            "embeddable": "embeddable",
+            "public_stats_viewable": "public_stats_viewable",
+            "made_for_kids": "made_for_kids",
+            "self_declared_made_for_kids": "self_declared_made_for_kids",
+            "contains_synthetic_media": "contains_synthetic_media",
+            "paid_product_placement": "paid_product_placement",
+            "has_paid_product_placement": "paid_product_placement",
+            "paid_product_placement_disclosure": (
+                "paid_product_placement_disclosure"
+            ),
+            "region_restriction": "region_restriction",
+            "content_rating": "content_rating",
+            "projection": "projection",
+            "actual_start_time": "actual_start_time",
+            "actual_end_time": "actual_end_time",
+            "scheduled_start_time": "scheduled_start_time",
+            "scheduled_end_time": "scheduled_end_time",
+            "concurrent_viewers": "concurrent_viewers",
+            "active_live_chat_id": "active_live_chat_id",
+            "topic_ids": "topic_ids",
+            "relevant_topic_ids": "relevant_topic_ids",
+            "topic_categories": "topic_categories",
+            "metadata_observed_at": "metadata_observed_at",
+            "metadata_expires_at": "metadata_expires_at",
+        }
+
+        with exclusive_file_guard(guard_path):
+            with open(file_path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle, parse_constant=_reject_json_constant)
+            if not isinstance(raw, dict):
+                raise ValueError("saved transcript record must be an object")
+            _require_finite_json(raw)
+            if str(raw.get("video_id") or "") != video_id:
+                raise ValueError("saved transcript video_id does not match its path")
+
+            metadata = raw.get("metadata")
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            source = raw.get("source")
+            source = dict(source) if isinstance(source, dict) else {}
+            filled = []
+            conflicts = []
+
+            for candidate_key, metadata_key in aliases.items():
+                incoming = observed_candidate.get(candidate_key)
+                if _metadata_value_missing(incoming):
+                    continue
+                existing = metadata.get(metadata_key)
+                if _metadata_value_missing(existing):
+                    metadata[metadata_key] = incoming
+                    filled.append(metadata_key)
+                elif existing != incoming:
+                    conflicts.append({
+                        "field": metadata_key,
+                        "existing": existing,
+                        "observed": incoming,
+                    })
+
+            source_aliases = {
+                "title": "title",
+                "channel_title": "channel",
+                "channel_id": "channel_id",
+                "published_at": "published_at",
+                "views": "views",
+                "metadata_observed_at": "views_observed_at",
+            }
+            for candidate_key, source_key in source_aliases.items():
+                incoming = observed_candidate.get(candidate_key)
+                if _metadata_value_missing(incoming):
+                    continue
+                existing = source.get(source_key)
+                if _metadata_value_missing(existing):
+                    source[source_key] = incoming
+                    filled.append("source.{}".format(source_key))
+                elif existing != incoming:
+                    conflict_name = "source.{}".format(source_key)
+                    if not any(
+                        item["field"] == conflict_name for item in conflicts
+                    ):
+                        conflicts.append({
+                            "field": conflict_name,
+                            "existing": existing,
+                            "observed": incoming,
+                        })
+
+            existing_provider_fields = metadata.get("provider_fields")
+            existing_provider_fields = (
+                dict(existing_provider_fields)
+                if isinstance(existing_provider_fields, dict)
+                else {}
+            )
+            for key, incoming in provider_fields.items():
+                if _metadata_value_missing(incoming):
+                    continue
+                existing = existing_provider_fields.get(key)
+                field_name = "provider_fields.{}".format(key)
+                if _metadata_value_missing(existing):
+                    existing_provider_fields[key] = incoming
+                    filled.append(field_name)
+                elif existing != incoming:
+                    conflicts.append({
+                        "field": field_name,
+                        "existing": existing,
+                        "observed": incoming,
+                    })
+            if existing_provider_fields:
+                metadata["provider_fields"] = existing_provider_fields
+
+            if not filled:
+                return {
+                    "status": "noop",
+                    "path": str(file_path),
+                    "filled_fields": [],
+                    "conflicts": conflicts,
+                }
+
+            raw["metadata"] = metadata
+            raw["source"] = source
+            observation = dict(provenance or {})
+            observation.setdefault(
+                "provider", str(candidate.get("provider") or "unknown")
+            )
+            if observed_candidate.get("metadata_observed_at") is not None:
+                observation.setdefault(
+                    "observed_at", observed_candidate["metadata_observed_at"]
+                )
+            if observed_candidate.get("metadata_expires_at") is not None:
+                observation.setdefault(
+                    "expires_at", observed_candidate["metadata_expires_at"]
+                )
+            observation["filled_fields"] = list(filled)
+            raw["metadata_enrichment"] = observation
+
+            temporary = _write_json_temporary(file_path, raw)
+            try:
+                _replace_with_retry(temporary, file_path)
+            finally:
+                if temporary.exists():
+                    try:
+                        temporary.unlink()
+                    except OSError:
+                        pass
+
+        return {
+            "status": "updated",
+            "path": str(file_path),
+            "filled_fields": filled,
+            "conflicts": conflicts,
+        }
     
     def get(self, video_id: str, topic: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
