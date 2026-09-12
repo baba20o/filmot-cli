@@ -204,6 +204,39 @@ class YouTubePlaylistShelfResultData(TypedDict, total=False):
     show_description: bool
 
 
+class YouTubeCommentThreadsResultData(TypedDict, total=False):
+    """Transient bounded public discussion returned by ``yt-comments``."""
+
+    provider: str
+    video_id: str
+    comment_threads: List[Dict[str, Any]]
+    replies_mode: str
+    availability: Dict[str, Any]
+    request: Dict[str, Any]
+    coverage: Dict[str, Any]
+    api_calls: Dict[str, Any]
+    quota: Dict[str, Any]
+    continuation: Dict[str, Any]
+    observed_at: Optional[str]
+    expires_at: Optional[str]
+
+
+class YouTubeCommentRepliesResultData(TypedDict, total=False):
+    """Transient bounded reply cursor returned by ``yt-replies``."""
+
+    provider: str
+    parent_comment_id: str
+    video_id: Optional[str]
+    replies: List[Dict[str, Any]]
+    request: Dict[str, Any]
+    coverage: Dict[str, Any]
+    api_calls: Dict[str, Any]
+    quota: Dict[str, Any]
+    continuation: Dict[str, Any]
+    observed_at: Optional[str]
+    expires_at: Optional[str]
+
+
 class TranscriptResultData(TypedDict, total=False):
     """Normalized transcript outcome used by raw and human renderers."""
 

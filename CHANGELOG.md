@@ -7,8 +7,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+The deterministic `yt-comments`/`yt-replies` provider and CLI contract is
+complete. A bounded live thread, reply, emitted-continuation, and isolated
+ledger identity/text/token privacy drive has also passed. A final two-call
+post-hardening replay verified exact named-session continuation, disjoint
+resumed rows, and the response-free minimal ledger contract; the full audit is
+recorded in `FIELD_TEST_LOG.md`.
+
 ### Added
 
+- `YOUTUBE_ROADMAP.md`, a durable ranked queue for future public read surfaces,
+  OAuth/policy gates, and the admission checklist for each new YouTube slice.
 - Named search-session routing through `--session` and `FILMOT_SESSION`, with
   bulk-download TOPIC inference and an explicit CLI → environment → bulk TOPIC
   → date precedence.
@@ -70,6 +79,37 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   accounting, typed partial/empty states, and copyable continuations;
   `yt-playlist --raw` adds an ordered item ledger and a pipeline-compatible
   current-video projection.
+- `yt-comments VIDEO` for one bounded public `commentThreads.list` cursor and
+  `yt-replies TOP_LEVEL_COMMENT_ID [--video VIDEO]` for the separate
+  `comments.list(parentId=...)` reply cursor. Both default to one page/25 rows,
+  5/20-second connect/read timeouts, and two retries; both accept `--pages`
+  1–10, `--max-results`/`-n` 1–500, `--page-token`, positive finite timeouts,
+  `--retries` 0–5, and `--raw`. Threads also accept
+  `--order time|relevance`, `--search`/`--search-terms` (1–500 non-control
+  characters), and `--replies none|preview`.
+- Typed public-discussion results with independent endpoint-specific
+  continuations, exact request/coverage/call accounting, thread
+  `availability`, and conservative quota estimates at one unit per HTTP
+  attempt including retries. The result status distinguishes `completed`,
+  `empty`, first-page disabled `skipped`, later-page `partial`, and first-page
+  `failed` retrieval; a preview subset alone is not mislabeled partial.
+- Exact transient raw discussion schemas. Thread output contains `provider`,
+  `video_id`, `comment_threads`, `replies_mode`, `availability`, `request`,
+  `coverage`, `api_calls`, `quota`, `continuation`, `observed_at`, `expires_at`,
+  and `_filmot`; reply output contains `provider`, `parent_comment_id`, nullable
+  `video_id`, `replies`, `request`, `coverage`, `api_calls`, `quota`,
+  `continuation`, `observed_at`, `expires_at`, and `_filmot`. Embedded replies
+  remain a covered preview, and
+  human output explicitly hands their nested top-level comment ID—not the
+  outer thread ID—to `yt-replies`.
+- A deliberately non-pipeline, non-library policy boundary for public
+  discussion. Raw exports carry 30-day observation/expiry timestamps; compact
+  events retain only invocation controls/presence booleans, coarse safe
+  diagnostics, and API-attempt/quota telemetry, and are marked
+  `transient_result_persisted=false`. They omit response identities, rows,
+  counts, coverage, availability, continuation state, search/discussion text,
+  and tokens. No sentiment analysis, author profiling or sensitive-trait
+  inference, or derived engagement metrics are produced.
 - A provider-neutral discovery candidate contract for Filmot, direct YouTube,
   and bare/list/result/videos/items artifacts. It provides all-row preflight,
   strict YouTube identities, zero-vs-missing preservation, bounded sanitized
@@ -93,6 +133,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Public-playlist and public-discussion providers now share bounded request
+  controls, credential-detached errors, page-information parsing, request
+  options, and opaque next-token handling through
+  `filmot.youtube_api_support`; endpoint-specific identity, parsing, and policy
+  remain in their provider modules.
 - Library list/search/compare/stats, stdout-only context, default echo
   inspection, claim display, and session inspection are read-only. Echo
   analysis never logs even when `--persist` writes its artifact; context file
@@ -171,6 +216,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Comment/reply CLI timeouts now reject non-finite values before provider or
+  ledger activity (F-023).
+- A later-page `commentsDisabled` response preserves earlier rows as partial
+  but clears the stale page token and cannot advertise a continuation (F-024).
+- Later-page YouTube failures now pass through the same credential-detached
+  error boundary as first-page failures; typed/raw/ledger output cannot retain
+  native credential-bearing request state.
+- Generated YouTube continuations and the human comment-to-reply drill-down now
+  preserve the active named session, including global-option placement.
+- Human comment/reply rendering neutralizes bidi/Unicode format and terminal
+  controls, collapses metadata newlines, and pads public text blocks so
+  untrusted content cannot visually impersonate Filmot labels; raw data remains
+  unchanged.
+- Discussion session events no longer persist video identity, response
+  counters, coverage, availability, or continuation state; the explicit
+  transient marker and stricter request/call/quota invariants keep lifecycle
+  and accounting claims machine-checkable.
 - Playlist command/provider boundaries reject API-key-shaped identities,
   detach unexpected transport exceptions without retaining caller state, and
   reject cross-resource rows before they can enter the transcript pipeline.

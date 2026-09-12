@@ -8,18 +8,27 @@ log without retaining the developer key.
 
 from __future__ import annotations
 
-import math
 import re
 import time
 from datetime import timedelta
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .channel_dl import _parse_channel_reference
+from .youtube_api_support import (
+    _detached_youtube_error,
+    _error_row,
+    _invalid_response,
+    _mapping,
+    _merge_page_info,
+    _next_token,
+    _page_info,
+    _request_options,
+    _string_list,
+    _text,
+    _validate_request_controls,
+)
 from .youtube_search import (
-    DEFAULT_CONNECT_TIMEOUT_SECONDS,
-    DEFAULT_MAX_RETRIES,
-    DEFAULT_READ_TIMEOUT_SECONDS,
     DEFAULT_RETRY_BACKOFF_SECONDS,
     METADATA_TTL_DAYS,
     YouTubeAPIError,
@@ -27,7 +36,6 @@ from .youtube_search import (
     _format_rfc3339,
     _optional_int,
     _request_json,
-    _resolve_timeout,
     _thumbnail,
     get_video_details_detailed,
     validate_youtube_api,
@@ -72,7 +80,7 @@ _SAFE_VALUE_ERROR_MESSAGES = frozenset({
     "Unsupported YouTube channel URL; use /channel/UC... or /@handle",
     "playlist_reference must be a playlist ID or supported YouTube URL",
     (
-        "Missing YOUTUBE_API_KEY in .env file. Get one from "
+        "Missing YOUTUBE_API_KEY in Filmot configuration. Get one from "
         "https://console.cloud.google.com/apis/credentials"
     ),
 })
@@ -128,112 +136,11 @@ def _safe_public_value_error(error: ValueError) -> str:
     return "Invalid YouTube playlist resource request"
 
 
-def _detached_youtube_error(error: YouTubeAPIError) -> YouTubeAPIError:
-    """Copy only bounded scalar diagnostics into a fresh public exception."""
-    category = str(getattr(error, "category", "unknown"))
-    if not re.fullmatch(r"[a-z_]{1,40}", category):
-        category = "unknown"
-    reason = str(getattr(error, "reason", "requestFailed"))
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", reason):
-        reason = "requestFailed"
-    status_code = getattr(error, "status_code", None)
-    if isinstance(status_code, bool) or not isinstance(status_code, int):
-        status_code = None
-    attempts = getattr(error, "attempts", 1)
-    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
-        attempts = 1
-    status = ", HTTP {}".format(status_code) if status_code is not None else ""
-    return YouTubeAPIError(
-        "YouTube API {} error ({}{})".format(category, reason, status),
-        category=category,
-        reason=reason,
-        status_code=status_code,
-        retryable=bool(getattr(error, "retryable", False)),
-        attempts=attempts,
-    )
-
-
 def _unexpected_resource_error() -> YouTubeAPIError:
     """Return a generic error that retains no unexpected exception material."""
-    return YouTubeAPIError(
-        "YouTube API client failed before a safe resource response was available",
-        category="unknown",
-        reason="unexpectedException",
-        retryable=False,
-        attempts=0,
-    )
+    from .youtube_api_support import _unexpected_provider_error
 
-
-def _text(value: Any) -> Optional[str]:
-    return value if isinstance(value, str) else None
-
-
-def _string_list(value: Any) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, str)]
-
-
-def _mapping(value: Any) -> Dict[str, Any]:
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _validate_request_controls(
-    *,
-    max_pages: int,
-    max_results: int,
-    page_token: Optional[str],
-    timeout: Optional[Any],
-    retries: Optional[int],
-    retry_backoff: float,
-) -> Tuple[int, int, Optional[str], float, float, int, float]:
-    """Validate every control-plane value before an API request is made."""
-    for name, value in (("max_pages", max_pages), ("max_results", max_results)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError("{} must be a positive integer".format(name))
-    if page_token is not None:
-        if not isinstance(page_token, str) or not page_token.strip():
-            raise ValueError("page_token must be non-empty text when provided")
-        page_token = page_token.strip()
-    connect_timeout, read_timeout = _resolve_timeout(timeout)
-    try:
-        connect_timeout = float(connect_timeout)
-        read_timeout = float(read_timeout)
-        retry_backoff = float(retry_backoff)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError("timeout and retry_backoff values must be numeric") from None
-    if (
-        not math.isfinite(connect_timeout)
-        or not math.isfinite(read_timeout)
-        or connect_timeout <= 0
-        or read_timeout <= 0
-    ):
-        raise ValueError("timeouts must be finite and greater than zero")
-    if not math.isfinite(retry_backoff) or retry_backoff < 0:
-        raise ValueError("retry_backoff must be finite and non-negative")
-    if retries is None:
-        retries = DEFAULT_MAX_RETRIES
-    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
-        raise ValueError("retries must be a non-negative integer")
-    return (
-        max_pages,
-        max_results,
-        page_token,
-        connect_timeout,
-        read_timeout,
-        retries,
-        retry_backoff,
-    )
-
-
-def _invalid_response(endpoint: str, reason: str) -> YouTubeAPIError:
-    return YouTubeAPIError(
-        "YouTube API invalid response ({}) at {}".format(reason, endpoint),
-        category="invalid_response",
-        reason="malformedResponse",
-        retryable=False,
-        attempts=1,
-    )
+    return _unexpected_provider_error("resource")
 
 
 def _playlist_resource(
@@ -358,55 +265,6 @@ def _playlist_item_resource(
     }
 
 
-def _error_row(error: YouTubeAPIError, *, stage: str, page: int) -> Dict[str, Any]:
-    return {"stage": stage, "page": page, **error.to_dict()}
-
-
-def _request_options(
-    *,
-    session: Optional[Any],
-    connect_timeout: float,
-    read_timeout: float,
-    retries: int,
-    retry_backoff: float,
-    sleep: Callable[[float], None],
-) -> Dict[str, Any]:
-    return {
-        "session": session,
-        "connect_timeout": connect_timeout,
-        "read_timeout": read_timeout,
-        "max_retries": retries,
-        "retry_backoff": retry_backoff,
-        "sleep": sleep,
-    }
-
-
-def _page_info(response: Dict[str, Any]) -> Dict[str, Optional[int]]:
-    raw = _mapping(response.get("pageInfo"))
-    return {
-        "approximate_total_results": _optional_int(raw.get("totalResults")),
-        "results_per_page": _optional_int(raw.get("resultsPerPage")),
-    }
-
-
-def _merge_page_info(
-    current: Dict[str, Optional[int]],
-    update: Dict[str, Optional[int]],
-) -> None:
-    for name, value in update.items():
-        if value is not None:
-            current[name] = value
-
-
-def _next_token(response: Dict[str, Any]) -> Tuple[Optional[str], bool]:
-    value = response.get("nextPageToken")
-    if value is None or value == "":
-        return None, True
-    if not isinstance(value, str):
-        return None, False
-    return value, True
-
-
 def _enumerate_playlists(
     channel_id: str,
     *,
@@ -460,6 +318,7 @@ def _enumerate_playlists(
             error = _invalid_response(
                 YOUTUBE_PLAYLISTS_URL,
                 "playlists.items is not an array",
+                attempts=result.attempts,
             )
             errors.append(_error_row(error, stage="playlists", page=page))
             stopping_reason = "partial_failure"
@@ -492,6 +351,7 @@ def _enumerate_playlists(
             error = _invalid_response(
                 YOUTUBE_PLAYLISTS_URL,
                 "playlists.nextPageToken is not text",
+                attempts=result.attempts,
             )
             errors.append(_error_row(error, stage="pagination", page=page))
             stopping_reason = "partial_failure"
@@ -509,6 +369,7 @@ def _enumerate_playlists(
             error = _invalid_response(
                 YOUTUBE_PLAYLISTS_URL,
                 "playlists pagination repeated a token",
+                attempts=result.attempts,
             )
             errors.append(_error_row(error, stage="pagination", page=page))
             stopping_reason = "partial_failure"
@@ -614,6 +475,7 @@ def _list_channel_playlists_detailed(
         raise _invalid_response(
             YOUTUBE_CHANNELS_URL,
             "channels.items is not an array",
+            attempts=channel_result.attempts,
         )
     malformed_channels = 0
     channel = None
@@ -840,6 +702,7 @@ def _enumerate_playlist_items(
             error = _invalid_response(
                 YOUTUBE_PLAYLIST_ITEMS_URL,
                 "playlistItems.items is not an array",
+                attempts=result.attempts,
             )
             errors.append(_error_row(error, stage="playlist-items", page=page))
             stopping_reason = "partial_failure"
@@ -876,6 +739,7 @@ def _enumerate_playlist_items(
             error = _invalid_response(
                 YOUTUBE_PLAYLIST_ITEMS_URL,
                 "playlistItems.nextPageToken is not text",
+                attempts=result.attempts,
             )
             errors.append(_error_row(error, stage="pagination", page=page))
             stopping_reason = "partial_failure"
@@ -893,6 +757,7 @@ def _enumerate_playlist_items(
             error = _invalid_response(
                 YOUTUBE_PLAYLIST_ITEMS_URL,
                 "playlistItems pagination repeated a token",
+                attempts=result.attempts,
             )
             errors.append(_error_row(error, stage="pagination", page=page))
             stopping_reason = "partial_failure"
@@ -1066,6 +931,7 @@ def _get_playlist_detailed(
         raise _invalid_response(
             YOUTUBE_PLAYLISTS_URL,
             "playlists.items is not an array",
+            attempts=metadata_result.attempts,
         )
     playlist = None
     malformed_playlists = 0

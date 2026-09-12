@@ -1066,3 +1066,228 @@ therefore a research decision rather than recovery from tool ambiguity.
   **928 tests** with one upstream Google Python 3.10 lifecycle warning; and
   `git diff --check`, command-help smoke checks, and the changed-diff Google
   API-key-shape scan passed.
+
+## Investigation 5 — Bounded public discussion on active inference — 2026-09-12
+
+### Research and tool question
+
+Can Filmot inspect discussion attached to an exact research video, distinguish
+a thread from its top-level comment, and cross into the independent reply
+cursor without making comment pagination, identity handling, retention, or
+privacy bookkeeping compete with reading the discussion itself?
+
+This was a tool-mechanics field test, not an audience study. Comment rows were
+treated as mutable, self-selected public discourse: no sentiment, author
+profiling, demographic inference, consensus estimate, or derived engagement
+metric was produced.
+
+### Minimal live trail
+
+Every call used an isolated temporary `FILMOT_DATA_DIR`, a named session, one
+page, zero retries, and raw output held only in process memory. The temporary
+directory and its ledger were removed on exit. The reply identity below is
+deliberately represented by a placeholder; no comment/thread ID, author field,
+comment text, page token, or response body was written to this repository.
+
+```bash
+filmot --session curated-active-inference-comments-2026-09-12 \
+  yt-comments PNYWi996Beg --order relevance --replies preview \
+  --pages 1 --max-results 10 --retries 0 --raw
+
+filmot --session curated-active-inference-replies-2026-09-12 \
+  yt-comments V_VXOdf1NMw --order relevance --replies preview \
+  --pages 1 --max-results 10 --retries 0 --raw
+
+# The first ten threads on either video contained no reply-bearing thread, so
+# one same-cost page was widened rather than starting a discovery crawl.
+filmot --session curated-active-inference-replies-2026-09-12 \
+  yt-comments PNYWi996Beg --order relevance --replies preview \
+  --pages 1 --max-results 50 --retries 0 --raw
+
+filmot --session curated-active-inference-replies-2026-09-12 \
+  yt-replies TOP_LEVEL_COMMENT_ID --video PNYWi996Beg \
+  --pages 1 --max-results 10 --retries 0 --raw
+
+# Fresh seed call whose in-memory next token supplied the resume call.
+filmot --session curated-active-inference-continuation-2026-09-12 \
+  yt-comments PNYWi996Beg --pages 1 --max-results 10 \
+  --order relevance --replies preview --retries 0 --raw
+
+# The token and command controls came from continuation.argv. This historical
+# orchestration reinserted the global session prefix; PAGE_TOKEN was never
+# printed, copied, interpreted, or written to this repository.
+filmot --session curated-active-inference-continuation-2026-09-12 \
+  yt-comments PNYWi996Beg --page-token PAGE_TOKEN \
+  --pages 1 --max-results 10 --order relevance \
+  --replies preview --retries 0 --raw
+```
+
+- Both initial ten-thread cursors completed in one attempt and stopped at the
+  explicit result budget. Neither slice happened to contain a thread with a
+  reported reply, which was presented as corpus state rather than an error.
+- The widened one-page cursor retained 50 threads in one attempt, exposed ten
+  valid embedded preview replies across the returned threads, and made a
+  nested top-level comment ID available for explicit drill-down.
+- `yt-replies` used that nested identity—not the outer thread ID—returned two
+  replies in one attempt, and stopped at `exhausted` with no continuation.
+- A fresh ten-thread slice then exposed `continuation.argv`; the orchestration
+  used its token and command controls while reinserting the global named-session
+  prefix. The resumed call returned the next ten threads in one attempt with
+  zero thread-identity overlap and preserved order, preview, bounds, retry, and
+  raw-output controls without displaying the opaque token.
+- The six calls consumed six conservatively reported quota units in total.
+  No retry obscured the relationship between an HTTP attempt and quota cost.
+- Privacy inspection covered all isolated session events. It found zero
+  occurrences of the live thread/comment/parent identities, author names or
+  channel IDs, displayed text, or page tokens collected from the in-memory
+  responses. The final two-command ledger contained exactly two compact
+  events.
+
+### Post-hardening live recheck — passed
+
+The final two-call seed/resume check executed the emitted continuation argument
+vector exactly, changing only `filmot` to the local executable path. The emitted
+vector retained `--session "Public Discussion Post Hardening"` in the correct
+global position. Both calls completed in one HTTP attempt and returned ten
+threads; the resumed slice had zero top-level comment identity overlap with the
+seed slice.
+
+The isolated ledger contained exactly two events, both marked
+`transient_result_persisted=false`. Programmatic comparison against the
+in-memory responses found zero live identity, author/channel, displayed-text,
+canonical-URL, or page-token occurrences and zero forbidden response fields:
+no row, count, coverage, availability, or continuation state persisted. The
+temporary data directory was removed after inspection. These two attempts add
+two conservatively reported quota units, bringing this discussion drive to
+eight calls and eight estimated units total.
+
+### Friction and recovery log
+
+#### F-023 — Non-finite CLI timeouts passed Click's positive range
+
+- Status: fixed and regression-tested.
+- Stage: pre-request command validation.
+- Expected: `nan` and infinities fail before provider invocation or ledger
+  activity, just like zero and negative timeouts.
+- Observed: Click's positive floating-point range did not reject every
+  non-finite spelling, leaving the provider to discover the invalid control.
+- Cognitive cost: validity depended on remembering a downstream invariant,
+  and failure timing could differ between otherwise equivalent bad inputs.
+- Classification: validation-boundary gap.
+- Severity: medium for predictable automation.
+- Resolution: both comment commands now apply the same explicit finite,
+  greater-than-zero validation before building request or ledger data.
+
+#### F-024 — Later-page `commentsDisabled` could advertise a stale resume token
+
+- Status: fixed and regression-tested.
+- Stage: a disabled response on a later pagination page.
+- Expected: a typed disabled state is terminal for that observed cursor and
+  cannot simultaneously offer a continuation.
+- Observed: the safe failed-page preservation rule initially retained the
+  current page token even when YouTube specifically reported
+  `commentsDisabled`.
+- Cognitive cost: status and next action contradicted each other, forcing the
+  caller to choose which field to trust.
+- Classification: continuation/status invariant.
+- Severity: high for reliable resumption.
+- Resolution: a later disabled response preserves completed rows as partial,
+  records the disabled availability, clears the token, and exposes no
+  continuation.
+
+#### F-025 — Later-page errors bypassed the shared credential-detachment point
+
+- Status: fixed and regression-tested.
+- Stage: partial pagination after a completed page.
+- Expected: first-page and later-page failures have the same detached, typed
+  error boundary and never retain a native request, response, URL, or API key.
+- Observed: the later-page assembly path could stringify an otherwise typed
+  transport exception after it left the shared detachment helper.
+- Cognitive cost: callers had to reason about two security behaviors for the
+  same endpoint based only on which page failed.
+- Classification: security-boundary inconsistency.
+- Severity: high for raw output and durable diagnostics.
+- Resolution: generic YouTube error construction now detaches every page
+  failure centrally; synthetic credential-bearing exceptions are covered at
+  provider, raw-result, and ledger boundaries.
+
+#### F-026 — Emitted continuations dropped the active named session
+
+- Status: fixed, regression-tested, and live-verified.
+- Stage: emitted continuation and human thread-to-reply handoff.
+- Expected: the printed/structured next command stays in the current named
+  session without the caller remembering Click's global-option placement.
+- Observed: the original field-test orchestration had to reinsert
+  `--session NAME` ahead of the command when replaying the emitted arguments.
+- Cognitive cost: an otherwise self-contained continuation could silently
+  route its audit event to the default session.
+- Classification: context-preservation gap.
+- Severity: high for research provenance.
+- Resolution: a shared continuation prefix places the active named session
+  before `yt-comments`, `yt-replies`, playlist, and channel commands; the human
+  reply drill-down uses the same prefix.
+
+#### F-027 — Compact discussion events retained response-derived state
+
+- Status: fixed, regression-tested, and live-verified.
+- Stage: post-command session logging.
+- Expected: transient public user-data results are not silently converted into
+  an indefinite response-summary archive.
+- Observed: early compact events omitted text and identities but still retained
+  video scope, response counts, coverage, availability, and continuation
+  availability.
+- Cognitive cost: the operator had to remember a lifecycle obligation for
+  data that was invisible in ordinary session review.
+- Classification: data-lifecycle boundary gap.
+- Severity: high for predictable retention.
+- Resolution: discussion events retain only invocation controls/presence
+  booleans, coarse safe diagnostics, and API-attempt/quota telemetry, explicitly
+  marked `transient_result_persisted=false`; no API response identity, row,
+  count, coverage, availability, continuation state, text, or token persists.
+
+#### F-028 — Public text could visually impersonate tool output
+
+- Status: fixed and regression-tested.
+- Stage: human comment and reply rendering.
+- Expected: untrusted API strings remain visibly distinct from Filmot labels
+  and cannot reorder text or control the terminal.
+- Observed: line-oriented escaping alone did not contain every Unicode
+  bidi/format control or metadata newline, and an unpadded text line could look
+  like adjacent tool output.
+- Cognitive cost: the reader could not reliably distinguish discussion content
+  from navigation, status, or attribution rendered by Filmot.
+- Classification: terminal trust-boundary gap.
+- Severity: high for reliable human inspection.
+- Resolution: human rendering neutralizes bidi/Unicode format and terminal
+  controls, collapses metadata newlines, and places public text in padded
+  blocks. Raw field values remain unchanged for programmatic use.
+
+### Final integration gate
+
+- `.venv/bin/python -m pytest -q` passed **1,152 tests**. The only warning is
+  Google client-library notice that Python 3.10 reaches upstream end of support
+  on 2026-10-04; it is not a Filmot test failure.
+- The focused comment/reply, shared playlist-resource, command-topology, and
+  release-metadata gate passed 262 tests.
+- `python -m compileall -q filmot tests main.py`, `git diff --check`, and help
+  smokes for the root CLI, both discussion commands, playlists, and channel
+  download passed.
+- The final live result is the two-attempt post-hardening replay above: exact
+  emitted continuation, zero row overlap, and a response-free isolated ledger.
+
+### Cognitive-load assessment
+
+The operational path is now compact: exact video → bounded thread cursor →
+inspect the explicit preview count → pass the printed nested top-level identity
+to `yt-replies` → follow only that endpoint's continuation. The command owns
+quota-attempt counts, reply-preview completeness, stopping reasons, safe
+continuation arguments, 30-day expiry, terminal rendering, and compact ledger
+redaction. The researcher does not need to remember the upstream thread/comment
+identity mismatch or infer whether embedded replies are complete.
+
+The remaining load is appropriately about the material. A relevance-ordered
+comment page is not a representative sample; an absent reply in the first ten
+threads is not an API failure; a displayed comment is not corroboration; and an
+exhausted reply cursor is only a snapshot at the observation time. Expanding
+from ten to fifty threads to find a reply-bearing example was a deliberate
+scope choice, not recovery from ambiguous tool state.

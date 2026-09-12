@@ -13,7 +13,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from ..api import FilmotClient
-from ..session_context import session_option
+from ..session_context import continuation_argv_prefix, session_option
 from ..cli_support import (
     command_error as _command_error,
     console,
@@ -785,8 +785,7 @@ def _channel_continuation(
     argv = []
     if available:
         argv = [
-            "filmot",
-            "channel-download",
+            *continuation_argv_prefix("channel-download"),
             requested_channel,
             "--page-token",
             token,

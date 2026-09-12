@@ -594,6 +594,7 @@ from .commands.transcript import (
     transcript_search,
 )
 from .commands.youtube import yt_playlist, yt_playlists
+from .commands.youtube_comments import yt_comments, yt_replies
 
 for command in (
     search,
@@ -607,6 +608,8 @@ for command in (
     yt_video,
     yt_playlist,
     yt_playlists,
+    yt_comments,
+    yt_replies,
     yt_data,
     claims,
     library,

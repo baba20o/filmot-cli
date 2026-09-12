@@ -92,7 +92,10 @@ the full-transcript similarity analysis performed by `library echoes`.
 
 ### 5. Relevance Density Scoring
 
-**What it does:** Calculate and display `matches_per_minute` for each search result. A 5-minute video with 12 matches is more relevant than a 3-hour video with 4 matches.
+**What it does:** Calculate and display `matches_per_minute` for each search
+result. A 5-minute video with 12 literal matches has greater lexical match
+concentration than a 3-hour video with 4; that does not establish semantic
+relevance, source credibility, or truth.
 
 **Implementation:**
 - In `_display_subtitle_results()`, compute density: `len(hits) / (duration / 60)` where duration > 0
@@ -278,6 +281,60 @@ forms in the `--title` parameter.
 **Current owners:** `filmot/commands/youtube.py`,
 `filmot/youtube_resources.py`, `filmot/discovery.py`
 
+### Bounded public comment and reply inspection
+
+- `yt-comments VIDEO` reads one exact video's `commentThreads.list` cursor;
+  `yt-replies TOP_LEVEL_COMMENT_ID [--video VIDEO]` reads the separate
+  `comments.list(parentId=...)` cursor. The reply identity is the nested
+  `top_level_comment.comment_id`, never the outer thread ID, and embedded
+  replies remain an explicitly covered preview rather than an automatic
+  fan-out.
+- Both commands default to one page/25 rows and 5/20-second connect/read
+  timeouts with two retries. They accept `--pages` 1–10,
+  `--max-results`/`-n` 1–500, `--page-token`, positive finite timeouts,
+  `--retries` 0–5, and `--raw`. Threads additionally accept
+  `--order time|relevance`, 1–500-character `--search`/`--search-terms`, and
+  `--replies none|preview`; replies accept optional exact `--video` context.
+- Raw thread data exposes `provider`, `video_id`, `comment_threads`,
+  `replies_mode`, `availability`, `request`, `coverage`, `api_calls`, `quota`,
+  `continuation`, `observed_at`, and `expires_at`; replies substitute
+  `parent_comment_id`, nullable `video_id`, and `replies`. `_filmot` carries the
+  `filmot.result/v1` status/errors/warnings. Typed outcomes distinguish
+  completed, empty, first-page disabled/skipped, later-page partial, and
+  first-page failed retrieval. Continuations preserve the matching token kind
+  and argument vector as well as the active named session; the human reply
+  drill-down preserves it too.
+- Every `commentThreads.list` or `comments.list` HTTP attempt is conservatively
+  estimated at one quota unit, including retries. The output keeps actual
+  endpoint attempt counts; it does not claim to know project quota balance.
+- Discussion results deliberately lack pipeline candidate keys and never enter
+  the transcript library or `yt-data` lifecycle. Raw exports carry a 30-day
+  refresh/delete deadline. Compact session events retain invocation controls,
+  presence booleans, coarse safe diagnostics, and call/quota telemetry, with
+  `transient_result_persisted=false`; they omit all response rows, identities,
+  counts, coverage, availability, continuation state, search text, and tokens.
+- Comments are mutable, self-selected, untrusted discourse—not corroboration,
+  consensus, authority, or a representative audience measure. The feature does
+  not compute sentiment, profile authors or infer sensitive traits, or create
+  derived engagement metrics. Human display neutralizes bidi/Unicode format
+  and terminal controls, collapses metadata newlines, and contains text in
+  padded blocks without altering raw rows.
+- Generic bounded-control, credential-detached error, page-info, request-option,
+  and next-token handling now lives in `filmot.youtube_api_support`; playlist
+  and comment providers share it while retaining endpoint-specific parsing and
+  policy decisions.
+
+Deterministic provider/CLI implementation and a bounded live API-key thread,
+reply, and emitted-continuation drive are complete. See the exact nested raw
+schemas in
+[AGENTS_README.md](AGENTS_README.md#transient-public-comment-and-reply-inspection).
+Future endpoint priorities, OAuth-only surfaces, and policy gates are maintained
+in [YOUTUBE_ROADMAP.md](YOUTUBE_ROADMAP.md), not duplicated here.
+
+**Current owners:** `filmot/commands/youtube_comments.py`,
+`filmot/youtube_comments.py`, `filmot/youtube_api_support.py`,
+`filmot/youtube_resources.py`, `filmot/schemas.py`
+
 ### Named search routing and session summaries
 
 - `filmot search --session NAME` routes the search activity event to a named
@@ -425,6 +482,8 @@ forms in the `--title` parameter.
 | 8 | Pipeline/stdin | DONE | `filmot download` reads a piped raw discovery value |
 | 9 | `--title` operators | DONE | Confirmed working, documented in README |
 | 10 | Speaker labels | NOT POSSIBLE | youtube-transcript-api only provides text/start/duration |
+| 11 | Public comment/reply cursors | DONE (LIVE VERIFIED) | Bounded thread, reply, exact-session continuation, and minimal-ledger privacy paths passed live; the complete drive is recorded in `FIELD_TEST_LOG.md` |
+| 12 | Shared YouTube API support | DONE | Playlist/comment controls, safe errors, page info, and tokens share one internal helper |
 
 The suite has expanded substantially since this plan was written. Run the
 current test suite rather than relying on a frozen test count. Verification

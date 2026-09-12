@@ -26,6 +26,7 @@ from ..schemas import (
     YouTubePlaylistResultData,
     YouTubePlaylistShelfResultData,
 )
+from ..session_context import continuation_argv_prefix
 
 
 DEFAULT_PLAYLIST_PAGES = 1
@@ -488,8 +489,7 @@ def _continuation(
     argv: List[str] = []
     if available:
         argv = [
-            "filmot",
-            command,
+            *continuation_argv_prefix(command),
             identity,
             "--page-token",
             token,

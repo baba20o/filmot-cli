@@ -228,7 +228,7 @@ def test_playlist_enumeration_is_bounded_enriched_and_credential_safe(monkeypatc
 
 def test_later_playlist_item_failure_preserves_prior_page(monkeypatch):
     failure = resources.YouTubeAPIError(
-        "safe timeout",
+        "leaking later-page timeout key={}".format(SECRET),
         category="timeout",
         reason="timeout",
         retryable=True,
@@ -269,6 +269,10 @@ def test_later_playlist_item_failure_preserves_prior_page(monkeypatch):
     assert result["coverage"]["stopping_reason"] == "partial_failure"
     assert result["coverage"]["next_page_token"] == "PAGE-2"
     assert result["errors"][0]["stage"] == "playlist-items"
+    assert result["errors"][0]["message"] == (
+        "YouTube API timeout error (timeout)"
+    )
+    assert SECRET not in repr(result)
     assert result["api_calls"]["total"] == 5
 
 

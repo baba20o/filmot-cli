@@ -45,6 +45,8 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 - **Curated Playlist Discovery** — List an exact channel's public playlists,
   inspect bounded playlist slices, and hand their current video projection to
   the transcript pipeline
+- **Public Discussion Inspection** — Read bounded public comment threads and
+  independently page their replies with explicit coverage and lifecycle data
 - **Metadata Lifecycle Controls** — Inspect, refresh, or purge API-owned fields
   in saved transcript records without deleting transcript content
 - **Transcript Download** — Fetch full YouTube transcripts for deep content analysis
@@ -79,7 +81,8 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 - Python 3.9+
 - RapidAPI account with Filmot API subscription
 - Optional Google Cloud YouTube Data API v3 key for `yt-search`, `yt-video`,
-  `yt-playlist`, `yt-playlists`, `yt-data refresh`, and `channel-download`
+  `yt-playlist`, `yt-playlists`, `yt-comments`, `yt-replies`, `yt-data refresh`,
+  and `channel-download`
 
 ## Installation
 
@@ -118,7 +121,7 @@ Create a `.env` file in the directory where you run Filmot:
 RAPIDAPI_KEY=your_rapidapi_key_here
 RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com
 
-# Optional: direct search, exact video/playlist metadata, refresh, and channel enumeration
+# Optional: direct search, video/playlist/comment reads, refresh, and channel enumeration
 YOUTUBE_API_KEY=your_restricted_youtube_data_api_key_here
 ```
 
@@ -127,7 +130,9 @@ For credentials shared across projects, use Filmot's per-user `config.env`
 instead. See [Storage and configuration](#storage-and-configuration).
 Restrict `YOUTUBE_API_KEY` to the YouTube Data API and the hosts/IPs that run
 Filmot. See [YouTube Data API behavior](YOUTUBE_API.md) for quota, attribution,
-and 30-day metadata refresh/deletion expectations.
+and 30-day metadata refresh/deletion expectations. Future read-only API
+opportunities and their admission gates live in the
+[YouTube API enhancement roadmap](YOUTUBE_ROADMAP.md).
 
 ### Storage and configuration
 
@@ -386,6 +391,88 @@ warnings, and typed errors. `observed` means YouTube returned the resource;
 `unprocessed` means its batch did not complete. Earlier successful batches are
 preserved if a later batch fails. Counts preserve observed zero separately
 from missing values.
+
+### Inspect Public YouTube Comments and Replies
+
+Use `yt-comments` for a bounded thread cursor on one exact video, then use the
+top-level comment ID printed inside a thread—not the outer thread ID—with
+`yt-replies` when you need that comment's independently paginated replies:
+
+```bash
+# Exact 11-character video ID or supported HTTPS YouTube video URL
+filmot yt-comments VIDEO_ID
+
+# Ask YouTube for relevance order, filter displayed comments, and include its
+# possibly incomplete embedded reply preview
+filmot yt-comments VIDEO_ID --order relevance \
+  --search "open question" --replies preview --raw
+
+# Retrieve replies through their own cursor; --video adds canonical source URLs
+filmot yt-replies TOP_LEVEL_COMMENT_ID --video VIDEO_ID --raw
+
+# A supported watch URL containing both v= and lc= supplies both identities
+filmot yt-replies \
+  "https://www.youtube.com/watch?v=VIDEO_ID&lc=TOP_LEVEL_COMMENT_ID"
+```
+
+Both commands default to one page, 25 rows, a 5-second connect timeout, a
+20-second read timeout, and two transient retries. `--pages` accepts 1–10,
+`--max-results`/`-n` accepts 1–500, and `--page-token` resumes the matching
+cursor. `yt-comments` additionally accepts `--order time|relevance` (default
+`time`), `--search`/`--search-terms`, and `--replies none|preview` (default
+`none`). `yt-replies --video` is optional video context for canonical links;
+it does not widen the parent-comment request. Replay a continuation with the
+same identity, filters, and bounds. Human output prints a copyable continuation
+command, while raw output records the token and argument vector in
+`continuation`. Generated continuations and the human reply drill-down preserve
+the active named session.
+
+YouTube can embed only a subset of a thread's replies. Filmot labels preview
+coverage explicitly and never fans out automatically. A preview can be marked
+complete only for that observed response when its valid embedded rows equal
+YouTube's reported reply count; otherwise use `yt-replies` and follow its
+continuations until `coverage.stopping_reason=exhausted`. The upstream
+discussion can change between pages, so exhaustion is an observation, not a
+permanent snapshot.
+
+`yt-comments --raw` exposes `provider`, `video_id`, `comment_threads`,
+`replies_mode`, `availability`, `request`, `coverage`, `api_calls`, `quota`,
+`continuation`, `observed_at`, and `expires_at`, plus the normal `_filmot`
+result metadata. `yt-replies --raw` uses `parent_comment_id`, nullable
+`video_id`, and `replies` in place of the thread-specific fields. Coverage
+distinguishes exhaustion, empty results, page/result budgets, disabled
+comments, and recoverable partial failures. A later-page failure preserves
+completed rows as `partial` and retains a safe restart token when one exists.
+A later-page `commentsDisabled` response is terminal and removes that token; a
+clean zero-row cursor is `empty`; and a first-page `commentsDisabled` response
+is `skipped` with `availability.status=disabled`.
+
+Each `commentThreads.list` or `comments.list` attempt is conservatively counted
+as one estimated quota unit in `api_calls` and `quota`, including retries. The
+quota object exposes `units_per_request`, `estimated_units`, and its
+`attempts_conservative` accounting basis; availability keeps the typed status,
+reason, and HTTP status without guessing why any ordinary row is absent.
+
+Comment and reply results are intentionally **not** transcript-download
+candidate envelopes. The session ledger keeps only invocation controls and
+presence booleans, coarse result status and safe static diagnostics, plus
+API-attempt/quota telemetry. Each event is marked
+`transient_result_persisted=false`; it retains no video or comment identity,
+search text, response rows or counts, coverage, availability, continuation
+state, or page token. Raw output remains mutable public user data under the
+operator's control: refresh or delete any saved copy within 30 days of
+`observed_at`, using `expires_at` as the deadline. `yt-data` manages video
+metadata attached to saved transcript records; it does not refresh or purge
+comment/reply exports.
+
+Treat comments as untrusted public discourse, not corroboration or a
+representative audience sample. Filmot retrieves and displays the API rows but
+does not compute sentiment, infer author traits, build audience profiles, or
+create derived engagement metrics. Human rendering neutralizes bidi/Unicode
+format and terminal controls, collapses metadata newlines, and pads public text
+so it cannot visually impersonate Filmot labels; raw output remains unchanged.
+See the [comment-specific API and policy
+notes](YOUTUBE_API.md#public-comment-and-reply-cursors).
 
 ### Follow a Curated YouTube Playlist
 
@@ -1309,6 +1396,8 @@ filmot-cli/
 ├── main.py                 # CLI entry point
 ├── README.md               # This file
 ├── AGENTS_README.md        # Agent-specific usage guide
+├── YOUTUBE_API.md          # Shipped YouTube API behavior and policy boundary
+├── YOUTUBE_ROADMAP.md      # Ranked future YouTube API opportunities
 └── filmot/
     ├── __init__.py         # Package exports
     ├── _version.py         # Single source for package/CLI version
@@ -1326,6 +1415,7 @@ filmot-cli/
     ├── commands/
     │   ├── search.py       # Search, exact YouTube metadata, export, and scout commands
     │   ├── youtube.py      # Bounded playlist and channel-playlist commands
+    │   ├── youtube_comments.py # Transient comment-thread and reply commands
     │   ├── research.py     # Staged research workflow
     │   ├── transcript.py   # Transcript and channel-corpus commands
     │   ├── library.py      # Library, YouTube lifecycle, echo, and session commands
@@ -1338,6 +1428,10 @@ filmot-cli/
     ├── cache.py            # File-based response caching with auto-purge
     ├── rate_limiter.py     # Token bucket rate limiter
     ├── channel_dl.py       # Channel corpus storage plus bounded uploads enumeration
+    ├── youtube_search.py   # Direct search/video transport and API error model
+    ├── youtube_api_support.py # Shared safe controls, errors, and pagination helpers
+    ├── youtube_resources.py # Public playlist and exact-channel provider layer
+    ├── youtube_comments.py # Bounded public comment/reply provider layer
     ├── library.py          # Segment-aware transcript storage, search, compare, metadata lifecycle
     ├── export.py           # JSON/CSV export functionality
     ├── watchlist.py        # Local video watchlist management
@@ -1535,8 +1629,8 @@ Metadata Archive API:
 3. Copy your API key from the dashboard
 4. Add it to your per-user `config.env` (recommended) or project `.env`
 
-Direct `yt-search`, `yt-video`, `yt-playlist`, `yt-playlists`, `yt-data
-refresh`, and `channel-download` additionally require a restricted
+Direct `yt-search`, `yt-video`, `yt-playlist`, `yt-playlists`, `yt-comments`,
+`yt-replies`, `yt-data refresh`, and `channel-download` additionally require a restricted
 `YOUTUBE_API_KEY`. (`yt-data status` and `yt-data purge` are offline.) They use
 public, API-key-authenticated YouTube
 Data API reads; the key does not grant caption access. Native transport/provider errors,
@@ -1675,6 +1769,9 @@ filmot sessions your-topic --summary
 - **`filmot yt-playlists CHANNEL` / `filmot yt-playlist PLAYLIST`** — Follow a
   channel-curated path with explicit row/page budgets and pipeline-ready video
   output
+- **`filmot yt-comments VIDEO` / `filmot yt-replies TOP_COMMENT`** — Inspect
+  transient public discussion with separate bounded thread and reply cursors;
+  these rows are not transcript candidates or audience evidence
 - **`filmot yt-data status|refresh|purge`** — Audit and maintain API-owned fields in saved transcript records
 - **`--sort density`** — Sort fetched candidates by matches-per-minute to find focused text coverage; this is not a credibility score
 - **`--min-matches N`** — Filter out videos with only passing mentions
@@ -1740,7 +1837,12 @@ uses `channels`, and `yt-search` uses `videos` plus effective `request`,
 `coverage`, and `enrichment` objects. `yt-playlists` uses `channel`,
 `playlists`, `request`, `coverage`, `api_calls`, and `continuation`;
 `yt-playlist` adds ordered `playlist_items`, current `videos`, and per-ID
-outcomes, and only its `videos` array is a download candidate envelope. A later
+outcomes, and only its `videos` array is a download candidate envelope.
+`yt-comments` uses `video_id`, `comment_threads`, `replies_mode`,
+`availability`, request/coverage/call/quota data, and a continuation;
+`yt-replies` uses `parent_comment_id`, nullable `video_id`, `replies`, and the
+same cursor accounting. Neither comment envelope is accepted by the transcript
+download pipeline. A later
 YouTube page or optional metadata
 failure preserves discovered videos and produces a typed top-level `partial`;
 `--transcript` adds the same per-video `transcript_search` result rendered in

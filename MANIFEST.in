@@ -1,5 +1,7 @@
 include .env.example
 include AGENTS_README.md
 include CHANGELOG.md
+include YOUTUBE_API.md
+include YOUTUBE_ROADMAP.md
 recursive-include scripts *.py
 recursive-include tests/fixtures/filmot_api *.json *.md

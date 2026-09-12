@@ -16,8 +16,10 @@ Direct `yt-search` is a separate recent-upload metadata discovery path; it
 attaches transcript matches only when `--transcript` is requested. `yt-video`
 fetches current public metadata for known IDs. `yt-playlists` and `yt-playlist`
 follow channel-curated paths without a search-ranking call, and `yt-data`
-maintains the YouTube-owned fields that were saved with transcripts. The
-indexed transcript search is powerful because:
+maintains the YouTube-owned fields that were saved with transcripts.
+`yt-comments` and `yt-replies` are separate, transient public-discussion
+cursors: they neither create download candidates nor enter the transcript
+library. The indexed transcript search is powerful because:
 
 1. You can find discussions that aren't in video titles
 2. You get the exact context of what was said
@@ -733,6 +735,10 @@ filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw \
   | filmot download -t curated-sources -n 10 --dedupe
 ```
 
+`yt-comments --raw` and `yt-replies --raw` are intentionally absent from this
+list: their top-level schemas contain neither `result`, `videos`, nor `items`,
+and they cannot be piped into `download` or persisted as transcript records.
+
 The provider-neutral boundary accepts bare candidate arrays and
 `result`/`videos`/`items` envelopes, normalizes Filmot and YouTube aliases, and
 preflights the complete input before any transcript request or library write.
@@ -817,6 +823,139 @@ expose actual `api_calls`, coverage, a stopping reason, and a copyable
 bounds. All returned fields are 30-day API observations. Playlist curation is
 useful discovery provenance, not proof of credibility, completeness, or source
 independence.
+
+### Transient public comment and reply inspection
+
+Use `yt-comments` for a bounded `commentThreads.list(videoId=...)` cursor and
+`yt-replies` for the independent `comments.list(parentId=...)` cursor beneath
+one top-level comment. These are public API-key reads through
+`YOUTUBE_API_KEY`; neither command requests OAuth access.
+
+```bash
+# VIDEO is an exact 11-character ID or supported HTTPS YouTube video URL
+filmot yt-comments VIDEO --pages 1 --max-results 25
+
+# Optional upstream order/filter and YouTube's embedded reply preview
+filmot yt-comments VIDEO --order relevance --search "open question" \
+  --replies preview --raw
+
+# Use comment_threads[].top_level_comment.comment_id, not thread_id
+filmot yt-replies TOP_LEVEL_COMMENT_ID --video VIDEO --raw
+
+# A supported watch URL containing v= and lc= supplies both identities
+filmot yt-replies \
+  "https://www.youtube.com/watch?v=VIDEO&lc=TOP_LEVEL_COMMENT_ID"
+```
+
+Both commands default to one page, 25 retained rows, a 5-second connect
+timeout, a 20-second read timeout, and two transient retries. Both accept
+`--pages` from 1 through 10, `--max-results`/`-n` from 1 through 500,
+`--page-token`, positive finite `--connect-timeout` and `--read-timeout`,
+`--retries` from 0 through 5, and `--raw`. `yt-comments` additionally accepts
+`--order time|relevance` (default `time`), `--search`/`--search-terms` with
+1–500 non-control characters, and `--replies none|preview` (default `none`).
+`yt-replies --video` is optional exact video ID/URL context for canonical
+links; a comment URL can supply the same context, and conflicting identities
+fail before quota use.
+
+The thread ID and nested top-level comment ID are different resource
+identities. Embedded `replies` are only a preview, never an automatic fan-out.
+`reply_coverage.status=all_observed_at_response` means the valid preview count
+equaled YouTube's reported total in that one response; `subset`, `unknown`, or
+`inconsistent` is not complete. Even an observed-complete preview can change.
+Use the nested top-level comment ID with `yt-replies`, then follow that reply
+cursor's own continuations.
+
+Filmot conservatively estimates one regular YouTube Data API quota unit for
+each `commentThreads.list` or `comments.list` HTTP attempt. A page asks for at
+most 100 rows. Retries are new attempts, so `api_calls.total` includes them and
+`quota` reports
+`units_per_request=1`, `estimated_units=api_calls.total`, and
+`accounting=attempts_conservative`. This is conservative request accounting,
+not a query of the project's remaining quota.
+
+Raw output is a flat `filmot.result/v1` mapping. The exact `yt-comments` keys
+are `provider`, `video_id`, `comment_threads`, `replies_mode`, `availability`,
+`request`, `coverage`, `api_calls`, `quota`, `continuation`, `observed_at`,
+`expires_at`, and `_filmot`. The exact `yt-replies` keys are `provider`,
+`parent_comment_id`, `video_id`, `replies`, `request`, `coverage`, `api_calls`,
+`quota`, `continuation`, `observed_at`, `expires_at`, and `_filmot`.
+`_filmot` contains `schema`, `command`, `status`, `errors`, and `warnings`.
+
+The shared nested accounting shapes are exact:
+
+- `coverage`: `pages_attempted`, `pages_fetched`, `rows_seen`, `returned`,
+  `duplicates_skipped`, `malformed_items_skipped`,
+  `unexpected_scope_skipped`, `next_page_token`, `page_info`,
+  `reported_total`, `stopping_reason`, `api_attempts`, `api_calls`, and
+  `partial`; `page_info` contains `reported_total` and `results_per_page`.
+  Thread coverage also has `embedded_replies_seen`,
+  `embedded_replies_returned`, `embedded_replies_malformed`,
+  `embedded_replies_wrong_parent`, and `embedded_replies_duplicates`.
+- `availability` (threads only): `status` (`available` or `disabled`), `reason`,
+  and `http_status`; the typed disabled state is
+  `reason=commentsDisabled`, `http_status=403`.
+- `api_calls`: `comment_threads`, `comments`, and `total`; `quota`:
+  `units_per_request`, `estimated_units`, and `accounting`.
+- `continuation`: `available`, `next_page_token`, endpoint-specific
+  `token_kind` (`comment_threads` or `comments`), and a reproducible `argv`
+  list. Replay the opaque token only with the same identity, filters, and
+  budgets; generated continuations and the human reply drill-down preserve the
+  active named session. Token pagination is not an immutable snapshot.
+
+The exact thread `request` keys are `video_id`, `video_url`, `requested_at`,
+`order`, `search_terms`, `reply_mode`, `parts`, `text_format`, `max_pages`,
+`max_results`, `page_token`, `page_budget`, `result_budget`, `timeout`,
+`retries`, and `retry_backoff_seconds`. The exact reply `request` keys are
+`parent_comment_id`, `video_id`, `video_id_source`, `requested_at`, `parts`,
+`text_format`, `max_pages`, `max_results`, `page_token`, `page_budget`,
+`result_budget`, `timeout`, `retries`, and `retry_backoff_seconds`. `timeout`
+contains `connect_seconds` and `read_seconds`. Thread rows contain `thread_id`, `video_id`,
+`associated_channel_id`, `can_reply`, `is_public`, `total_reply_count`,
+`top_level_comment`, `embedded_replies`, `reply_coverage`, `replies_complete`,
+`observed_at`, `expires_at`, and `provider`; `reply_coverage` contains `mode`,
+`returned`, `reported_total`, and `status`. A comment/reply row contains
+`comment_id`, `parent_comment_id`, `video_id`, `video_id_source`,
+`associated_channel_id`, `author_channel_id`, `author_display_name`,
+`text_display`, `like_count`, `can_rate`, `viewer_rating`,
+`moderation_status`, `published_at`, `updated_at`, `canonical_url`,
+`observed_at`, `expires_at`, and `provider`. Null and observed zero remain
+distinct. `text_display` is YouTube's displayed plain text, not a claim that it
+is the author's original input; treat all public strings as untrusted. Human
+rendering neutralizes bidi/Unicode format and terminal controls, collapses
+metadata newlines, and pads public text against label impersonation; raw output
+is unchanged.
+
+Status is literal. A complete nonempty cursor slice is `completed`; a clean
+zero-row cursor is `empty`. First-page `commentsDisabled` is successful
+`skipped`; the same condition on a later page is terminal, preserves earlier
+rows as `partial`, and exposes no continuation. Any other
+first-page request or malformed-response failure is `failed`; a later-page
+failure preserves usable rows as `partial` and retains a safe resumable token
+when one exists. Invalid/repeated response tokens and skipped malformed,
+duplicate, or wrong-scope rows are partial. An expected embedded-reply
+`subset` alone is a coverage warning, not a partial thread result.
+
+These result shapes deliberately omit top-level `result`, `videos`, and
+`items`, so `filmot download` rejects them. Filmot does not save comments in
+the transcript library, refresh them through `yt-data`, or run a background
+refresh/purge scheduler. Raw files are non-authorized, mutable YouTube API data:
+refresh or delete every saved copy within 30 days of `observed_at`, no later
+than `expires_at`.
+
+The session ledger keeps invocation controls and presence booleans, coarse
+result status and safe static diagnostics, plus API-attempt/quota telemetry.
+Every discussion event says `transient_result_persisted=false`. It never keeps
+video, thread, comment, parent, author, or channel identities; search or comment
+text; response rows or counts; coverage; availability; continuation state; or
+page tokens. Do not describe comments, likes, order, or reply counts as
+corroboration, consensus, authority, or a representative audience measure.
+Filmot intentionally performs no sentiment analysis, author profiling or
+sensitive-trait inference, and no derived engagement metrics.
+
+Deterministic provider/CLI coverage and a bounded live thread → reply → emitted
+continuation drive are complete. Future YouTube endpoint priorities and
+OAuth/policy boundaries belong in [YOUTUBE_ROADMAP.md](YOUTUBE_ROADMAP.md).
 
 ### Saved-data maintenance
 
@@ -1420,6 +1559,8 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Fetch exact YouTube metadata** | `filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw` |
 | **List an exact channel's playlists** | `filmot yt-playlists @handle --pages 1 --max-results 25 --raw` |
 | **Inspect/download a curated playlist** | `filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw` |
+| **Inspect a video's public comment threads** | `filmot yt-comments VIDEO_ID --pages 1 --max-results 25 --raw` |
+| **Continue one top-level comment's replies** | `filmot yt-replies TOP_LEVEL_COMMENT_ID --video VIDEO_ID --raw` |
 | **Audit saved YouTube expiry** | `filmot yt-data status --expired --raw` |
 | **Refresh expired YouTube fields** | `filmot yt-data refresh --dry-run` then `filmot yt-data refresh` |
 | **Purge expired YouTube fields** | `filmot yt-data purge --dry-run` then `filmot yt-data purge --yes` |

@@ -106,7 +106,7 @@ def validate_youtube_api() -> bool:
     """Check whether a YouTube API key is configured right now."""
     if not _api_key():
         raise ValueError(
-            "Missing YOUTUBE_API_KEY in .env file. "
+            "Missing YOUTUBE_API_KEY in Filmot configuration. "
             "Get one from https://console.cloud.google.com/apis/credentials"
         )
     return True
@@ -124,6 +124,10 @@ def _safe_endpoint(url: str) -> str:
 
 def _error_category(reason: str, status_code: Optional[int]) -> str:
     normalized = reason.lower()
+    if normalized == "commentsdisabled":
+        # commentThreads.list uses a typed 403 for a video's public comment
+        # availability.  It is not evidence that the developer key failed.
+        return "comments_unavailable"
     if normalized in {
         "quotaexceeded", "dailylimitexceeded", "dailylimitexceededunreg",
     }:

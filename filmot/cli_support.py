@@ -108,6 +108,7 @@ def command_error(
     payload: Optional[dict] = None,
     error_type: str = "CommandError",
     stage: Optional[str] = None,
+    error_details: Optional[dict] = None,
 ) -> None:
     """Terminate with a machine-detectable, credential-safe failure.
 
@@ -132,6 +133,11 @@ def command_error(
                 type=error_type,
                 message=safe_message,
                 stage=stage,
+                details=(
+                    redact_diagnostic(error_details)
+                    if isinstance(error_details, dict)
+                    else {}
+                ),
             ),
         )
         emit_raw_result(result, indent=2)

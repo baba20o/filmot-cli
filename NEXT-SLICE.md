@@ -1,9 +1,10 @@
 # Filmot: next implementation slice and follow-up backlog
 
 Updated 2026-09-12. **Status: implemented but unreleased; the live playlist
-handoff is complete, while the remaining API/policy operator checks still
-precede release.** The current work builds on `main` at `597b7c9`; none of the
-status statements in this file should be read as a released-version claim.
+handoff and public-comment/reply slice are complete, while the remaining
+recent-upload/search/channel and API-policy operator checks still precede
+release.** The current work builds on `main` at `33ac265`; none of the status
+statements in this file should be read as a released-version claim.
 
 The implementation direction remains **preserving fresh discovery metadata
 through library persistence**, now accompanied by exact-ID metadata retrieval,
@@ -17,6 +18,9 @@ investigations. It supplements the historical [feature plan](AGENT_FEATURES_PLAN
 and [field-test log](FIELD_TEST_LOG.md); it does not reopen their already
 resolved findings. N-series IDs below are independent of the older F-series
 findings. Priorities indicate implementation order, not security severity.
+Future YouTube endpoint ordering, API-key/OAuth boundaries, and policy gates
+are maintained in [YOUTUBE_ROADMAP.md](YOUTUBE_ROADMAP.md); this file keeps only
+the current implementation and release checks.
 
 ## Evidence behind the next slice
 
@@ -49,6 +53,7 @@ Research's internal scout already maps those fields for selected candidates. Reu
 | N07 pagination/coverage | Implemented | Live continuation check and quota-aware operational review. |
 | Bounded channel enumeration | Implemented | Live `--page-token` continuation/checkpoint check. |
 | Public playlist CLI bridge | Implemented | The bounded five-call shelf → playlist → transcript handoff passed live; retain broader continuation checks. |
+| Public comments/replies | Implemented and field-tested | Bounded thread, independent reply, emitted continuation, and isolated minimal-ledger privacy checks passed live and are recorded in `FIELD_TEST_LOG.md`. |
 
 ## Slice 1: fresh discovery to durable evidence
 
@@ -150,21 +155,47 @@ persisted with the saved record. Old records remain incomplete by design.
   token protection, first-page failure, later-page partial preservation, and a
   30-day manifest checkpoint. The CLI defaults to 10 pages/500 uploads and
   keeps `--limit` as a later transcript-selection cap.
-- Raw-capable commands emit one versioned JSON value on stdout with diagnostics
-  separated. Existing `download` has no `--raw`; adding that capability remains
-  a separate interface decision, not an assumed prerequisite.
+- Once Click option parsing reaches a raw-capable command handler, it emits one
+  versioned JSON value on stdout with diagnostics separated. Root/option parse
+  failures still use Click's human stderr and exit code 2. Existing `download`
+  has no `--raw`; adding that capability remains a separate interface decision,
+  not an assumed prerequisite.
 - Investigation sessions remain separate from library topics, and legacy reads
   plus current scout admission/selection behavior retain regression coverage.
 - README/help includes a working discovery-to-save example and the explicit
   enrichment behavior. Focused and repository-wide deterministic suites were
   green during integration; historical test counts are not acceptance criteria.
+- Public-discussion coverage exercises `yt-comments VIDEO` and
+  `yt-replies TOP_LEVEL_COMMENT_ID`: exact identity/URL validation before
+  quota, separate thread and reply tokens, one-page/25-row defaults,
+  10-page/500-row caps, 5/20-second timeouts, 0–5 retries, search/order/preview
+  controls, top-level-comment versus thread identity, preview completeness,
+  continuation argument vectors, and completed/empty/skipped/partial/failed
+  boundaries.
+- Comment raw results expose explicit request, coverage, availability where
+  applicable, endpoint attempts, and conservative one-unit-per-attempt quota
+  estimates. They deliberately have no pipeline candidate envelope and no
+  library persistence. Raw exports expire after 30 days; compact events omit
+  all API response rows, identities, counts, coverage, availability,
+  continuation state, text, search terms, and page tokens. They retain only
+  invocation controls/presence booleans, coarse safe diagnostics, and call/quota
+  telemetry, with `transient_result_persisted=false`. No sentiment, author
+  profiling, sensitive-trait inference, or derived engagement metrics are
+  implemented.
 
 The playlist release check is complete: a bounded live shelf and playlist read
 used five regular API calls total, then the unchanged raw result saved two
 transcripts with playlist-position and metadata-lifecycle provenance. The
-remaining release check is a small live recent-upload plus search/channel
-page-continuation run and operator review. Keep network-dependent checks
-separate from deterministic tests. No AWS fallback is needed for this slice.
+public-discussion check is also complete: bounded thread, reply, emitted
+continuation, and isolated ledger identity/text/token privacy paths passed live;
+the post-hardening two-call replay also verified exact named-session
+continuation and the minimal durable ledger contract. The remaining release
+check is a small recent-upload plus
+search/channel page-continuation run and operator review. Observe disabled
+comments only if a stable public fixture is naturally available; do not spend
+quota to manufacture one. Keep
+network-dependent checks separate from deterministic tests. No AWS fallback is
+needed for this slice.
 
 ## Follow-up backlog
 
@@ -200,6 +231,17 @@ YouTube-derived public metadata is timestamped with a 30-day expiry. Operators
 remain responsible for running lifecycle commands and separately maintaining
 raw exports and channel manifests.
 
+Public comments and replies remain transient inspection results. They are not
+download candidates, transcript-library records, or `yt-data`-managed fields;
+an operator must refresh or delete any saved raw copy within 30 days. Their
+ledger records retain only invocation controls/presence booleans, coarse safe
+diagnostics, and API-attempt/quota telemetry, marked
+`transient_result_persisted=false`. They do not retain video scope or any other
+response identity, row, count, coverage, availability, continuation state,
+text, or token. Discussion activity is not a credibility, consensus,
+representativeness, or authority measure, and no
+sentiment/profiling/derived-metric feature is in scope.
+
 No semantic verifier or credibility score is proposed as a substitute for source judgment. Saved reactions, source similarity, popularity, and claim assessments retain their existing evidence limits.
 
 ## Code starting points
@@ -210,6 +252,8 @@ No semantic verifier or credibility score is proposed as a substitute for source
 | Shared provider-neutral candidate boundary | [discovery.py](filmot/discovery.py) |
 | Bulk candidate consumption, `yt-search`, and `yt-video` | [commands/search.py](filmot/commands/search.py) |
 | Public playlist providers and `yt-playlist`/`yt-playlists` | [youtube_resources.py](filmot/youtube_resources.py), [commands/youtube.py](filmot/commands/youtube.py) |
+| Public comment/reply providers and commands | [youtube_comments.py](filmot/youtube_comments.py), [commands/youtube_comments.py](filmot/commands/youtube_comments.py) |
+| Shared bounded YouTube controls, safe errors, and pagination primitives | [youtube_api_support.py](filmot/youtube_api_support.py) |
 | `download`, explicit discovery handoff, and manual transcript save | [commands/transcript.py](filmot/commands/transcript.py) |
 | Existing scout normalization and persistence | [commands/research.py](filmot/commands/research.py) |
 | Library normalization, provider ownership, lifecycle, and atomic record writes | [library.py](filmot/library.py) |
@@ -259,15 +303,12 @@ detection, and the Atlas adapter does not enable paid AWS fallback.
   manual/stdin/request hashes.
 - Add an overall discovery wall-clock deadline/cancellation budget beyond
   per-request timeouts and retries.
-- Consolidate direct YouTube request/retry/redaction/paging mechanics behind a
-  shared transport where doing so reduces duplicated policy without weakening
-  endpoint-specific contracts.
-- Add further research bridges such as comment discovery and channel/catalog
-  views only with explicit quotas, bounded output, and the same
-  provenance/lifecycle semantics.
-- Decide whether useful read-only endpoints such as video categories and
-  supported i18n regions/languages belong in the CLI; keep OAuth/write APIs out
-  unless a separately authorized use case requires them.
 - Run a small live recent-upload and search/channel page-continuation check,
-  inspect the resulting provenance, and complete the operator policy review
-  before release. The equivalent bounded playlist handoff has passed live.
+  then complete the operator policy review. The equivalent bounded playlist
+  handoff and `yt-comments` → `yt-replies` path have passed live, including
+  executable continuation arguments and compact-ledger inspection.
+
+The ranked public-endpoint backlog, including API-key versus OAuth-only access
+and policy-heavy surfaces, lives in [YOUTUBE_ROADMAP.md](YOUTUBE_ROADMAP.md).
+Keep that matrix there rather than copying a second future roadmap into this
+release checklist.

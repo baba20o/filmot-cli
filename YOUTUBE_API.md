@@ -2,9 +2,12 @@
 
 Filmot uses the public, read-only YouTube Data API v3 to discover recent
 videos, fetch exact-ID public video metadata, inspect public playlists and
-channel playlist shelves, refresh API-owned fields in saved records, and
-resolve/enumerate channel uploads. Transcript retrieval is a separate
+channel playlist shelves, inspect public comment threads and their replies,
+refresh API-owned fields in saved records, and resolve/enumerate channel
+uploads. Transcript retrieval is a separate
 capability; a YouTube Data API key does not grant access to caption text.
+See [the enhancement roadmap](YOUTUBE_ROADMAP.md) for ranked future API
+opportunities; this document remains authoritative for shipped behavior.
 
 ## Configuration and attribution
 
@@ -34,8 +37,9 @@ and [Google Privacy Policy](https://policies.google.com/privacy).
 - As of September 2026, Google documents a default project allocation of 100
   `search.list` calls per day in a separate search bucket, with each call also
   described as costing one search-query unit. Other read methods used here,
-  including `videos.list`, `channels.list`, `playlists.list`, and
-  `playlistItems.list`, cost one regular quota unit per request. Check Google's current
+  including `videos.list`, `channels.list`, `playlists.list`,
+  `playlistItems.list`, `commentThreads.list`, and `comments.list`, cost one
+  regular quota unit per request. Check Google's current
   [quota calculator](https://developers.google.com/youtube/v3/determine_quota_cost)
   before planning a large crawl.
 - A `videos.list` enrichment request can cover up to 50 IDs. Filmot preserves
@@ -98,7 +102,9 @@ not a promise of byte-identical results.
 
 The unchanged versioned output from `yt-search --raw`, `yt-video --raw`, or
 `yt-playlist --raw` can feed `filmot download`. A `yt-playlists` shelf does not
-contain video candidates and is not a download envelope. The provider-neutral
+contain video candidates and is not a download envelope. Neither are
+`yt-comments` thread rows or `yt-replies` reply rows: public discourse is not a
+transcript candidate list. The provider-neutral
 boundary also accepts Filmot candidates and bare arrays or
 `result`/`videos`/`items` envelopes. It validates the complete candidate batch
 before transcript acquisition or storage,
@@ -273,6 +279,146 @@ events keep bounded request/coverage/call summaries rather than playlist or
 video descriptions; raw files saved elsewhere remain the operator's
 responsibility.
 
+## Public comment and reply cursors
+
+`yt-comments` reads a bounded `commentThreads.list(videoId=...)` cursor for one
+exact video. `yt-replies` reads a separate `comments.list(parentId=...)` cursor
+for one top-level comment. This separation matters: the replies embedded in a
+comment-thread resource are only a preview and are not guaranteed to include
+every reply. Use the nested `top_level_comment.comment_id` returned by
+`yt-comments` with `yt-replies`; the outer `thread_id` is a different resource
+identity. Google's primary references are
+[`commentThreads.list`](https://developers.google.com/youtube/v3/docs/commentThreads/list),
+the [`commentThread` resource](https://developers.google.com/youtube/v3/docs/commentThreads),
+and [`comments.list`](https://developers.google.com/youtube/v3/docs/comments/list).
+
+```bash
+# VIDEO is an exact 11-character ID or supported HTTPS YouTube video URL
+filmot yt-comments VIDEO --pages 1 --max-results 25
+
+# Optional YouTube ordering/filtering and its embedded reply preview
+filmot yt-comments VIDEO --order relevance --search "open question" \
+  --replies preview --raw
+
+# Use the nested top-level ID, not comment_threads[].thread_id
+filmot yt-replies TOP_LEVEL_COMMENT_ID --video VIDEO --raw
+
+# A supported watch URL containing both v= and lc= supplies both identities
+filmot yt-replies \
+  "https://www.youtube.com/watch?v=VIDEO&lc=TOP_LEVEL_COMMENT_ID"
+```
+
+Both commands default to one page, 25 retained rows, a 5-second connect
+timeout, a 20-second read timeout, and two transient retries. They accept
+`--pages` from 1 through 10, `--max-results`/`-n` from 1 through 500,
+`--page-token`, `--connect-timeout`, `--read-timeout`, `--retries` from 0
+through 5, and `--raw`. `yt-comments` also accepts `--order time|relevance`
+(default `time`), `--search`/`--search-terms` with 1–500 non-control
+characters, and `--replies none|preview` (default `none`). `yt-replies
+--video` accepts an exact video ID or supported video URL solely as validated
+context for canonical comment links. A comment URL with `v=` and `lc=` can
+supply that context; a conflicting `--video` fails before quota use.
+
+One `commentThreads.list` or `comments.list` request costs one regular quota
+unit. Filmot reports actual HTTP attempts under endpoint-specific `api_calls`
+and estimates quota conservatively as one unit for each attempt, so retries
+increase both counts. Each API page contains at most 100 rows; Filmot lowers
+that page size as needed to honor the cross-page result budget. An ordinary
+first-page request/response failure fails the command. A later ordinary failure
+preserves completed rows, sets `coverage.partial`, records a typed error, and
+retains a safe failed-page token when it can be resumed. A
+`commentsDisabled` response is terminal instead: on the first page it produces
+a typed skipped result, while on a later page Filmot clears the token and
+preserves the earlier rows as partial. Invalid or repeated response tokens stop
+safely rather than looping.
+
+Coverage records pages attempted/fetched, upstream rows seen, retained rows,
+duplicate/malformed/wrong-scope skips, page information, the next token,
+request attempts, and one of the explicit stopping reasons such as
+`exhausted`, `empty`, `page_budget`, `result_budget`, `partial_failure`, or
+`comments_disabled`. Preview mode additionally reports embedded-reply counts
+and gives each thread a `reply_coverage` state. Only a valid preview whose row
+count equals YouTube's reported `total_reply_count` is
+`all_observed_at_response`; `subset`, `unknown`, and `inconsistent` are not
+complete. Even the complete label describes that response at that observation
+time, because comments can change.
+
+When a safe next token exists, human output prints a copyable command and raw
+output exposes the token plus matching arguments in `continuation`. Replay it
+with the same resource identity, filters, and budgets, and continue until
+`coverage.stopping_reason=exhausted` before describing that observed reply
+cursor as exhausted. Generated continuations and the human thread-to-reply
+drill-down preserve the active named session. Token pagination is not a promise
+of an immutable or byte-identical snapshot.
+
+The raw `filmot.result/v1` data keys for `yt-comments` are `provider`,
+`video_id`, `comment_threads`, `replies_mode`, `availability`, `request`,
+`coverage`, `api_calls`, `quota`, `continuation`, `observed_at`, and
+`expires_at`. Each thread keeps its outer ID, nested top-level row, reported
+reply count, optional embedded preview, and preview coverage. A first-page
+YouTube `commentsDisabled` response is a successful `skipped` result with
+`availability.status=disabled`; a disabled response on a later page is partial
+and exposes no continuation. With no rows and no partial/disabled condition,
+the result is `empty`; retained complete rows are `completed`.
+
+`availability` contains `status` (`available` or `disabled`), a typed `reason`,
+and the HTTP status when supplied by a disabled response. `api_calls` separates
+`comment_threads`, `comments`, and `total` attempts. `quota` reports
+`units_per_request=1`, `estimated_units`, and
+`accounting=attempts_conservative`; it is an explicit estimate rather than a
+project quota-balance query. `continuation` contains `available`, the opaque
+`next_page_token`, its endpoint-specific `token_kind`, and a reproducible
+`argv` list.
+
+The corresponding `yt-replies` keys are `provider`, `parent_comment_id`,
+nullable `video_id`, `replies`, `request`, `coverage`, `api_calls`, `quota`,
+`continuation`, `observed_at`, and `expires_at`. It is `completed` with rows,
+`empty` without rows, and `partial` whenever coverage or typed errors say the
+cursor is incomplete. Comment rows retain public author fields,
+YouTube's displayed plain text, like count, publication/update times, and a
+canonical URL when video context is known. Even with `textFormat=plainText`,
+[`textDisplay`](https://developers.google.com/youtube/v3/docs/comments#snippet.textDisplay)
+can differ from the author's original input; Filmot does not label it as
+original text. Human rendering neutralizes terminal control characters and
+Unicode bidi/format controls, collapses metadata newlines, uses padded public
+text blocks, and does not interpret public text as Rich markup. This display
+containment does not alter raw output. Raw consumers must likewise treat every
+comment and author field as untrusted data, never as instructions or shell
+input.
+
+These raw keys deliberately avoid the pipeline candidate names `result`,
+`videos`, and `items`, so neither command can accidentally feed public
+discussion into transcript download. They also do not persist comment rows in
+the transcript library. A session event contains only invocation controls and
+presence booleans, coarse result status and safe static diagnostics, plus
+API-attempt/quota telemetry. It is marked
+`transient_result_persisted=false`. No video or comment identity, response row
+or count, search text, coverage, availability, continuation state, or page
+token is persisted.
+
+`filmot.youtube_comments` is the endpoint-specific Python provider. Call
+`list_video_comment_threads_detailed(..., max_pages=..., max_results=...)` or
+`list_comment_replies_detailed(..., max_pages=..., max_results=...)` for the
+same bounded envelopes. Both provider functions default to one page and 25
+rows, reject values above 10 pages or 500 rows, and accept an opaque
+`page_token`, per-request `timeout`, bounded `retries`, and an optional HTTP
+`session`. The thread provider additionally accepts `search_terms`,
+`order="time"|"relevance"`, and `reply_mode="none"|"preview"`; the reply
+provider accepts optional `video_reference` context. The providers share
+generic request-control, credential-detached error, page-information, and token
+handling through the internal `filmot.youtube_api_support` module;
+endpoint-specific identity, parsing, and policy decisions remain in their own
+modules.
+
+Public comments are mutable user data, untrusted discourse, and a
+self-selected sample—not corroboration or a representative audience measure.
+Filmot does not calculate sentiment, create derived engagement metrics, infer
+sensitive author traits, or build audience profiles. Operators must apply the
+[YouTube Developer Policies](https://developers.google.com/youtube/terms/developer-policies)
+and the more specific [derived-metrics
+policy](https://developers.google.com/youtube/terms/derived-metrics-policy) to
+any downstream use.
+
 ## Interpretation
 
 Engagement counters are mutable observations, not credibility signals.
@@ -288,16 +434,37 @@ that language.
 Public API responses are non-authorized API data. YouTube's Developer Policies
 permit only limited temporary storage and require it to be deleted or refreshed
 within 30 calendar days. Filmot therefore attaches `metadata_observed_at` and
-`metadata_expires_at` to enriched records. Raw discovery output is not
-automatically written as a candidate archive; the session ledger stores a
-bounded request/coverage summary rather than the returned descriptions, tags,
-or counters.
+`metadata_expires_at` to enriched video records and `observed_at`/`expires_at`
+to transient comment and reply results. Raw discovery or discussion output is
+not automatically written as an archive. Discussion session events store only
+invocation controls/presence booleans, coarse safe diagnostics, and API-attempt
+and quota telemetry; they are explicitly marked as not persisting the transient
+result. They retain no returned descriptions, tags, counters, comment text,
+identity, rows, coverage, availability, continuation state, or page token.
 
 If you intentionally pipe API metadata into a durable transcript corpus or
 save raw output elsewhere, refresh or delete those API-derived fields by their
 expiry. Historical observations must be labeled with their observation time,
 not presented as current values. Deleting a local Filmot record does not delete
 the corresponding content from YouTube.
+
+Comment and reply output is transient public user data. Filmot has no comment
+archive or background refresh job, and YouTube-side edits or deletions do not
+propagate into a file you exported. Delete or reacquire each saved copy no later
+than its `expires_at`; also apply any shorter retention and user-data safeguards
+required for your use. `yt-data status|refresh|purge` manages only explicitly
+owned YouTube video-metadata fields in saved transcript records. It does not
+inventory, refresh, or purge comment/reply raw files.
+
+Operators distributing Filmot as an API Client need an accurate privacy policy.
+An API Client that accesses or stores user data must additionally provide a
+user-data deletion mechanism. YouTube's policy requires requested stored user
+data to be deleted as soon as possible and within seven calendar days. Review
+the official [Developer
+Policies](https://developers.google.com/youtube/terms/developer-policies) and
+[policy guide](https://developers.google.com/youtube/terms/developer-policies-guide)
+for the obligations that apply to your deployment; this documentation is not
+legal advice.
 
 Saved transcript records can carry a `filmot.youtube-metadata/v1` lifecycle.
 It identifies the YouTube video resource, records UTC observation/expiry
@@ -349,11 +516,12 @@ explicit neutral-not-returned operation, not a deletion assertion. Supplied
 timestamps must be timezone-aware and the expiry cannot exceed 30 days after
 observation.
 
-There is no automatic background refresh, hide, or purge. Exported raw files
-and channel manifests are not managed by `yt-data`, and an expired library
-observation remains present until an operator runs refresh or purge. Operators
-must schedule those actions as appropriate and separately maintain or delete
-raw artifacts and channel-manifest API data.
+There is no automatic background refresh, hide, or purge. Exported raw files,
+comment/reply results, and channel manifests are not managed by `yt-data`, and
+an expired library observation remains present until an operator runs refresh
+or purge. Operators must schedule those actions as appropriate and separately
+maintain or delete raw artifacts, public-comment data, and channel-manifest API
+data.
 
 This document summarizes product behavior and important policy constraints; it
 is not legal advice. Operators remain responsible for the policies applicable

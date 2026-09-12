@@ -16,6 +16,16 @@ def current_session() -> Optional[str]:
     return _session.get()
 
 
+def continuation_argv_prefix(command: str) -> list[str]:
+    """Return a CLI prefix that preserves the active investigation session."""
+    argv = ["filmot"]
+    selected = current_session()
+    if selected is not None:
+        argv.extend(["--session", selected])
+    argv.append(command)
+    return argv
+
+
 def _validate_session(ctx, param, value):
     if value is not None and not value.strip():
         raise click.BadParameter("Session name must not be blank.", ctx, param)
