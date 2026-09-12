@@ -40,6 +40,10 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 - **Channel Discovery** — Search and explore YouTube channels by name or handle
 - **Fresh YouTube Discovery** — Search recent uploads with bounded pagination,
   rich public metadata, explicit coverage, and resumable page tokens
+- **Exact YouTube Metadata** — Fetch rich `videos.list` observations for known
+  IDs or URLs in quota-efficient batches, without acquiring captions
+- **Metadata Lifecycle Controls** — Inspect, refresh, or purge API-owned fields
+  in saved transcript records without deleting transcript content
 - **Transcript Download** — Fetch full YouTube transcripts for deep content analysis
 - **Rich Terminal UI** — Beautiful formatted output with tables, colors, and clickable links
 - **Expanded Hit Mode** — Show all non-duplicate hit details returned for the displayed videos without widening the fetched page scope
@@ -71,8 +75,8 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 
 - Python 3.9+
 - RapidAPI account with Filmot API subscription
-- Optional Google Cloud YouTube Data API v3 key for `yt-search` and
-  `channel-download`
+- Optional Google Cloud YouTube Data API v3 key for `yt-search`, `yt-video`,
+  `yt-data refresh`, and `channel-download`
 
 ## Installation
 
@@ -111,7 +115,7 @@ Create a `.env` file in the directory where you run Filmot:
 RAPIDAPI_KEY=your_rapidapi_key_here
 RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com
 
-# Optional: direct recent-video discovery and channel upload enumeration
+# Optional: direct search, exact video metadata, refresh, and channel enumeration
 YOUTUBE_API_KEY=your_restricted_youtube_data_api_key_here
 ```
 
@@ -329,8 +333,10 @@ statistics, content/status, live-stream, topic, regional/content-rating,
 made-for-kids, synthetic-media, and `paid_product_placement` disclosure fields
 when YouTube returns them. Missing counters remain `null`, distinct from an observed zero. Each
 metadata observation has UTC `metadata_observed_at` and
-`metadata_expires_at`; Filmot does not automatically refresh or delete a raw
-artifact or persisted provider metadata when it expires. Follow the
+`metadata_expires_at`. Exported raw artifacts are not maintained
+automatically. API-owned fields in saved transcript records can be inspected,
+refreshed, or purged explicitly with `yt-data`; see
+[Saved YouTube Metadata Lifecycle](#saved-youtube-metadata-lifecycle) and the
 [30-day storage guidance](YOUTUBE_API.md#storage-and-the-30-day-rule).
 
 The request defaults to 5-second connect and 20-second read timeouts with two
@@ -350,6 +356,33 @@ error, and makes the top-level outcome `partial`.
 For one exact known channel, use `channel-download` rather than a
 `search.list(order=date)` crawl: it resolves the channel's uploads playlist and
 enumerates it with `playlistItems.list`, which is the documented upload path.
+
+### Fetch Exact YouTube Video Metadata
+
+Use `yt-video` when you already know the video identities and want current
+public `videos.list` metadata without a search call or caption request:
+
+```bash
+# Bare IDs, public URLs, repeated arguments, and comma-separated values work
+filmot yt-video dQw4w9WgXcQ \
+  https://www.youtube.com/shorts/aqz-KE-bpKQ --show-description
+
+# One pipeline-compatible result with request and per-ID coverage
+filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw > exact-videos.json
+
+# Fetch metadata, acquire the transcripts separately, and register lifecycle data
+filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw \
+  | filmot download -t exact-sources -n 2
+```
+
+Input is validated and deduplicated before quota is spent, then requested in
+batches of at most 50. The raw result retains request order and includes
+credential-free `request`, `coverage`, `id_outcomes`, observation/expiry times,
+warnings, and typed errors. `observed` means YouTube returned the resource;
+`not_returned` means a completed batch omitted it and does not establish why;
+`unprocessed` means its batch did not complete. Earlier successful batches are
+preserved if a later batch fails. Counts preserve observed zero separately
+from missing values.
 
 ### Query Syntax (Full-Text Operators)
 
@@ -521,19 +554,21 @@ filmot search "нейросеть" --lang ru --full
 
 > **Tip:** If a language code isn't returning results, try omitting `--lang` entirely. The API will match your query in transcripts regardless of language tag.
 
-### Get Video Metadata
+### Get Filmot Video Metadata
 
-Retrieve metadata for one or more YouTube videos:
+Retrieve Filmot-index metadata for one or more YouTube videos. Use
+[`yt-video`](#fetch-exact-youtube-video-metadata) for a current public YouTube
+Data API observation:
 
 ```bash
 # Single video
-python main.py video dQw4w9WgXcQ
+filmot video dQw4w9WgXcQ
 
 # Multiple videos (comma-separated)
-python main.py video "dQw4w9WgXcQ,abc123def,xyz789ghi"
+filmot video "dQw4w9WgXcQ,aqz-KE-bpKQ,M7lc1UVf-VE"
 
 # Raw JSON output
-python main.py video dQw4w9WgXcQ --raw
+filmot video dQw4w9WgXcQ --raw
 ```
 
 ### Download Transcripts
@@ -610,16 +645,23 @@ bytes receive a `sha256:` discovery reference in save/enrichment provenance;
 Filmot never guesses metadata from the most recent query or a nearby session
 event.
 
-If the transcript is already saved, the same explicit handoff invokes atomic,
-fill-only enrichment: missing values and recognized `Unknown` placeholders are
-filled, observed zeroes and other known values are retained, and conflicts are
-reported rather than overwritten. Repeating a completed enrichment is a
-byte-for-byte no-op. Transcript text, source segments, original `saved_at`,
-acquisition metadata, citations, and unrelated record fields are preserved.
-This is currently part of the `transcript ... --save-to ... --discovery ...`
-flow, so it still performs transcript acquisition before reaching the
-existing-record check; there is not yet a standalone metadata-only refresh
-command.
+Provider ownership determines how an existing record is updated. A direct
+YouTube candidate is registered under `metadata_lifecycle.youtube`: Filmot
+removes the previous YouTube-owned path set before applying the new
+observation, so a field omitted upstream cannot survive as stale API data.
+Values outside that owned set remain untouched; a colliding manual or
+other-provider value is preserved and reported as a conflict. A Filmot-shaped
+candidate retains the earlier atomic fill-only behavior: missing values and
+recognized `Unknown` placeholders can be filled, while known values and
+observed zeroes are not replaced. Both paths preserve transcript text, source
+segments, original `saved_at`, acquisition metadata, citations, and unrelated
+record fields.
+
+The manual `transcript ... --save-to ... --discovery ...` path still acquires
+the transcript before reaching its existing-record check. For current YouTube
+metadata without caption acquisition, use
+`filmot yt-data refresh --video VIDEO_ID`; it updates every saved topic copy of
+that ID unless `--topic` narrows the selection.
 
 Library saves validate the record and segments before publication, serialize
 strict JSON to a unique same-directory temporary file, flush and `fsync` that
@@ -660,6 +702,10 @@ Get-Content -Raw results.json | filmot download -t ai-safety --dedupe -n 20
 # Unchanged direct YouTube raw output uses the same pipeline
 filmot yt-search "fresh AI safety" --pages 2 --max-results 75 --raw \
   | filmot download -t ai-safety -n 20
+
+# Exact-ID YouTube metadata uses the same candidate envelope
+filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw \
+  | filmot download -t exact-sources -n 2
 ```
 
 The download boundary normalizes the complete candidate batch before opening
@@ -671,6 +717,67 @@ in a bounded, credential-scrubbed `provider_fields` object; freshness,
 disclosure, status, and topic provenance is prioritized ahead of bulky native
 extras. Any invalid or conflicting identity rejects the whole preflight, so a
 bad later row cannot leave a partially downloaded batch.
+
+`download` hashes the exact decoded stdin text as a `sha256:`
+`discovery_ref`. For each successfully saved direct-YouTube candidate it also
+registers the provider-owned metadata lifecycle. A lifecycle-registration
+failure does not discard the transcript; the command reports a partial result,
+and the explicitly recorded YouTube provenance makes the record eligible for
+later adoption by `yt-data refresh`.
+
+### Saved YouTube Metadata Lifecycle
+
+Maintain API-derived fields in saved transcript records without reacquiring
+captions:
+
+```bash
+# Offline, read-only inventory across every topic
+filmot yt-data status
+filmot yt-data status --expired --raw
+filmot yt-data status --topic ai-safety --video dQw4w9WgXcQ
+
+# Preview the default expired-only refresh, then perform it
+filmot yt-data refresh --dry-run --raw
+filmot yt-data refresh
+
+# Refresh every saved topic copy of exact IDs; each unique ID is fetched once
+filmot yt-data refresh --video dQw4w9WgXcQ,aqz-KE-bpKQ
+
+# Explicitly include current and unmanaged records, within a quota budget
+filmot yt-data refresh --all --max-videos 250
+
+# Preview or confirm removal of expired API-owned fields only
+filmot yt-data purge --dry-run --raw
+filmot yt-data purge --yes
+filmot yt-data purge --all --max-records 1000 --yes
+```
+
+`status` uses no API key, makes no network request, and classifies each saved
+copy as `current`, `expired`, or `unmanaged` while surfacing invalid records
+separately and retaining more specific lifecycle states such as
+`not_returned` and `purged`. Legacy records
+with explicit YouTube provenance are marked adoptable. `refresh` defaults to
+expired copies; `--video` explicitly selects every saved copy of the supplied
+ID (optionally restricted by `--topic`), while `--all` widens the default scope
+to current and unmanaged copies. `--video` and `--all` are mutually exclusive.
+`--max-videos` bounds unique IDs, not topic copies. `--dry-run` performs neither
+API calls nor writes.
+
+A successful `videos.list` observation replaces only the record paths owned by
+the prior YouTube observation and records exact JSON Pointer ownership,
+observation/expiry times, a bounded audit trail, and a `sha256:` reference to
+the credential-free effective request. An observed `0` or `false` is data, not
+absence. If a completed batch does not return an ID, Filmot records the neutral
+`not_returned` state and removes its previous API-owned values; it does not
+infer deletion, privacy, or invalidity. If a failed batch leaves an ID
+`unprocessed`, the old record and expiry are not advanced.
+
+`purge` is offline and defaults to expired copies. It requires confirmation
+unless `--yes` is supplied; `--dry-run` never prompts or writes. Purge removes
+only the lifecycle's owned API paths and retains transcript text, segments,
+manual or other-provider metadata, citations, acquisition details, and the
+lifecycle audit record. Mutations are guarded and atomic per record, but a
+multi-record refresh or purge is not one cross-record transaction.
 
 ### Transcript Library
 
@@ -955,10 +1062,17 @@ filmot channel-download https://www.youtube.com/@GoogleDevelopers
 filmot channel-download \
   https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw
 
-# Enumerate the uploads playlist, then select its most recent 50 rows
+# Enumerate a bounded slice, then select its first 50 new transcript candidates
 filmot channel-download @GoogleDevelopers --limit 50
 
-# Resume interrupted download (automatic — just re-run the same command)
+# Tighten the API work to two pages and at most 75 distinct uploads
+filmot channel-download @GoogleDevelopers --pages 2 --max-results 75
+
+# Continue from the exact token printed by the preceding slice
+filmot channel-download @GoogleDevelopers --page-token PAGE_TOKEN \
+  --pages 2 --max-results 75
+
+# Resume interrupted transcript work within the same slice
 filmot channel-download @GoogleDevelopers --workers 4
 
 # Bypass proxy and connect directly
@@ -981,11 +1095,54 @@ Channel resolution retrieves public description, upload-playlist identity,
 statistics, locale, publication, and topic metadata. Unknown/hidden counters
 remain unknown rather than becoming zero. Upload enumeration retains playlist
 position/ownership, video-owner, publication, and privacy metadata where
-available and guards against repeated page tokens. `--limit` limits transcript
-selection after enumeration; it is not an API page budget. Channel metadata is
-timestamped with `observed_at`/`expires_at` 30 days apart, but manifests are not
-automatically refreshed or purged at expiry. See [YouTube Data API
+available and guards against repeated page tokens. The command defaults to at
+most 10 pages and 500 distinct uploads; `--pages` accepts 1–100 and
+`--max-results` accepts 1–5000. `--limit` only caps transcript selection after
+that bounded enumeration and is not an API page/result budget.
+
+When another page exists, the typed/logged outcome includes a continuation
+object and human output prints a copyable command with the opaque
+`--page-token` plus the same page/result budgets. A later-page failure preserves
+usable earlier rows, marks enumeration partial, continues to their transcript
+downloads, and retains the failed page token for a retry. The final aggregate
+also accounts for transcript failures or interruption. A first-page failure writes no new checkpoint
+and starts no transcript downloads; an explicitly destructive `--fresh` reset,
+if requested, has already happened by then. `--fresh` cannot be combined with
+`--page-token`. Re-running the same slice resumes pending transcript work from
+the manifest, while a continuation slice adds new video identities to that
+same corpus.
+
+The manifest's latest compact `upload_enumeration` checkpoint uses
+`filmot.youtube-upload-enumeration/v1` and stores the provider,
+`observed_at`/`expires_at`, credential-free effective request, and coverage:
+page/API/item counts, row-quality counters, approximate total, next token,
+stopping reason, and partial state. Both channel resolution and every completed
+enumeration observation use a 30-day window. There is no automatic
+manifest-refresh/purge scheduler; see [YouTube Data API
 behavior](YOUTUBE_API.md).
+
+Python integrations should prefer the bounded, resumable control-plane API:
+
+```python
+from filmot.channel_dl import enumerate_uploads_detailed
+
+page = enumerate_uploads_detailed(
+    uploads_playlist_id,
+    max_pages=3,
+    max_items=120,
+    page_token=None,
+)
+next_token = page["coverage"]["next_page_token"]
+```
+
+It returns normalized `videos`, top-level observation/expiry times, the
+credential-free effective `request`, page, item, duplicate, malformed, and
+ID-less-row `coverage`, a stopping reason, continuation token, API-call counts,
+warnings, and typed errors. A first-page failure raises; a later failure
+preserves earlier rows and marks the envelope partial. `cancel_check` can
+cooperatively stop before the next page while retaining its token. The legacy
+`list_all_video_ids()` wrapper remains available only for callers that
+deliberately need its historical unbounded, fail-fast list contract.
 
 #### Check Download Status
 
@@ -1077,10 +1234,10 @@ filmot-cli/
     ├── claims.py           # Strict append-only claim/evidence event store
     ├── analysis.py         # Deterministic full-transcript echo analysis
     ├── commands/
-    │   ├── search.py       # Search, metadata, export, and scout commands
+    │   ├── search.py       # Search, exact YouTube metadata, export, and scout commands
     │   ├── research.py     # Staged research workflow
     │   ├── transcript.py   # Transcript and channel-corpus commands
-    │   ├── library.py      # Library, echo-analysis, and session commands
+    │   ├── library.py      # Library, YouTube lifecycle, echo, and session commands
     │   ├── claims.py       # Claim, evidence, and assessment commands
     │   └── proxy.py        # Machine-global proxy operations
     ├── _process.py         # Killable JSON subprocess boundary
@@ -1089,8 +1246,8 @@ filmot-cli/
     ├── proxy_pool.py       # Cross-process proxy health and leases
     ├── cache.py            # File-based response caching with auto-purge
     ├── rate_limiter.py     # Token bucket rate limiter
-    ├── channel_dl.py       # Channel corpus downloader: parallel download, resume, proximity search
-    ├── library.py          # Segment-aware transcript storage, search, compare
+    ├── channel_dl.py       # Channel corpus storage plus bounded uploads enumeration
+    ├── library.py          # Segment-aware transcript storage, search, compare, metadata lifecycle
     ├── export.py           # JSON/CSV export functionality
     ├── watchlist.py        # Local video watchlist management
     ├── batch.py            # Batch query processing
@@ -1287,9 +1444,10 @@ Metadata Archive API:
 3. Copy your API key from the dashboard
 4. Add it to your per-user `config.env` (recommended) or project `.env`
 
-Direct `yt-search` and `channel-download` additionally require a restricted
-`YOUTUBE_API_KEY`. They use public, API-key-authenticated YouTube Data API
-reads; the key does not grant caption access. Native transport/provider errors,
+Direct `yt-search`, `yt-video`, `yt-data refresh`, and `channel-download`
+additionally require a restricted `YOUTUBE_API_KEY`. (`yt-data status` and
+`yt-data purge` are offline.) They use public, API-key-authenticated YouTube
+Data API reads; the key does not grant caption access. Native transport/provider errors,
 typed result errors, discovery artifacts, and ledger events pass through
 credential-redaction boundaries. The YouTube request exceptions deliberately
 do not retain native request/response objects or credential-bearing URLs.
@@ -1421,6 +1579,8 @@ filmot sessions your-topic --summary
 - **`filmot claims`** — Append-only claims, classified evidence, and explicit human assessments
 - **`filmot sessions NAME --summary`** — Derived investigation totals without conflating candidate, source, and failure universes
 - **`filmot --session NAME COMMAND`** — Keep compound research and follow-up activity in one investigation
+- **`filmot yt-video IDS... --raw`** — Get ordered, exact-ID YouTube metadata with per-ID coverage and no caption request
+- **`filmot yt-data status|refresh|purge`** — Audit and maintain API-owned fields in saved transcript records
 - **`--sort density`** — Sort fetched candidates by matches-per-minute to find focused text coverage; this is not a credibility score
 - **`--min-matches N`** — Filter out videos with only passing mentions
 - **`--dedupe`** — Skip matching first-500-character transcript fingerprints during bulk download

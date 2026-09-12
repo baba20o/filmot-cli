@@ -31,6 +31,8 @@ def test_top_level_command_topology_is_stable():
         "video",
         "watchlist",
         "yt-search",
+        "yt-data",
+        "yt-video",
     }
     assert set(cli.commands["library"].commands) == {
         "compare",
@@ -59,6 +61,11 @@ def test_top_level_command_topology_is_stable():
         "list",
         "remove",
         "watched",
+    }
+    assert set(cli.commands["yt-data"].commands) == {
+        "purge",
+        "refresh",
+        "status",
     }
 
 

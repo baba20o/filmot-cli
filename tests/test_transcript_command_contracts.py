@@ -32,6 +32,46 @@ def _route_plan():
     }
 
 
+def _upload_enumeration(
+    videos,
+    *,
+    max_pages=10,
+    max_items=500,
+    page_token=None,
+    next_page_token=None,
+    partial=False,
+    warnings=None,
+    errors=None,
+    stopping_reason=None,
+):
+    """Return the bounded provider envelope expected by channel-download."""
+    return {
+        "provider": "youtube-data-api-v3",
+        "videos": videos,
+        "request": {
+            "uploads_playlist_id": "uploads",
+            "max_pages": max_pages,
+            "max_items": max_items,
+            "page_token": page_token,
+        },
+        "coverage": {
+            "pages_attempted": 1,
+            "pages_fetched": 1,
+            "api_calls": 1,
+            "returned": len(videos),
+            "next_page_token": next_page_token,
+            "stopping_reason": stopping_reason or (
+                "page_budget" if next_page_token else "exhausted"
+            ),
+            "partial": partial,
+        },
+        "observed_at": "2026-09-12T12:00:00Z",
+        "expires_at": "2026-10-12T12:00:00Z",
+        "warnings": list(warnings or []),
+        "errors": list(errors or []),
+    }
+
+
 def _save_grep_record(
     library,
     *,
@@ -529,7 +569,10 @@ def test_channel_download_already_synced_shares_aggregate_and_keeps_start_event(
             return_value=downloader,
         ),
         patch("filmot.channel_dl.get_channel_info", return_value=info),
-        patch("filmot.channel_dl.list_all_video_ids", return_value=[]),
+        patch(
+            "filmot.channel_dl.enumerate_uploads_detailed",
+            return_value=_upload_enumeration([]),
+        ),
         patch("filmot.ledger.log_event") as mock_log_event,
         patch("filmot.ledger.log_result") as mock_log_result,
         patch(
@@ -571,7 +614,10 @@ def test_channel_download_renders_unknown_counts_and_keeps_resolution_provenance
             return_value=downloader,
         ),
         patch("filmot.channel_dl.get_channel_info", return_value=info),
-        patch("filmot.channel_dl.list_all_video_ids", return_value=[]),
+        patch(
+            "filmot.channel_dl.enumerate_uploads_detailed",
+            return_value=_upload_enumeration([]),
+        ),
         patch("filmot.ledger.log_event") as mock_log_event,
         patch("filmot.ledger.log_result") as mock_log_result,
         patch(
@@ -626,7 +672,7 @@ def test_channel_download_persists_canonical_identity_for_handle_input(
         "uploads_playlist_id": "uploads",
     }
     videos = [{
-        "video_id": "video-one",
+        "video_id": "abc12345678",
         "title": "Video",
         "published_at": "2026-01-01T00:00:00Z",
     }]
@@ -645,7 +691,10 @@ def test_channel_download_persists_canonical_identity_for_handle_input(
             return_value=downloader,
         ),
         patch("filmot.channel_dl.get_channel_info", return_value=info),
-        patch("filmot.channel_dl.list_all_video_ids", return_value=videos),
+        patch(
+            "filmot.channel_dl.enumerate_uploads_detailed",
+            return_value=_upload_enumeration(videos),
+        ),
         patch("filmot.transcript.get_transcript", return_value=transcript),
         patch("filmot.transcript.routing_plan", return_value=_route_plan()),
         patch("filmot.transcript.describe_routing_plan", return_value="direct"),
@@ -704,7 +753,7 @@ def test_channel_download_all_failed_preserves_item_event_and_nonzero_exit(
         "uploads_playlist_id": "uploads",
     }
     videos = [{
-        "video_id": "vid",
+        "video_id": "def12345678",
         "title": "Video",
         "published_at": "2026-01-01T00:00:00",
     }]
@@ -714,7 +763,10 @@ def test_channel_download_all_failed_preserves_item_event_and_nonzero_exit(
             return_value=downloader,
         ),
         patch("filmot.channel_dl.get_channel_info", return_value=info),
-        patch("filmot.channel_dl.list_all_video_ids", return_value=videos),
+        patch(
+            "filmot.channel_dl.enumerate_uploads_detailed",
+            return_value=_upload_enumeration(videos),
+        ),
         patch(
             "filmot.transcript.get_transcript",
             return_value={
@@ -747,6 +799,276 @@ def test_channel_download_all_failed_preserves_item_event_and_nonzero_exit(
         and call.kwargs["status"] == "failed"
         for call in mock_log_event.call_args_list
     )
+
+
+def test_channel_download_uses_explicit_bounds_and_persists_continuation(
+    runner,
+    tmp_path,
+):
+    downloader = MagicMock()
+    channel_dir = Path(tmp_path) / "example"
+    downloader._resolve_channel_dir.return_value = ("example", channel_dir)
+    downloader._load_manifest.return_value = {"videos": {}}
+    info = {
+        "channel_id": "UC1234567890123456789012",
+        "name": "Example",
+        "video_count": 900,
+        "subscriber_count": 12,
+        "uploads_playlist_id": "uploads",
+    }
+    provider = _upload_enumeration(
+        [],
+        max_pages=2,
+        max_items=75,
+        page_token="START",
+        next_page_token="NEXT",
+    )
+    with (
+        patch("filmot.channel_dl.ChannelDownloader", return_value=downloader),
+        patch("filmot.channel_dl.get_channel_info", return_value=info),
+        patch(
+            "filmot.channel_dl.enumerate_uploads_detailed",
+            return_value=provider,
+        ) as enumerate_uploads,
+        patch("filmot.ledger.log_event"),
+        patch("filmot.ledger.log_result") as mock_log_result,
+        patch(
+            "filmot.commands.transcript._render_channel_download"
+        ) as mock_renderer,
+    ):
+        result = runner.invoke(cli, [
+            "channel-download",
+            "@Example",
+            "--pages",
+            "2",
+            "--max-results",
+            "75",
+            "--page-token",
+            "START",
+            "--limit",
+            "1",
+        ])
+
+    assert result.exit_code == 0, result.output
+    call = enumerate_uploads.call_args
+    assert call.args == ("uploads",)
+    assert call.kwargs["max_pages"] == 2
+    assert call.kwargs["max_items"] == 75
+    assert call.kwargs["page_token"] == "START"
+    assert callable(call.kwargs["progress_callback"])
+
+    outcome = _shared_outcome(mock_log_result, mock_renderer)
+    assert outcome.status_value == ResultStatus.COMPLETED.value
+    assert outcome.data["already_synced"] is False
+    assert outcome.data["continuation"] == {
+        "available": True,
+        "next_page_token": "NEXT",
+        "argv": [
+            "filmot",
+            "channel-download",
+            "@Example",
+            "--page-token",
+            "NEXT",
+            "--pages",
+            "2",
+            "--max-results",
+            "75",
+        ],
+    }
+    checkpoint = outcome.data["enumeration"]
+    assert checkpoint["schema"] == "filmot.youtube-upload-enumeration/v1"
+    assert checkpoint["observed_at"] == "2026-09-12T12:00:00Z"
+    assert checkpoint["expires_at"] == "2026-10-12T12:00:00Z"
+    assert checkpoint["coverage"]["next_page_token"] == "NEXT"
+    saved_manifest = downloader._save_manifest.call_args.args[1]
+    assert saved_manifest["upload_enumeration"] == checkpoint
+    compact = mock_log_result.call_args.kwargs["data"]
+    assert compact["enumeration"] == checkpoint
+    assert compact["continuation"] == outcome.data["continuation"]
+
+
+def test_channel_download_preserves_downloads_but_is_partial_on_provider_issue(
+    runner,
+    tmp_path,
+):
+    downloader = MagicMock()
+    channel_dir = Path(tmp_path) / "example"
+    downloader._resolve_channel_dir.return_value = ("example", channel_dir)
+    downloader._load_manifest.return_value = {"videos": {}}
+    info = {
+        "channel_id": "UC1234567890123456789012",
+        "name": "Example",
+        "video_count": 2,
+        "subscriber_count": 12,
+        "uploads_playlist_id": "uploads",
+    }
+    videos = [{
+        "video_id": "abc12345678",
+        "title": "Preserved upload",
+        "published_at": "2026-09-12T00:00:00Z",
+    }]
+    provider = _upload_enumeration(
+        videos,
+        next_page_token="FAILED_PAGE",
+        partial=True,
+        stopping_reason="partial_failure",
+        warnings=["Earlier upload pages were preserved."],
+        errors=[{
+            "type": "YouTubeChannelAPIError",
+            "message": "YouTube Data API playlistItems.list failed",
+            "stage": "enumeration",
+            "page": 2,
+            "reason": "quotaExceeded",
+        }],
+    )
+    transcript = {
+        "language": "en",
+        "is_generated": False,
+        "duration_seconds": 5.0,
+        "segment_count": 1,
+        "full_text": "two words",
+        "segments": [{"start": 0.0, "duration": 5.0, "text": "two words"}],
+        "route": "direct",
+    }
+    with (
+        patch("filmot.channel_dl.ChannelDownloader", return_value=downloader),
+        patch("filmot.channel_dl.get_channel_info", return_value=info),
+        patch(
+            "filmot.channel_dl.enumerate_uploads_detailed",
+            return_value=provider,
+        ),
+        patch("filmot.transcript.get_transcript", return_value=transcript),
+        patch("filmot.transcript.routing_plan", return_value=_route_plan()),
+        patch("filmot.transcript.describe_routing_plan", return_value="direct"),
+        patch("filmot.ledger.log_event"),
+        patch("filmot.ledger.log_result") as mock_log_result,
+    ):
+        result = runner.invoke(
+            cli, ["channel-download", "@Example", "--delay", "0"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Download Partially Complete" in result.output
+    assert "Earlier upload pages were preserved." in result.output
+    assert "Upload enumeration issue" in result.output
+    outcome = mock_log_result.call_args.args[1]
+    assert outcome.status_value == ResultStatus.PARTIAL.value
+    assert outcome.data["downloaded"] == 1
+    assert outcome.data["continuation"]["next_page_token"] == "FAILED_PAGE"
+    assert outcome.errors[0].stage == "enumeration"
+    assert outcome.errors[0].details["page"] == 2
+    assert outcome.warnings == ["Earlier upload pages were preserved."]
+    downloader._save_transcript.assert_called_once()
+    saved_manifest = downloader._save_manifest.call_args.args[1]
+    assert saved_manifest["upload_enumeration"]["coverage"]["partial"] is True
+
+
+def test_channel_download_zero_row_partial_is_visible_and_not_fully_synced(
+    runner,
+    tmp_path,
+):
+    downloader = MagicMock()
+    downloader._resolve_channel_dir.return_value = (
+        "example",
+        Path(tmp_path) / "example",
+    )
+    downloader._load_manifest.return_value = {"videos": {}}
+    info = {
+        "name": "Example",
+        "video_count": 2,
+        "subscriber_count": 12,
+        "uploads_playlist_id": "uploads",
+    }
+    provider = _upload_enumeration(
+        [],
+        next_page_token="RETRY_PAGE",
+        partial=True,
+        stopping_reason="partial_failure",
+        warnings=["No usable upload rows were returned before failure."],
+        errors=[{
+            "type": "YouTubeChannelAPIError",
+            "message": "A later uploads page failed",
+            "stage": "enumeration",
+        }],
+    )
+    with (
+        patch("filmot.channel_dl.ChannelDownloader", return_value=downloader),
+        patch("filmot.channel_dl.get_channel_info", return_value=info),
+        patch(
+            "filmot.channel_dl.enumerate_uploads_detailed",
+            return_value=provider,
+        ),
+        patch("filmot.ledger.log_event"),
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = runner.invoke(cli, ["channel-download", "UC-example"])
+
+    assert result.exit_code == 0, result.output
+    assert "This run is partial; No new transcripts" in result.output
+    assert "A later uploads page failed" in result.output
+    assert "--page-token RETRY_PAGE" in result.output
+    outcome = log_result.call_args.args[1]
+    assert outcome.status_value == ResultStatus.PARTIAL.value
+    assert outcome.data["already_synced"] is False
+
+
+def test_channel_download_rejects_malformed_video_before_manifest_write(
+    runner,
+):
+    downloader = MagicMock()
+    info = {
+        "name": "Example",
+        "video_count": 1,
+        "subscriber_count": 12,
+        "uploads_playlist_id": "uploads",
+    }
+    malformed = _upload_enumeration([{
+        "video_id": "../../escape",
+        "title": "Bad identity",
+        "published_at": "2026-09-12T00:00:00Z",
+    }])
+    with (
+        patch("filmot.channel_dl.ChannelDownloader", return_value=downloader),
+        patch("filmot.channel_dl.get_channel_info", return_value=info),
+        patch(
+            "filmot.channel_dl.enumerate_uploads_detailed",
+            return_value=malformed,
+        ),
+        patch("filmot.transcript.get_transcript") as get_transcript,
+        patch("filmot.ledger.log_event"),
+        patch("filmot.ledger.log_result") as log_result,
+    ):
+        result = runner.invoke(cli, ["channel-download", "UC-example"])
+
+    assert result.exit_code == 1
+    assert "exact 11-character YouTube video_id" in result.output
+    assert log_result.call_args.args[1].status_value == ResultStatus.FAILED.value
+    downloader._resolve_channel_dir.assert_not_called()
+    downloader._save_manifest.assert_not_called()
+    get_transcript.assert_not_called()
+
+
+def test_channel_download_rejects_fresh_with_page_token_before_side_effects(
+    runner,
+):
+    with (
+        patch("filmot.channel_dl.ChannelDownloader") as downloader,
+        patch("filmot.channel_dl.get_channel_info") as get_channel_info,
+        patch("filmot.ledger.log_event") as log_event,
+    ):
+        result = runner.invoke(cli, [
+            "channel-download",
+            "@Example",
+            "--fresh",
+            "--page-token",
+            "NEXT",
+        ])
+
+    assert result.exit_code == 2
+    assert "--fresh cannot be combined with --page-token" in result.output
+    downloader.assert_not_called()
+    get_channel_info.assert_not_called()
+    log_event.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -60,6 +60,16 @@ class YouTubeChannelAPIError(RuntimeError):
         rendered = "; ".join(detail for detail in details if detail)
         super().__init__(f"YouTube Data API {self.endpoint} failed ({rendered})")
 
+    def to_dict(self) -> dict:
+        """Return the small, credential-safe diagnostic used in result data."""
+        return {
+            "type": type(self).__name__,
+            "endpoint": self.endpoint,
+            "status": self.status,
+            "reason": self.reason,
+            "message": str(self),
+        }
+
 
 def _utc_now() -> datetime:
     """Return a timezone-aware UTC clock value (split out for deterministic tests)."""
@@ -569,16 +579,41 @@ def _get_channel_info(channel_id: str) -> dict:
     }
 
 
-def list_all_video_ids(uploads_playlist_id: str, progress_callback: Optional[Callable] = None) -> list[dict]:
-    """
-    Enumerate ALL videos in a channel's uploads playlist.
-    
-    Returns:
-        list of dicts with video_id, title, published_at, description
+def enumerate_uploads_detailed(
+    uploads_playlist_id: str,
+    *,
+    max_pages: int,
+    max_items: int,
+    page_token: Optional[str] = None,
+    progress_callback: Optional[Callable] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> dict:
+    """Return one bounded, resumable slice of an uploads playlist.
+
+    ``max_pages`` bounds successful API pages and ``max_items`` bounds unique
+    video rows. ``page_token`` resumes at an exact YouTube continuation token.
+    The result contains ``videos``, the effective ``request``, detailed
+    ``coverage``, and bounded ``warnings``/``errors`` lists. A failure before
+    the first usable page raises :class:`YouTubeChannelAPIError`; a later
+    failure is reported as partial while retaining earlier pages.
+
+    ``cancel_check`` is called immediately before each page request. Returning
+    true stops without making that request and leaves its token in coverage so
+    the caller can resume. The hook is deliberately cooperative: it does not
+    interrupt a request already executing.
     """
     failure = None
     try:
-        return _list_all_video_ids(uploads_playlist_id, progress_callback)
+        return _enumerate_uploads_detailed_impl(
+            uploads_playlist_id,
+            max_pages=max_pages,
+            max_items=max_items,
+            page_token=page_token,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            preserve_partial=True,
+            allow_unbounded=False,
+        )
     except YouTubeChannelAPIError as error:
         # Playlist pagination keeps one credential-bearing discovery client
         # alive across pages. Never retain that implementation frame on a
@@ -596,113 +631,279 @@ def list_all_video_ids(uploads_playlist_id: str, progress_callback: Optional[Cal
     # A caller callback can retain arbitrary state. Do not leave it attached
     # to the only provider frame exposed by the detached public traceback.
     progress_callback = None
+    cancel_check = None
+    page_token = None
     raise failure
 
 
-def _list_all_video_ids(
+def list_all_video_ids(
     uploads_playlist_id: str,
     progress_callback: Optional[Callable] = None,
 ) -> list[dict]:
-    """Sensitive implementation for :func:`list_all_video_ids`."""
+    """Enumerate every upload, preserving the original list-returning API.
+
+    New control-plane callers should prefer :func:`enumerate_uploads_detailed`.
+    This compatibility wrapper intentionally retains the historical unbounded
+    traversal and fail-fast behavior.
+    """
+    failure = None
+    try:
+        return _list_all_video_ids(uploads_playlist_id, progress_callback)
+    except YouTubeChannelAPIError as error:
+        failure = error.with_traceback(None)
+    except ValueError as error:
+        failure = ValueError(redact_sensitive_text(error))
+    except Exception as error:
+        failure = YouTubeChannelAPIError(
+            "playlist enumeration",
+            reason="unexpected {}".format(type(error).__name__),
+        )
+    progress_callback = None
+    raise failure
+
+
+def _validate_upload_enumeration_request(
+    uploads_playlist_id: str,
+    max_pages: Optional[int],
+    max_items: Optional[int],
+    page_token: Optional[str],
+    *,
+    allow_unbounded: bool,
+) -> tuple[str, Optional[str]]:
+    """Validate public pagination inputs before creating an API client."""
+    if not isinstance(uploads_playlist_id, str) or not uploads_playlist_id.strip():
+        raise ValueError("uploads_playlist_id must be a non-empty string")
+
+    for name, value in (("max_pages", max_pages), ("max_items", max_items)):
+        if value is None and allow_unbounded:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+
+    if page_token is not None:
+        if not isinstance(page_token, str) or not page_token.strip():
+            raise ValueError("page_token must be a non-empty string when provided")
+        page_token = page_token.strip()
+    return uploads_playlist_id.strip(), page_token
+
+
+def _upload_video_row(item: dict, uploads_playlist_id: str) -> Optional[dict]:
+    """Normalize one playlistItems row, or return ``None`` when no ID exists."""
+    snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else {}
+    content_details = (
+        item.get("contentDetails")
+        if isinstance(item.get("contentDetails"), dict)
+        else {}
+    )
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    resource = (
+        snippet.get("resourceId")
+        if isinstance(snippet.get("resourceId"), dict)
+        else {}
+    )
+    content_video_id = content_details.get("videoId")
+    resource_video_id = resource.get("videoId")
+    if isinstance(content_video_id, str) and content_video_id.strip():
+        video_id = content_video_id.strip()
+    elif isinstance(resource_video_id, str) and resource_video_id.strip():
+        video_id = resource_video_id.strip()
+    else:
+        return None
+
+    description = snippet.get("description", "")
+    if not isinstance(description, str):
+        description = ""
+    return {
+        # Original keys and semantics.
+        "video_id": video_id,
+        "title": snippet.get("title", "")
+        if isinstance(snippet.get("title", ""), str)
+        else "",
+        "published_at": snippet.get("publishedAt", "")
+        if isinstance(snippet.get("publishedAt", ""), str)
+        else "",
+        "description": description[:500],
+        # Exact playlist provenance and channel ownership metadata.
+        "playlist_item_id": item.get("id")
+        if isinstance(item.get("id"), str)
+        else None,
+        "playlist_id": snippet.get("playlistId")
+        if isinstance(snippet.get("playlistId"), str)
+        and snippet.get("playlistId")
+        else uploads_playlist_id,
+        "position": _optional_int(snippet.get("position")),
+        "channel_id": snippet.get("channelId")
+        if isinstance(snippet.get("channelId"), str)
+        else None,
+        "channel_title": snippet.get("channelTitle")
+        if isinstance(snippet.get("channelTitle"), str)
+        else None,
+        "video_owner_channel_id": snippet.get("videoOwnerChannelId")
+        if isinstance(snippet.get("videoOwnerChannelId"), str)
+        else None,
+        "video_owner_channel_title": snippet.get("videoOwnerChannelTitle")
+        if isinstance(snippet.get("videoOwnerChannelTitle"), str)
+        else None,
+        "video_published_at": content_details.get("videoPublishedAt")
+        if isinstance(content_details.get("videoPublishedAt"), str)
+        else None,
+        "privacy_status": status.get("privacyStatus")
+        if isinstance(status.get("privacyStatus"), str)
+        else None,
+    }
+
+
+def _enumerate_uploads_detailed_impl(
+    uploads_playlist_id: str,
+    *,
+    max_pages: Optional[int],
+    max_items: Optional[int],
+    page_token: Optional[str],
+    progress_callback: Optional[Callable],
+    cancel_check: Optional[Callable[[], bool]],
+    preserve_partial: bool,
+    allow_unbounded: bool,
+) -> dict:
+    """Sensitive paginator shared by the detailed and compatibility APIs."""
+    uploads_playlist_id, page_token = _validate_upload_enumeration_request(
+        uploads_playlist_id,
+        max_pages,
+        max_items,
+        page_token,
+        allow_unbounded=allow_unbounded,
+    )
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable when provided")
+    if cancel_check is not None and not callable(cancel_check):
+        raise ValueError("cancel_check must be callable when provided")
+
     api_key = os.getenv("YOUTUBE_API_KEY", "")
     if not api_key:
         raise ValueError("YOUTUBE_API_KEY not found in .env")
 
     yt = _build_youtube_client(api_key)
+    observation_started = _utc_now()
 
-    videos = []
-    next_page_token = None
-    seen_page_tokens = set()
-    page = 0
+    videos: list[dict] = []
+    seen_video_ids: set[str] = set()
+    current_page_token = page_token
+    next_page_token = page_token
+    seen_page_tokens: set[str] = set()
+    pages_attempted = 0
+    pages_fetched = 0
+    items_seen = 0
+    candidates_fetched = 0
+    malformed_items = 0
+    idless_items = 0
+    duplicates = 0
+    approximate_total = None
+    results_per_page = None
+    stopping_reason = "exhausted"
+    partial = False
+    warnings: list[str] = []
+    errors: list[dict] = []
 
     while True:
-        page += 1
+        if cancel_check is not None:
+            callback_failure = None
+            try:
+                cancelled = bool(cancel_check())
+            except Exception as error:
+                callback_failure = _safe_api_failure(
+                    error,
+                    "playlist cancellation callback",
+                    api_key,
+                )
+                cancelled = False
+            if callback_failure is not None:
+                cancel_check = None
+                raise callback_failure
+            if cancelled:
+                stopping_reason = "cancelled"
+                partial = True
+                warnings.append(
+                    "Upload enumeration was cancelled before the next page request."
+                )
+                break
+
+        pages_attempted += 1
+        if current_page_token:
+            seen_page_tokens.add(current_page_token)
+        remaining = (
+            50 if max_items is None else min(50, max_items - len(videos))
+        )
         params = {
             "part": "snippet,contentDetails,status",
             "playlistId": uploads_playlist_id,
-            "maxResults": 50,
-            "pageToken": next_page_token,
+            "maxResults": remaining,
+            "pageToken": current_page_token,
         }
-        response = _execute_youtube_request(
-            lambda: yt.playlistItems().list(**params),
-            "playlistItems.list",
-            api_key,
-        )
+        try:
+            response = _execute_youtube_request(
+                lambda: yt.playlistItems().list(**params),
+                "playlistItems.list",
+                api_key,
+            )
+        except YouTubeChannelAPIError as error:
+            if pages_fetched == 0 or not preserve_partial:
+                yt = None
+                params = {}
+                api_key = ""
+                raise
+            stopping_reason = "partial_failure"
+            partial = True
+            errors.append({
+                "stage": "enumeration",
+                "page": pages_attempted,
+                **error.to_dict(),
+            })
+            warnings.append(
+                "Upload enumeration stopped after a later page failed; "
+                "earlier pages were preserved."
+            )
+            break
 
         items = response.get("items")
         if not isinstance(items, list):
-            raise YouTubeChannelAPIError(
+            response_failure = YouTubeChannelAPIError(
                 "playlistItems.list",
                 reason="malformed response: items is not an array",
             )
+            if pages_fetched == 0 or not preserve_partial:
+                raise response_failure
+            stopping_reason = "partial_failure"
+            partial = True
+            errors.append({
+                "stage": "enumeration",
+                "page": pages_attempted,
+                **response_failure.to_dict(),
+            })
+            warnings.append(
+                "Upload enumeration stopped after a malformed later page; "
+                "earlier pages were preserved."
+            )
+            break
+
+        pages_fetched += 1
 
         for item in items:
+            items_seen += 1
             if not isinstance(item, dict):
+                malformed_items += 1
                 continue
-            snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else {}
-            content_details = (
-                item.get("contentDetails")
-                if isinstance(item.get("contentDetails"), dict)
-                else {}
-            )
-            status = item.get("status") if isinstance(item.get("status"), dict) else {}
-            resource = (
-                snippet.get("resourceId")
-                if isinstance(snippet.get("resourceId"), dict)
-                else {}
-            )
-            content_video_id = content_details.get("videoId")
-            resource_video_id = resource.get("videoId")
-            if isinstance(content_video_id, str) and content_video_id:
-                vid = content_video_id
-            elif isinstance(resource_video_id, str) and resource_video_id:
-                vid = resource_video_id
-            else:
-                # Deleted or malformed playlist items sometimes omit one or
-                # both metadata containers. A missing ID cannot be downloaded,
-                # so skip it while retaining every usable unavailable item.
+            video = _upload_video_row(item, uploads_playlist_id)
+            if video is None:
+                idless_items += 1
                 continue
-            description = snippet.get("description", "")
-            if not isinstance(description, str):
-                description = ""
-            videos.append({
-                # Original keys and semantics.
-                "video_id": vid,
-                "title": snippet.get("title", "")
-                if isinstance(snippet.get("title", ""), str)
-                else "",
-                "published_at": snippet.get("publishedAt", "")
-                if isinstance(snippet.get("publishedAt", ""), str)
-                else "",
-                "description": description[:500],
-                # Exact playlist provenance and channel ownership metadata.
-                "playlist_item_id": item.get("id")
-                if isinstance(item.get("id"), str)
-                else None,
-                "playlist_id": snippet.get("playlistId")
-                if isinstance(snippet.get("playlistId"), str)
-                and snippet.get("playlistId")
-                else uploads_playlist_id,
-                "position": _optional_int(snippet.get("position")),
-                "channel_id": snippet.get("channelId")
-                if isinstance(snippet.get("channelId"), str)
-                else None,
-                "channel_title": snippet.get("channelTitle")
-                if isinstance(snippet.get("channelTitle"), str)
-                else None,
-                "video_owner_channel_id": snippet.get("videoOwnerChannelId")
-                if isinstance(snippet.get("videoOwnerChannelId"), str)
-                else None,
-                "video_owner_channel_title": snippet.get("videoOwnerChannelTitle")
-                if isinstance(snippet.get("videoOwnerChannelTitle"), str)
-                else None,
-                "video_published_at": content_details.get("videoPublishedAt")
-                if isinstance(content_details.get("videoPublishedAt"), str)
-                else None,
-                "privacy_status": status.get("privacyStatus")
-                if isinstance(status.get("privacyStatus"), str)
-                else None,
-            })
+            candidates_fetched += 1
+            video_id = video["video_id"]
+            if video_id in seen_video_ids:
+                duplicates += 1
+                continue
+            seen_video_ids.add(video_id)
+            videos.append(video)
+            if max_items is not None and len(videos) >= max_items:
+                break
 
         if progress_callback:
             page_info = response.get("pageInfo")
@@ -713,7 +914,7 @@ def _list_all_video_ids(
                 total = len(videos)
             callback_failure = None
             try:
-                progress_callback(len(videos), total, page)
+                progress_callback(len(videos), total, pages_fetched)
             except Exception as error:
                 callback_failure = _safe_api_failure(
                     error,
@@ -724,22 +925,145 @@ def _list_all_video_ids(
                 progress_callback = None
                 raise callback_failure
 
-        next_page_token = response.get("nextPageToken")
-        if next_page_token is None or next_page_token == "":
+        page_info = response.get("pageInfo")
+        if isinstance(page_info, dict):
+            total = _optional_int(page_info.get("totalResults"))
+            per_page = _optional_int(page_info.get("resultsPerPage"))
+            if total is not None:
+                approximate_total = total
+            if per_page is not None:
+                results_per_page = per_page
+
+        token = response.get("nextPageToken")
+        if token is None or token == "":
+            next_page_token = None
+            stopping_reason = "exhausted"
             break
-        if not isinstance(next_page_token, str):
-            raise YouTubeChannelAPIError(
+        if not isinstance(token, str):
+            token_failure = YouTubeChannelAPIError(
                 "playlistItems.list",
                 reason="malformed response: nextPageToken is not a string",
             )
-        if next_page_token in seen_page_tokens:
-            raise YouTubeChannelAPIError(
+            if not preserve_partial:
+                raise token_failure
+            next_page_token = None
+            stopping_reason = "partial_failure"
+            partial = True
+            errors.append({
+                "stage": "pagination",
+                "page": pages_fetched,
+                **token_failure.to_dict(),
+            })
+            warnings.append(
+                "Upload enumeration stopped because pagination metadata was malformed."
+            )
+            break
+        if token in seen_page_tokens:
+            token_failure = YouTubeChannelAPIError(
                 "playlistItems.list",
                 reason="pagination returned a repeated nextPageToken",
             )
-        seen_page_tokens.add(next_page_token)
+            if not preserve_partial:
+                raise token_failure
+            next_page_token = None
+            stopping_reason = "partial_failure"
+            partial = True
+            errors.append({
+                "stage": "pagination",
+                "page": pages_fetched,
+                **token_failure.to_dict(),
+            })
+            warnings.append(
+                "Upload enumeration stopped because YouTube repeated a page token."
+            )
+            break
 
-    return videos
+        next_page_token = token
+        if max_items is not None and len(videos) >= max_items:
+            stopping_reason = "item_budget"
+            break
+        if max_pages is not None and pages_fetched >= max_pages:
+            stopping_reason = "page_budget"
+            break
+        current_page_token = token
+
+    if malformed_items:
+        warnings.append("Malformed non-object upload playlist items were skipped.")
+    if idless_items:
+        warnings.append("Upload playlist items without a usable video ID were skipped.")
+    if duplicates:
+        warnings.append("Duplicate upload video IDs were skipped.")
+
+    observed_at = (
+        _isoformat_utc(observation_started) if pages_fetched else None
+    )
+    expires_at = (
+        _isoformat_utc(
+            observation_started + timedelta(days=CHANNEL_METADATA_TTL_DAYS)
+        )
+        if pages_fetched
+        else None
+    )
+
+    return {
+        "provider": "youtube-data-api-v3",
+        "videos": videos,
+        "request": {
+            "uploads_playlist_id": uploads_playlist_id,
+            "max_pages": max_pages,
+            "max_items": max_items,
+            "page_token": page_token,
+            "page_budget": max_pages,
+            "item_budget": max_items,
+            "initial_page_token": page_token,
+        },
+        "observed_at": observed_at,
+        "expires_at": expires_at,
+        "coverage": {
+            "pages_attempted": pages_attempted,
+            "pages_fetched": pages_fetched,
+            "api_calls": pages_attempted,
+            "items_seen": items_seen,
+            "candidates_fetched": candidates_fetched,
+            "unique_results": len(videos),
+            "returned": len(videos),
+            "duplicates_skipped": duplicates,
+            "malformed_items_skipped": malformed_items,
+            "idless_items_skipped": idless_items,
+            "next_page_token": next_page_token,
+            "page_info": {
+                "approximate_total_results": approximate_total,
+                "results_per_page": results_per_page,
+            },
+            "approximate_total": approximate_total,
+            "stopping_reason": stopping_reason,
+            "partial": partial,
+        },
+        "warnings": warnings,
+        "errors": errors,
+        "api_calls": {
+            "playlist_items": pages_attempted,
+            "total": pages_attempted,
+        },
+    }
+
+
+def _list_all_video_ids(
+    uploads_playlist_id: str,
+    progress_callback: Optional[Callable] = None,
+) -> list[dict]:
+    """Sensitive implementation for :func:`list_all_video_ids`."""
+    result = _enumerate_uploads_detailed_impl(
+        uploads_playlist_id,
+        max_pages=None,
+        max_items=None,
+        page_token=None,
+        progress_callback=progress_callback,
+        cancel_check=None,
+        preserve_partial=False,
+        allow_unbounded=True,
+    )
+    return result["videos"]
 
 
 class ChannelDownloader:

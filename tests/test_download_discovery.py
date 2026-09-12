@@ -1,3 +1,4 @@
+import hashlib
 import json
 from unittest.mock import patch
 
@@ -54,13 +55,14 @@ def test_unchanged_yt_search_raw_payload_pipes_into_download():
         "metadata_observed_at": "2026-09-12T10:00:00Z",
         "metadata_expires_at": "2026-10-12T10:00:00Z",
     }
+    piped = json.dumps(_yt_payload([video]))
     with (
         patch("filmot.library.get_library") as get_library,
         patch(
             "filmot.transcript.get_transcript",
             return_value=_transcript(video["video_id"]),
         ) as get_transcript,
-        patch("filmot.ledger.log_result"),
+        patch("filmot.ledger.log_result") as log_result,
         patch("filmot.ledger.log_event"),
     ):
         library = get_library.return_value
@@ -69,7 +71,7 @@ def test_unchanged_yt_search_raw_payload_pipes_into_download():
         result = CliRunner().invoke(
             cli,
             ["download", "--topic", "fresh", "--count", "1"],
-            input=json.dumps(_yt_payload([video])),
+            input=piped,
         )
 
     assert result.exit_code == 0, result.output
@@ -90,6 +92,12 @@ def test_unchanged_yt_search_raw_payload_pipes_into_download():
     assert saved["metadata"]["provider_fields"][
         "metadata_observed_at"
     ] == "2026-09-12T10:00:00Z"
+    discovery_ref = "sha256:" + hashlib.sha256(piped.encode("utf-8")).hexdigest()
+    lifecycle = library.replace_youtube_metadata.call_args
+    assert lifecycle.args[0:2] == (video["video_id"], "fresh")
+    assert lifecycle.args[2]["provider"] == "youtube"
+    assert lifecycle.kwargs["request_ref"] == discovery_ref
+    assert log_result.call_args.args[1].data["discovery_ref"] == discovery_ref
 
 
 def test_download_preflights_complete_batch_before_any_mutation():

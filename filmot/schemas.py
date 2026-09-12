@@ -160,6 +160,18 @@ class YouTubeSearchResultData(TypedDict, total=False):
     show_description: bool
 
 
+class YouTubeVideoDetailsResultData(TypedDict, total=False):
+    """Exact-ID public metadata returned by ``yt-video``."""
+
+    videos: List[Dict[str, Any]]
+    id_outcomes: List[Dict[str, Any]]
+    request: Dict[str, Any]
+    coverage: Dict[str, Any]
+    observed_at: Optional[str]
+    expires_at: Optional[str]
+    show_description: bool
+
+
 class TranscriptResultData(TypedDict, total=False):
     """Normalized transcript outcome used by raw and human renderers."""
 

@@ -91,6 +91,10 @@ def test_manual_save_uses_exact_discovery_metadata_without_refetch(tmp_path):
     assert log_result.call_args.kwargs["data"]["discovery_ref"].startswith(
         "sha256:"
     )
+    lifecycle = library.replace_youtube_metadata.call_args
+    assert lifecycle.args[:2] == (VIDEO_ID, "topic")
+    assert lifecycle.args[2]["provider"] == "youtube"
+    assert lifecycle.kwargs["request_ref"].startswith("sha256:")
 
 
 def test_discovery_mismatch_fails_before_transcript_or_library(tmp_path):
@@ -130,7 +134,9 @@ def test_existing_record_metadata_enrichment_failure_is_nonfatal(tmp_path):
     ):
         library = get_library.return_value
         library.exists.return_value = True
-        library.enrich_metadata.side_effect = OSError("metadata store busy")
+        library.replace_youtube_metadata.side_effect = OSError(
+            "metadata store busy"
+        )
         result = CliRunner().invoke(
             cli,
             [

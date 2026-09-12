@@ -39,6 +39,7 @@ from ..schemas import (
     SearchResultData,
     VideoResultData,
     YouTubeSearchResultData,
+    YouTubeVideoDetailsResultData,
 )
 
 
@@ -1156,6 +1157,7 @@ def _bulk_download_transcripts(
     fallback: bool = False,
     dedupe: bool = False,
     lang: str = None,
+    discovery_ref: Optional[str] = None,
 ):
     """Download transcripts from search results to library.
 
@@ -1166,6 +1168,7 @@ def _bulk_download_transcripts(
         fallback: If True, use AWS Transcribe when YouTube captions unavailable
         dedupe: If True, skip matching first-500-character fingerprints
         lang: Optional preferred transcript language
+        discovery_ref: Optional content-addressed source artifact reference
     """
     import hashlib
     from ..library import get_library
@@ -1219,6 +1222,7 @@ def _bulk_download_transcripts(
     skip_count = 0
     fail_count = 0
     dedupe_count = 0
+    metadata_failure_count = 0
     proxy_errors = False
 
     # Build dedup hash set from existing library entries
@@ -1374,6 +1378,47 @@ def _bulk_download_transcripts(
                 metadata=metadata,
                 segments=result.get("segments", []),
             )
+            if str(video.get("provider") or "").casefold() == "youtube":
+                try:
+                    lifecycle = library.replace_youtube_metadata(
+                        video_id,
+                        topic,
+                        video,
+                        request_ref=discovery_ref,
+                    )
+                    log_event(
+                        "metadata_enrichment",
+                        topic=topic,
+                        video_id=video_id,
+                        status="completed",
+                        source="bulk_download",
+                        discovery_ref=discovery_ref,
+                        lifecycle_state=lifecycle.get("state"),
+                        changed_paths=lifecycle.get("changed_paths"),
+                        conflict_paths=lifecycle.get("conflict_paths"),
+                    )
+                except Exception as metadata_error:
+                    # The saved record retains explicit discovery-provider
+                    # provenance and can be adopted by `yt-data refresh`.
+                    metadata_failure_count += 1
+                    log_event(
+                        "metadata_enrichment",
+                        topic=topic,
+                        video_id=video_id,
+                        status="failed",
+                        source="bulk_download",
+                        discovery_ref=discovery_ref,
+                        error="{}: {}".format(
+                            type(metadata_error).__name__,
+                            _whole_word_summary(metadata_error, 500),
+                        ),
+                    )
+                    console.print(
+                        "  [yellow]Metadata lifecycle registration failed; "
+                        "run `filmot yt-data refresh --video {}` later.[/yellow]".format(
+                            video_id
+                        )
+                    )
             log_event(
                 "transcript_save", topic=topic, video_id=video_id,
                 status="saved", source="bulk_download",
@@ -1408,6 +1453,7 @@ def _bulk_download_transcripts(
         "skipped": skip_count + dedupe_count,
         "failed": fail_count,
         "deduped": dedupe_count,
+        "metadata_failures": metadata_failure_count,
     }
     log_event(
         "bulk_download",
@@ -2999,6 +3045,303 @@ def yt_search(query: str, days: int, max_results: int, pages: int,
         _emit_raw_result(outcome, indent=2)
         return
     _render_yt_search_result(outcome)
+
+
+def _youtube_video_ids(values: tuple[str, ...]) -> List[str]:
+    """Normalize exact IDs/URLs while failing before a quota-bearing request."""
+    from ..discovery import youtube_video_id
+
+    video_ids = []
+    seen = set()
+    for value in values:
+        for item in str(value).split(","):
+            candidate = item.strip()
+            if not candidate:
+                continue
+            video_id = youtube_video_id(candidate)
+            if video_id is None:
+                raise click.BadParameter(
+                    "expected an 11-character YouTube video ID or supported "
+                    "watch/shorts/live/youtu.be URL; got {!r}".format(candidate),
+                    param_hint="VIDEO",
+                )
+            if video_id not in seen:
+                seen.add(video_id)
+                video_ids.append(video_id)
+    if not video_ids:
+        raise click.BadParameter("at least one YouTube video ID is required")
+    return video_ids
+
+
+def _normalize_youtube_video_provider_result(value: object) -> Dict[str, Any]:
+    """Validate the exact-ID provider boundary before rendering or logging."""
+    if not isinstance(value, dict):
+        raise TypeError("YouTube video provider returned a non-object result")
+    result = dict(value)
+    videos = result.get("videos") or []
+    if not isinstance(videos, list) or any(
+        not isinstance(video, dict) for video in videos
+    ):
+        raise TypeError("YouTube video provider videos must be a list of objects")
+    result["videos"] = [dict(video) for video in videos]
+    id_outcomes = result.get("id_outcomes") or []
+    if not isinstance(id_outcomes, list) or any(
+        not isinstance(item, dict) for item in id_outcomes
+    ):
+        raise TypeError(
+            "YouTube video provider id_outcomes must be a list of objects"
+        )
+    result["id_outcomes"] = [dict(item) for item in id_outcomes]
+    for section in ("request", "coverage"):
+        item = result.get(section) or {}
+        if not isinstance(item, dict):
+            raise TypeError(
+                "YouTube video provider {} must be an object".format(section)
+            )
+        result[section] = dict(item)
+    for section, member_type in (("warnings", str), ("errors", dict)):
+        items = result.get(section) or []
+        if not isinstance(items, list) or any(
+            not isinstance(item, member_type) for item in items
+        ):
+            raise TypeError(
+                "YouTube video provider {} must be a list of {}".format(
+                    section,
+                    "strings" if member_type is str else "objects",
+                )
+            )
+        result[section] = [
+            dict(item) if isinstance(item, dict) else item for item in items
+        ]
+    return result
+
+
+def _render_yt_video_result(
+    outcome: CommandResult[YouTubeVideoDetailsResultData],
+) -> None:
+    """Render exact-ID public YouTube metadata."""
+    if outcome.status_value == ResultStatus.FAILED.value:
+        message = (
+            outcome.errors[0].message
+            if outcome.errors
+            else "YouTube metadata request failed"
+        )
+        _command_error(message)
+
+    from ..youtube_search import format_duration
+
+    videos = outcome.data.get("videos") or []
+    coverage = outcome.data.get("coverage") or {}
+    if not videos:
+        missing = coverage.get("missing_video_ids") or []
+        suffix = " ({})".format(", ".join(map(str, missing))) if missing else ""
+        console.print(
+            "[yellow]No public video metadata was returned{}.[/yellow]".format(
+                suffix
+            )
+        )
+        return
+
+    console.print(Panel(
+        "[bold]Requested:[/bold] {} | [bold]Returned:[/bold] {} | "
+        "[bold]API attempts:[/bold] {} | [bold]Stopped:[/bold] {}".format(
+            coverage.get("requested_count", len(videos)),
+            coverage.get("matched_count", len(videos)),
+            coverage.get("api_calls", 0),
+            coverage.get("stopping_reason", "completed"),
+        ),
+        title="YouTube Data API Video Metadata",
+    ))
+    for index, video in enumerate(videos, 1):
+        views = video.get("views")
+        likes = video.get("likes")
+        comments = video.get("comments")
+        console.print(
+            "\n[bold cyan]{}. {}[/bold cyan]".format(
+                index, video.get("title") or "Untitled video"
+            )
+        )
+        console.print(
+            "   Channel: [green]{}[/green] | Published: {}".format(
+                video.get("channel_title") or "Unknown channel",
+                str(video.get("published_at") or "unknown")[:10],
+            )
+        )
+        console.print(
+            "   Views: {} | Likes: {} | Comments: {} | Duration: {}".format(
+                f"{views:,}" if isinstance(views, int) else "unknown",
+                f"{likes:,}" if isinstance(likes, int) else "unknown",
+                f"{comments:,}" if isinstance(comments, int) else "unknown",
+                format_duration(video.get("duration")) or "unknown",
+            )
+        )
+        video_url = video.get("url") or "https://youtube.com/watch?v={}".format(
+            video.get("video_id", "")
+        )
+        console.print(f"   [link={video_url}]{video_url}[/link]")
+        disclosures = []
+        if video.get("paid_product_placement_disclosure") == "declared":
+            disclosures.append("paid promotion declared")
+        if video.get("contains_synthetic_media") is True:
+            disclosures.append("synthetic media declared")
+        if video.get("made_for_kids") is True:
+            disclosures.append("made for kids")
+        if disclosures:
+            console.print("   [dim]Disclosures: {}[/dim]".format(
+                ", ".join(disclosures)
+            ))
+        if outcome.data.get("show_description") and video.get("description"):
+            description = str(video["description"])
+            console.print(
+                "   [dim]{}[/dim]".format(
+                    description[:500] + ("..." if len(description) > 500 else "")
+                )
+            )
+
+
+@click.command("yt-video")
+@click.argument("videos", nargs=-1, required=True)
+@click.option(
+    "--connect-timeout", default=5.0,
+    type=click.FloatRange(min=0, min_open=True), show_default=True,
+    help="Per-request connection timeout in seconds",
+)
+@click.option(
+    "--read-timeout", default=20.0,
+    type=click.FloatRange(min=0, min_open=True), show_default=True,
+    help="Per-request response timeout in seconds",
+)
+@click.option(
+    "--retries", default=2, type=click.IntRange(0, 5), show_default=True,
+    help="Retries for transient failures",
+)
+@click.option("--show-description", is_flag=True, help="Show video descriptions")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def yt_video(
+    videos: tuple[str, ...],
+    connect_timeout: float,
+    read_timeout: float,
+    retries: int,
+    show_description: bool,
+    raw: bool,
+) -> None:
+    """Fetch rich public YouTube metadata for exact video IDs or URLs.
+
+    This uses ``videos.list`` only; it never downloads or acquires captions.
+    Comma-separated IDs and repeated VIDEO arguments are accepted, deduplicated,
+    and fetched in API-sized batches of 50.
+    """
+    from ..ledger import log_event, log_result
+    from ..youtube_search import (
+        YouTubeAPIError,
+        get_video_details_detailed,
+    )
+
+    video_ids = _youtube_video_ids(videos)
+    event_data = {
+        "video_ids": video_ids,
+        "requested": len(video_ids),
+        "connect_timeout": connect_timeout,
+        "read_timeout": read_timeout,
+        "retries": retries,
+        "raw": raw,
+    }
+    try:
+        with _search_status(
+            "[bold green]Fetching YouTube metadata for {} video(s)...".format(
+                len(video_ids)
+            ),
+            raw=raw,
+        ):
+            provider_result = get_video_details_detailed(
+                video_ids,
+                timeout=(connect_timeout, read_timeout),
+                retries=retries,
+            )
+        provider_result = _normalize_youtube_video_provider_result(
+            provider_result
+        )
+    except ValueError as error:
+        log_event(
+            "yt-video", **event_data, status="failed",
+            failure_stage="configuration",
+            error="{}: {}".format(type(error).__name__, error),
+        )
+        _command_error(
+            "Invalid YouTube metadata request: {}".format(error),
+            raw=raw,
+            command="yt-video",
+            error_type=type(error).__name__,
+            stage="configuration",
+        )
+    except YouTubeAPIError as error:
+        log_event(
+            "yt-video", **event_data, status="failed",
+            failure_stage="request", error=str(error),
+            error_category=error.category, error_reason=error.reason,
+            http_status=error.status_code,
+        )
+        _command_error(
+            str(error), raw=raw, command="yt-video",
+            error_type=type(error).__name__, stage="request",
+        )
+    except (TypeError, RuntimeError) as error:
+        log_event(
+            "yt-video", **event_data, status="failed",
+            failure_stage="invalid-response",
+            error="{}: {}".format(type(error).__name__, error),
+        )
+        _command_error(
+            str(error), raw=raw, command="yt-video",
+            error_type=type(error).__name__, stage="invalid-response",
+        )
+
+    result_videos = list(provider_result.get("videos") or [])
+    coverage = dict(provider_result.get("coverage") or {})
+    provider_errors = _youtube_error_details(provider_result.get("errors"))
+    if provider_errors and not coverage.get("batches_completed"):
+        status = ResultStatus.FAILED
+    elif result_videos and (
+        provider_errors or coverage.get("partial")
+    ):
+        status = ResultStatus.PARTIAL
+    elif result_videos:
+        status = ResultStatus.COMPLETED
+    else:
+        status = ResultStatus.EMPTY
+    data: YouTubeVideoDetailsResultData = {
+        "videos": result_videos,
+        "id_outcomes": list(provider_result.get("id_outcomes") or []),
+        "request": dict(provider_result.get("request") or {}),
+        "coverage": coverage,
+        "observed_at": provider_result.get("observed_at"),
+        "expires_at": provider_result.get("expires_at"),
+        "show_description": show_description,
+    }
+    outcome = CommandResult(
+        command="yt-video",
+        status=status,
+        data=data,
+        errors=provider_errors,
+        warnings=list(provider_result.get("warnings") or []),
+    )
+    if raw:
+        outcome = _prepare_raw_result(outcome)
+    log_result(
+        "yt-video",
+        outcome,
+        data={
+            **event_data,
+            "request": data["request"],
+            "coverage": coverage,
+            "returned": len(result_videos),
+            "partial": status == ResultStatus.PARTIAL,
+        },
+    )
+    if raw:
+        _emit_raw_result(outcome, indent=2)
+        return
+    _render_yt_video_result(outcome)
 
 
 # ========== TRANSCRIPT LIBRARY ==========

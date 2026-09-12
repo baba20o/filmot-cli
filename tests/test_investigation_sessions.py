@@ -182,14 +182,43 @@ def test_parallel_download_item_events_inherit_investigation(tmp_path):
     downloader._resolve_channel_dir.return_value = ("example", tmp_path / "example")
     downloader._load_manifest.return_value = {"videos": {}}
     info = {"name": "Example", "video_count": 2, "subscriber_count": 12, "uploads_playlist_id": "uploads"}
-    videos = [{"video_id": video, "title": "Video", "published_at": "2026-01-01"} for video in ("one", "two")]
+    video_ids = ("videoone001", "videotwo002")
+    videos = [
+        {"video_id": video, "title": "Video", "published_at": "2026-01-01"}
+        for video in video_ids
+    ]
+    enumeration = {
+        "provider": "youtube-data-api-v3",
+        "videos": videos,
+        "request": {
+            "uploads_playlist_id": "uploads",
+            "max_pages": 10,
+            "max_items": 500,
+            "page_token": None,
+        },
+        "coverage": {
+            "pages_attempted": 1,
+            "pages_fetched": 1,
+            "api_calls": 1,
+            "returned": 2,
+            "next_page_token": None,
+            "stopping_reason": "exhausted",
+            "partial": False,
+        },
+        "observed_at": "2026-09-12T12:00:00Z",
+        "expires_at": "2026-10-12T12:00:00Z",
+        "warnings": [],
+        "errors": [],
+    }
     with patch("filmot.channel_dl.ChannelDownloader", return_value=downloader), patch(
         "filmot.channel_dl.get_channel_info", return_value=info
-    ), patch("filmot.channel_dl.list_all_video_ids", return_value=videos), patch(
+    ), patch(
+        "filmot.channel_dl.enumerate_uploads_detailed", return_value=enumeration
+    ), patch(
         "filmot.transcript.get_transcript", return_value={"error": "transport failed"}
     ):
         result = CliRunner().invoke(cli, ["channel-download", "UC-example", "--workers", "2", "--delay", "0", "--session", "parallel"])
     assert result.exit_code == 1, result.output
     items = [event for event in read_events("parallel") if event["kind"] == "channel_download_item"]
-    assert {event["data"]["video_id"] for event in items} == {"one", "two"}
+    assert {event["data"]["video_id"] for event in items} == set(video_ids)
     assert current_session() is None

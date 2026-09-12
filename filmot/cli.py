@@ -553,7 +553,7 @@ def watchlist_clear():
 # core/domain modules never import the root group and circular imports stay
 # impossible.
 from .commands.claims import claims
-from .commands.library import library, sessions
+from .commands.library import library, sessions, yt_data
 from .commands.proxy import proxy
 from .commands.research import (
     _candidate_assessment,
@@ -576,6 +576,7 @@ from .commands.search import (
     search_all,
     video,
     yt_search,
+    yt_video,
 )
 from .commands.transcript import (
     channel_download,
@@ -595,6 +596,8 @@ for command in (
     transcript,
     transcript_search,
     yt_search,
+    yt_video,
+    yt_data,
     claims,
     library,
     research,

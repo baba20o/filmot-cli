@@ -591,6 +591,25 @@ def _youtube_id_from_url(value: Any) -> Optional[str]:
     return None
 
 
+def youtube_video_id(value: Any) -> Optional[str]:
+    """Return an exact YouTube ID from a bare ID or supported public URL.
+
+    The parser accepts canonical watch, short-link, shorts, embed, and live
+    URLs on known YouTube hosts.  Extracted path/query values still have to be
+    exactly 11 URL-safe characters, so callers can reject malformed input
+    before spending API quota.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if YOUTUBE_VIDEO_ID_RE.fullmatch(candidate):
+        return candidate
+    extracted = _youtube_id_from_url(candidate)
+    if isinstance(extracted, str) and YOUTUBE_VIDEO_ID_RE.fullmatch(extracted):
+        return extracted
+    return None
+
+
 def _safe_url(value: Any) -> Optional[str]:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -1015,4 +1034,5 @@ __all__ = [
     "normalize_candidate",
     "normalize_candidates",
     "preflight_candidates",
+    "youtube_video_id",
 ]

@@ -1,6 +1,7 @@
 """Transcript-library and research-session commands."""
 
 from contextlib import nullcontext
+import hashlib
 import json as json_mod
 from pathlib import Path
 import shlex
@@ -189,6 +190,702 @@ def library():
         filmot library stats                   # Show library statistics
     """
     pass
+
+
+def _youtube_metadata_video_ids(values: tuple[str, ...]) -> list[str]:
+    """Normalize repeated/comma-separated exact YouTube IDs and URLs."""
+    from ..discovery import youtube_video_id
+
+    output = []
+    seen = set()
+    for value in values:
+        for part in str(value).split(","):
+            supplied = part.strip()
+            if not supplied:
+                continue
+            video_id = youtube_video_id(supplied)
+            if video_id is None:
+                raise click.BadParameter(
+                    "expected an 11-character YouTube video ID or supported "
+                    "public URL; got {!r}".format(supplied),
+                    param_hint="--video",
+                )
+            if video_id not in seen:
+                seen.add(video_id)
+                output.append(video_id)
+    if values and not output:
+        raise click.BadParameter(
+            "at least one YouTube video ID is required when --video is supplied",
+            param_hint="--video",
+        )
+    return output
+
+
+def _youtube_metadata_inventory(lib, topic: Optional[str], video_ids: list[str]):
+    """Return a stable record-copy inventory for one CLI selection."""
+    if not video_ids:
+        rows = lib.youtube_metadata_inventory(topic=topic)
+    else:
+        rows = []
+        for video_id in video_ids:
+            rows.extend(lib.youtube_metadata_inventory(
+                topic=topic,
+                video_id=video_id,
+            ))
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise TypeError("YouTube metadata inventory must be a list of objects")
+    deduped = {}
+    for row in rows:
+        copied = dict(row)
+        key = (
+            str(copied.get("topic") or ""),
+            str(copied.get("video_id") or ""),
+            str(copied.get("path") or ""),
+        )
+        deduped.setdefault(key, copied)
+    return [deduped[key] for key in sorted(deduped)]
+
+
+def _youtube_metadata_summary(rows: list[dict]) -> dict:
+    classifications = {"current": 0, "expired": 0, "unmanaged": 0}
+    states = {}
+    for row in rows:
+        classification = str(row.get("classification") or "unmanaged")
+        classifications[classification] = classifications.get(classification, 0) + 1
+        state = str(row.get("state") or "unmanaged")
+        states[state] = states.get(state, 0) + 1
+    return {
+        "records": len(rows),
+        "current": classifications.get("current", 0),
+        "expired": classifications.get("expired", 0),
+        "unmanaged": classifications.get("unmanaged", 0),
+        "invalid": states.get("invalid", 0),
+        "managed": sum(1 for row in rows if row.get("managed")),
+        "legacy_adoptable": sum(
+            1 for row in rows if row.get("legacy_adoptable")
+        ),
+        "states": states,
+    }
+
+
+def _select_youtube_metadata_rows(
+    rows: list[dict],
+    *,
+    explicit: bool,
+    include_all: bool,
+) -> list[dict]:
+    if explicit or include_all:
+        return list(rows)
+    return [
+        row for row in rows if row.get("classification") == "expired"
+    ]
+
+
+def _bounded_metadata_targets(
+    rows: list[dict],
+    *,
+    max_videos: int,
+) -> tuple[list[dict], list[str], int]:
+    """Apply an exact unique-video quota budget while retaining topic copies."""
+    selected_ids = []
+    selected_set = set()
+    for row in rows:
+        video_id = row.get("video_id")
+        if not isinstance(video_id, str):
+            continue
+        if video_id not in selected_set:
+            if len(selected_ids) >= max_videos:
+                continue
+            selected_set.add(video_id)
+            selected_ids.append(video_id)
+    bounded = [row for row in rows if row.get("video_id") in selected_set]
+    total_unique = len({
+        row.get("video_id")
+        for row in rows
+        if isinstance(row.get("video_id"), str)
+    })
+    return bounded, selected_ids, max(0, total_unique - len(selected_ids))
+
+
+def _youtube_request_reference(request: dict) -> str:
+    """Hash a credential-free effective request for lifecycle provenance."""
+    from ..redaction import redact_sensitive_value
+
+    safe_request = redact_sensitive_value(request)
+    encoded = json_mod.dumps(
+        safe_request,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+@click.group("yt-data")
+def yt_data():
+    """Inspect, refresh, or purge saved YouTube API metadata.
+
+    These commands manage API-derived metadata only. They never acquire
+    captions and never delete transcript text or the corresponding YouTube
+    resource.
+    """
+    pass
+
+
+def _render_yt_data_status(
+    outcome: CommandResult[LibraryResultData],
+) -> None:
+    _render_library_failure(outcome, "YouTube metadata status failed")
+    rows = outcome.data.get("rows") or []
+    summary = outcome.data.get("summary") or {}
+    console.print(Panel(
+        "[bold]Records:[/bold] {} | [green]Current:[/green] {} | "
+        "[yellow]Expired:[/yellow] {} | [dim]Unmanaged:[/dim] {} | "
+        "[red]Invalid:[/red] {}".format(
+            summary.get("records", 0),
+            summary.get("current", 0),
+            summary.get("expired", 0),
+            summary.get("unmanaged", 0),
+            summary.get("invalid", 0),
+        ),
+        title="Saved YouTube API Metadata",
+    ))
+    if not rows:
+        return
+    table = Table()
+    table.add_column("Topic", style="cyan")
+    table.add_column("Video ID", style="white")
+    table.add_column("Status")
+    table.add_column("Expires (UTC)", style="dim")
+    table.add_column("Fields", justify="right")
+    for row in rows:
+        classification = str(row.get("classification") or "unmanaged")
+        color = {
+            "current": "green",
+            "expired": "yellow",
+            "unmanaged": "dim",
+        }.get(classification, "red")
+        table.add_row(
+            str(row.get("topic") or ""),
+            str(row.get("video_id") or ""),
+            "[{}]{}[/{}]".format(color, classification, color),
+            str(row.get("expires_at") or "—"),
+            str(row.get("owned_path_count") or 0),
+        )
+    console.print(table)
+
+
+@yt_data.command("status")
+@click.option("--topic", default=None, help="Limit inspection to one topic")
+@click.option(
+    "--video", "videos", multiple=True,
+    help="Exact video ID/URL (repeat or comma-separate)",
+)
+@click.option("--expired", "expired_only", is_flag=True, help="Show expired rows only")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def yt_data_status(
+    topic: Optional[str],
+    videos: tuple[str, ...],
+    expired_only: bool,
+    raw: bool,
+) -> None:
+    """Inspect freshness and ownership locally without an API key."""
+    from ..library import get_library
+
+    video_ids = _youtube_metadata_video_ids(videos)
+    try:
+        rows = _youtube_metadata_inventory(get_library(), topic, video_ids)
+        if expired_only:
+            rows = [
+                row for row in rows
+                if row.get("classification") == "expired"
+            ]
+        data: LibraryResultData = {
+            "topic": topic,
+            "rows": rows,
+            "summary": {
+                **_youtube_metadata_summary(rows),
+                "offline": True,
+                "expired_only": expired_only,
+                "video_ids": video_ids,
+            },
+        }
+        outcome = CommandResult(
+            command="yt-data-status",
+            status=ResultStatus.COMPLETED if rows else ResultStatus.EMPTY,
+            data=data,
+        )
+    except Exception as error:
+        data = {
+            "topic": topic,
+            "rows": [],
+            "summary": {"offline": True, "records": 0},
+        }
+        outcome = CommandResult.failed(
+            "yt-data-status",
+            data,
+            ErrorDetail.from_exception(error, stage="inventory"),
+        )
+    if raw:
+        _emit_library_raw(outcome)
+    else:
+        _render_yt_data_status(outcome)
+
+
+def _render_yt_data_refresh(
+    outcome: CommandResult[LibraryResultData],
+) -> None:
+    _render_library_failure(outcome, "YouTube metadata refresh failed")
+    summary = outcome.data.get("summary") or {}
+    if summary.get("dry_run"):
+        console.print(
+            "[cyan]Would refresh {} record(s) across {} unique video(s); "
+            "no API calls or writes were made.[/cyan]".format(
+                summary.get("selected_records", 0),
+                summary.get("selected_videos", 0),
+            )
+        )
+        return
+    console.print(Panel(
+        "[bold]Selected videos:[/bold] {} | [bold]API attempts:[/bold] {}\n"
+        "[green]Refreshed records:[/green] {} | "
+        "[yellow]Not returned:[/yellow] {} | "
+        "[red]Record failures:[/red] {} | "
+        "[dim]Unprocessed records:[/dim] {}".format(
+            summary.get("selected_videos", 0),
+            summary.get("api_calls", 0),
+            summary.get("refreshed_records", 0),
+            summary.get("not_returned_records", 0),
+            summary.get("failed_records", 0),
+            summary.get("unprocessed_records", 0),
+        ),
+        title="YouTube Metadata Refresh",
+    ))
+    if summary.get("request_ref"):
+        console.print("[dim]Request: {}[/dim]".format(summary["request_ref"]))
+
+
+@yt_data.command("refresh")
+@click.option("--topic", default=None, help="Limit refresh to one topic")
+@click.option(
+    "--video", "videos", multiple=True,
+    help="Refresh exact saved video ID/URL (repeat or comma-separate)",
+)
+@click.option(
+    "--all", "include_all", is_flag=True,
+    help="Refresh current and unmanaged rows too (default: expired only)",
+)
+@click.option(
+    "--max-videos", default=500, type=click.IntRange(1, 5000),
+    show_default=True, help="Unique-video/API work budget",
+)
+@click.option("--dry-run", is_flag=True, help="Preview scope without API calls or writes")
+@click.option(
+    "--connect-timeout", default=5.0,
+    type=click.FloatRange(min=0, min_open=True), show_default=True,
+)
+@click.option(
+    "--read-timeout", default=20.0,
+    type=click.FloatRange(min=0, min_open=True), show_default=True,
+)
+@click.option(
+    "--retries", default=2, type=click.IntRange(0, 5), show_default=True,
+)
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def yt_data_refresh(
+    topic: Optional[str],
+    videos: tuple[str, ...],
+    include_all: bool,
+    max_videos: int,
+    dry_run: bool,
+    connect_timeout: float,
+    read_timeout: float,
+    retries: int,
+    raw: bool,
+) -> None:
+    """Refresh saved API metadata through videos.list, without captions.
+
+    With no selector, only expired records are refreshed. ``--video`` targets
+    every saved topic copy of an exact ID; ``--all`` explicitly widens scope.
+    """
+    from ..ledger import log_result
+    from ..library import get_library
+
+    if include_all and videos:
+        raise click.UsageError("--all cannot be combined with --video")
+    video_ids = _youtube_metadata_video_ids(videos)
+    try:
+        lib = get_library()
+        inventory = _youtube_metadata_inventory(lib, topic, video_ids)
+        selected = _select_youtube_metadata_rows(
+            inventory,
+            explicit=bool(video_ids),
+            include_all=include_all,
+        )
+        selected, selected_ids, truncated = _bounded_metadata_targets(
+            selected,
+            max_videos=max_videos,
+        )
+    except Exception as error:
+        data: LibraryResultData = {
+            "topic": topic,
+            "rows": [],
+            "summary": {"selected_records": 0, "selected_videos": 0},
+        }
+        outcome = CommandResult.failed(
+            "yt-data-refresh", data,
+            ErrorDetail.from_exception(error, stage="inventory"),
+        )
+        log_result("yt-data-refresh", outcome, topic=topic, data=outcome.data["summary"])
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_yt_data_refresh(outcome)
+        return
+
+    base_summary = {
+        "selected_records": len(selected),
+        "selected_videos": len(selected_ids),
+        "truncated_videos": truncated,
+        "scope": "explicit" if video_ids else "all" if include_all else "expired",
+        "dry_run": dry_run,
+    }
+    if dry_run or not selected_ids:
+        data = {
+            "topic": topic,
+            "rows": selected,
+            "summary": {**base_summary, "api_calls": 0},
+        }
+        outcome = CommandResult(
+            command="yt-data-refresh",
+            status=ResultStatus.COMPLETED if selected else ResultStatus.EMPTY,
+            data=data,
+            warnings=(
+                ["Selection exceeded --max-videos and was truncated."]
+                if truncated else []
+            ),
+        )
+        if not dry_run:
+            log_result(
+                "yt-data-refresh", outcome, topic=topic,
+                data=outcome.data["summary"],
+            )
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_yt_data_refresh(outcome)
+        return
+
+    from .search import (
+        _normalize_youtube_video_provider_result,
+        _youtube_error_details,
+    )
+    from ..youtube_search import get_video_details_detailed
+
+    try:
+        provider = _normalize_youtube_video_provider_result(
+            get_video_details_detailed(
+                selected_ids,
+                timeout=(connect_timeout, read_timeout),
+                retries=retries,
+            )
+        )
+    except Exception as error:
+        data = {
+            "topic": topic,
+            "rows": [],
+            "summary": {**base_summary, "api_calls": 0},
+        }
+        outcome = CommandResult.failed(
+            "yt-data-refresh", data,
+            ErrorDetail.from_exception(error, stage="video-details"),
+        )
+        log_result("yt-data-refresh", outcome, topic=topic, data=outcome.data["summary"])
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_yt_data_refresh(outcome)
+        return
+
+    request = dict(provider.get("request") or {})
+    coverage = dict(provider.get("coverage") or {})
+    request_ref = _youtube_request_reference(request)
+    details = {
+        row.get("video_id"): row
+        for row in provider.get("videos") or []
+        if isinstance(row.get("video_id"), str)
+    }
+    id_outcomes = {
+        row.get("video_id"): row
+        for row in provider.get("id_outcomes") or []
+        if isinstance(row.get("video_id"), str)
+    }
+    mutation_rows = []
+    mutation_errors = []
+    unprocessed_records = 0
+    for target in selected:
+        target_id = str(target.get("video_id") or "")
+        target_topic = str(target.get("topic") or "")
+        id_outcome = id_outcomes.get(target_id, {})
+        state = id_outcome.get("status")
+        if state == "unprocessed" or state not in {"observed", "not_returned"}:
+            unprocessed_records += 1
+            continue
+        try:
+            result = lib.replace_youtube_metadata(
+                target_id,
+                target_topic,
+                details.get(target_id) if state == "observed" else None,
+                observed_at=id_outcome.get("observed_at"),
+                expires_at=id_outcome.get("expires_at"),
+                request_ref=request_ref,
+            )
+            mutation_rows.append({
+                "topic": target_topic,
+                "video_id": target_id,
+                **result,
+            })
+        except Exception as error:
+            mutation_errors.append(ErrorDetail.from_exception(
+                error,
+                stage="store-metadata",
+                details={"topic": target_topic, "video_id": target_id},
+            ))
+
+    provider_errors = _youtube_error_details(provider.get("errors"))
+    warnings = list(provider.get("warnings") or [])
+    if truncated:
+        warnings.append("Selection exceeded --max-videos and was truncated.")
+    failed_records = len(mutation_errors)
+    refreshed_records = sum(
+        1 for row in mutation_rows if row.get("state") == "current"
+    )
+    not_returned_records = sum(
+        1 for row in mutation_rows if row.get("state") == "not_returned"
+    )
+    summary = {
+        **base_summary,
+        "request_ref": request_ref,
+        "api_calls": coverage.get("api_calls", coverage.get("api_attempts", 0)),
+        "refreshed_records": refreshed_records,
+        "not_returned_records": not_returned_records,
+        "failed_records": failed_records,
+        "unprocessed_records": unprocessed_records,
+        "conflict_paths": sum(
+            len(row.get("conflict_paths") or []) for row in mutation_rows
+        ),
+    }
+    incomplete = bool(
+        provider_errors or mutation_errors or unprocessed_records or truncated
+    )
+    status = (
+        ResultStatus.FAILED
+        if provider_errors and not coverage.get("batches_completed")
+        else ResultStatus.PARTIAL
+        if incomplete
+        else ResultStatus.COMPLETED
+    )
+    data = {
+        "topic": topic,
+        "rows": mutation_rows,
+        "summary": summary,
+        "request": request,
+        "coverage": coverage,
+    }
+    outcome = CommandResult(
+        command="yt-data-refresh",
+        status=status,
+        data=data,
+        errors=[*provider_errors, *mutation_errors],
+        warnings=warnings,
+    )
+    log_result(
+        "yt-data-refresh", outcome, topic=topic,
+        data={
+            **summary,
+            "request": request,
+            "coverage": coverage,
+        },
+    )
+    if raw:
+        _emit_library_raw(outcome)
+    else:
+        _render_yt_data_refresh(outcome)
+
+
+def _render_yt_data_purge(
+    outcome: CommandResult[LibraryResultData],
+) -> None:
+    _render_library_failure(outcome, "YouTube metadata purge failed")
+    summary = outcome.data.get("summary") or {}
+    verb = "Would purge" if summary.get("dry_run") else "Purged"
+    console.print(
+        "[{}]{} {} API-metadata record(s); transcript content was untouched."
+        "[/{}]".format(
+            "cyan" if summary.get("dry_run") else "green",
+            verb,
+            summary.get("purged_records", summary.get("selected_records", 0)),
+            "cyan" if summary.get("dry_run") else "green",
+        )
+    )
+
+
+@yt_data.command("purge")
+@click.option("--topic", default=None, help="Limit purge to one topic")
+@click.option(
+    "--video", "videos", multiple=True,
+    help="Purge exact saved video ID/URL (repeat or comma-separate)",
+)
+@click.option(
+    "--all", "include_all", is_flag=True,
+    help="Include current metadata (default: expired only)",
+)
+@click.option(
+    "--max-records", default=5000, type=click.IntRange(1),
+    show_default=True, help="Record mutation budget",
+)
+@click.option("--dry-run", is_flag=True, help="Preview scope without writing")
+@click.option("--yes", is_flag=True, help="Confirm metadata purge without prompting")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def yt_data_purge(
+    topic: Optional[str],
+    videos: tuple[str, ...],
+    include_all: bool,
+    max_records: int,
+    dry_run: bool,
+    yes: bool,
+    raw: bool,
+) -> None:
+    """Delete owned API fields while retaining transcripts and local metadata."""
+    from ..ledger import log_result
+    from ..library import get_library
+
+    if include_all and videos:
+        raise click.UsageError("--all cannot be combined with --video")
+    video_ids = _youtube_metadata_video_ids(videos)
+    try:
+        lib = get_library()
+        inventory = _youtube_metadata_inventory(lib, topic, video_ids)
+        selected = _select_youtube_metadata_rows(
+            inventory,
+            explicit=bool(video_ids),
+            include_all=include_all,
+        )
+        truncated = max(0, len(selected) - max_records)
+        selected = selected[:max_records]
+    except Exception as error:
+        data: LibraryResultData = {
+            "topic": topic,
+            "rows": [],
+            "summary": {"selected_records": 0},
+        }
+        outcome = CommandResult.failed(
+            "yt-data-purge", data,
+            ErrorDetail.from_exception(error, stage="inventory"),
+        )
+        log_result("yt-data-purge", outcome, topic=topic, data=outcome.data["summary"])
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_yt_data_purge(outcome)
+        return
+
+    summary = {
+        "selected_records": len(selected),
+        "truncated_records": truncated,
+        "scope": "explicit" if video_ids else "all" if include_all else "expired",
+        "dry_run": dry_run,
+    }
+    if dry_run or not selected:
+        data = {"topic": topic, "rows": selected, "summary": summary}
+        outcome = CommandResult(
+            command="yt-data-purge",
+            status=ResultStatus.COMPLETED if selected else ResultStatus.EMPTY,
+            data=data,
+            warnings=(
+                ["Selection exceeded --max-records and was truncated."]
+                if truncated else []
+            ),
+        )
+        if not dry_run:
+            log_result("yt-data-purge", outcome, topic=topic, data=summary)
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_yt_data_purge(outcome)
+        return
+
+    if not yes:
+        confirmed = click.confirm(
+            "Purge YouTube API metadata from {} saved record(s)? "
+            "Transcript text will remain".format(len(selected)),
+            default=False,
+        )
+        if not confirmed:
+            raise click.Abort()
+
+    mutation_rows = []
+    errors = []
+    for target in selected:
+        target_id = str(target.get("video_id") or "")
+        target_topic = str(target.get("topic") or "")
+        try:
+            result = lib.purge_youtube_metadata(
+                target_id,
+                target_topic,
+                reason=(
+                    "expired"
+                    if target.get("classification") == "expired"
+                    else "operator"
+                ),
+            )
+            mutation_rows.append({
+                "topic": target_topic,
+                "video_id": target_id,
+                **result,
+            })
+        except Exception as error:
+            errors.append(ErrorDetail.from_exception(
+                error,
+                stage="purge-metadata",
+                details={"topic": target_topic, "video_id": target_id},
+            ))
+    summary.update({
+        "purged_records": sum(
+            1 for row in mutation_rows if row.get("status") == "updated"
+        ),
+        "noop_records": sum(
+            1 for row in mutation_rows if row.get("status") == "noop"
+        ),
+        "failed_records": len(errors),
+        "removed_paths": sum(
+            len(row.get("removed_paths") or []) for row in mutation_rows
+        ),
+    })
+    if truncated:
+        errors.append(ErrorDetail(
+            type="SelectionTruncated",
+            message="Selection exceeded --max-records",
+            stage="selection",
+            details={"truncated_records": truncated},
+        ))
+    outcome = CommandResult(
+        command="yt-data-purge",
+        status=(
+            ResultStatus.PARTIAL if errors else ResultStatus.COMPLETED
+        ),
+        data={"topic": topic, "rows": mutation_rows, "summary": summary},
+        errors=errors,
+    )
+    log_result(
+        "yt-data-purge", outcome, topic=topic,
+        data=summary,
+    )
+    if raw:
+        _emit_library_raw(outcome)
+    else:
+        _render_yt_data_purge(outcome)
 
 
 @library.command("list")

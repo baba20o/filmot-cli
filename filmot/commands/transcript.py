@@ -112,6 +112,35 @@ def _metadata_candidate_from_response(
     return matches[0]
 
 
+def _apply_discovery_metadata(
+    library,
+    video_id: str,
+    topic: str,
+    candidate: dict,
+    *,
+    discovery_ref: Optional[str],
+    artifact_path: Optional[str] = None,
+) -> dict:
+    """Persist discovery metadata through its provider-aware ownership path."""
+    provider = str(candidate.get("provider") or "").casefold()
+    if provider == "youtube":
+        return library.replace_youtube_metadata(
+            video_id,
+            topic,
+            candidate,
+            request_ref=discovery_ref,
+        )
+    provenance = {"discovery_ref": discovery_ref}
+    if artifact_path is not None:
+        provenance["artifact_path"] = artifact_path
+    return library.enrich_metadata(
+        video_id,
+        topic,
+        candidate,
+        provenance=provenance,
+    )
+
+
 def _validate_transcript_response(
     result: object,
     *,
@@ -623,9 +652,174 @@ def _render_transcript_search(outcome: CommandResult[dict]) -> None:
         console.print(f"  {highlighted}")
 
 
+def _normalize_channel_enumeration_result(value: object) -> dict:
+    """Validate the bounded uploads provider before any corpus mutation."""
+    from ..discovery import youtube_video_id
+
+    if not isinstance(value, dict):
+        raise TypeError("upload enumeration provider returned a non-object result")
+
+    provider = value.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise TypeError("upload enumeration provider must be non-empty text")
+
+    raw_videos = value.get("videos")
+    if not isinstance(raw_videos, list):
+        raise TypeError("upload enumeration videos must be an array")
+    videos = []
+    seen_ids = set()
+    for index, raw_video in enumerate(raw_videos):
+        if not isinstance(raw_video, dict):
+            raise TypeError(
+                "upload enumeration video {} must be an object".format(index)
+            )
+        video_id = raw_video.get("video_id")
+        if (
+            not isinstance(video_id, str)
+            or video_id != video_id.strip()
+            or youtube_video_id(video_id) != video_id
+        ):
+            raise TypeError(
+                "upload enumeration video {} must have an exact 11-character "
+                "YouTube video_id".format(index)
+            )
+        video_id = video_id.strip()
+        if video_id in seen_ids:
+            raise ValueError(
+                "upload enumeration returned duplicate video_id {!r}".format(
+                    video_id
+                )
+            )
+        seen_ids.add(video_id)
+        video = dict(raw_video)
+        video["video_id"] = video_id
+        for field in ("title", "published_at", "description"):
+            field_value = video.get(field)
+            if field_value is None:
+                video[field] = ""
+            elif not isinstance(field_value, str):
+                raise TypeError(
+                    "upload enumeration video {} field {} must be text or null".format(
+                        index, field
+                    )
+                )
+        videos.append(video)
+
+    sections = {}
+    for field in ("request", "coverage"):
+        section = value.get(field)
+        if not isinstance(section, dict):
+            raise TypeError("upload enumeration {} must be an object".format(field))
+        sections[field] = dict(section)
+
+    coverage = sections["coverage"]
+    next_page_token = coverage.get("next_page_token")
+    if next_page_token is not None and not isinstance(next_page_token, str):
+        raise TypeError(
+            "upload enumeration coverage.next_page_token must be text or null"
+        )
+    partial = coverage.get("partial", False)
+    if not isinstance(partial, bool):
+        raise TypeError("upload enumeration coverage.partial must be boolean")
+    stopping_reason = coverage.get("stopping_reason")
+    if not isinstance(stopping_reason, str) or not stopping_reason:
+        raise TypeError(
+            "upload enumeration coverage.stopping_reason must be non-empty text"
+        )
+
+    warnings = value.get("warnings")
+    if not isinstance(warnings, list) or any(
+        not isinstance(item, str) for item in warnings
+    ):
+        raise TypeError("upload enumeration warnings must be an array of text")
+    raw_errors = value.get("errors")
+    if not isinstance(raw_errors, list) or any(
+        not isinstance(item, dict) for item in raw_errors
+    ):
+        raise TypeError("upload enumeration errors must be an array of objects")
+
+    for field in ("observed_at", "expires_at"):
+        timestamp = value.get(field)
+        if timestamp is not None and not isinstance(timestamp, str):
+            raise TypeError("upload enumeration {} must be text or null".format(field))
+
+    return {
+        "provider": provider.strip(),
+        "videos": videos,
+        "request": sections["request"],
+        "coverage": coverage,
+        "observed_at": value.get("observed_at"),
+        "expires_at": value.get("expires_at"),
+        "warnings": list(warnings),
+        "errors": [dict(item) for item in raw_errors],
+    }
+
+
+def _channel_enumeration_error_details(errors: list[dict]) -> list[ErrorDetail]:
+    """Project credential-safe provider diagnostics into command errors."""
+    output = []
+    for error in errors:
+        output.append(ErrorDetail(
+            type=str(error.get("type") or "YouTubeChannelAPIError"),
+            message=str(error.get("message") or "Upload enumeration failed"),
+            stage=str(error.get("stage") or "enumerate"),
+            details={
+                key: item
+                for key, item in error.items()
+                if key not in {"type", "message", "stage"}
+            },
+        ))
+    return output
+
+
+def _channel_continuation(
+    requested_channel: str,
+    coverage: dict,
+    *,
+    pages: int,
+    max_results: int,
+) -> dict:
+    """Build a compact, directly actionable continuation contract."""
+    token = coverage.get("next_page_token")
+    available = isinstance(token, str) and bool(token)
+    argv = []
+    if available:
+        argv = [
+            "filmot",
+            "channel-download",
+            requested_channel,
+            "--page-token",
+            token,
+            "--pages",
+            str(pages),
+            "--max-results",
+            str(max_results),
+        ]
+    return {
+        "available": available,
+        "next_page_token": token if available else None,
+        "argv": argv,
+    }
+
+
 def _render_channel_download(outcome: CommandResult[dict]) -> None:
     """Render the final channel-download summary from its aggregate outcome."""
     data = outcome.data
+    continuation = data.get("continuation") or {}
+    status_style = {
+        ResultStatus.PARTIAL.value: ("Download Partially Complete", "yellow"),
+        ResultStatus.INTERRUPTED.value: ("Download Interrupted", "yellow"),
+        ResultStatus.FAILED.value: ("Download Failed", "red"),
+    }.get(outcome.status_value, ("Download Complete", "green"))
+    for warning in outcome.warnings:
+        console.print("[yellow]{}[/yellow]".format(warning))
+    for error in outcome.errors:
+        if error.stage in {"enumerate", "enumeration", "pagination"}:
+            console.print(
+                "[yellow]Upload enumeration issue: {}[/yellow]".format(
+                    error.message
+                )
+            )
     if data.get("already_synced"):
         console.print(
             "[green]✓ Channel is fully synced! Nothing new to download.[/green]"
@@ -635,20 +829,53 @@ def _render_channel_download(outcome: CommandResult[dict]) -> None:
         )
         return
 
-    channel = data.get("channel") or {}
-    console.print()
-    console.print(Panel(
-        f"[bold green]Download Complete[/bold green]\n\n"
-        f"Channel: [bold]{channel.get('name', 'Unknown')}[/bold]\n"
-        f"This session: [green]{data.get('downloaded', 0)}[/green] "
-        f"downloaded, [red]{data.get('failed', 0)}[/red] failed\n"
-        f"Total corpus: [bold]{data.get('corpus_done', 0)}/"
-        f"{data.get('enumerated', 0)}[/bold] videos\n"
-        f"Words downloaded: [bold]{int(data.get('words', 0)):,}[/bold]\n"
-        f"Storage: {data.get('storage', '')}",
-        title="Summary",
-        border_style="green",
-    ))
+    if not data.get("selected"):
+        color = (
+            status_style[1]
+            if outcome.status_value != ResultStatus.COMPLETED.value
+            else "cyan"
+        )
+        prefix = (
+            "This run is partial; "
+            if outcome.status_value == ResultStatus.PARTIAL.value
+            else ""
+        )
+        console.print(
+            "[{}]{}No new transcripts were selected from this upload slice."
+            "[/{}]".format(
+                color,
+                prefix,
+                color,
+            )
+        )
+    else:
+        channel = data.get("channel") or {}
+        console.print()
+        console.print(Panel(
+            "[bold {}]{}[/bold {}]\n\n".format(
+                status_style[1], status_style[0], status_style[1]
+            )
+            + f"Channel: [bold]{channel.get('name', 'Unknown')}[/bold]\n"
+            f"This session: [green]{data.get('downloaded', 0)}[/green] "
+            f"downloaded, [red]{data.get('failed', 0)}[/red] failed\n"
+            f"Upload slice: [bold]{data.get('enumerated', 0)}[/bold] videos\n"
+            f"Total corpus: [bold]{data.get('corpus_done', 0)}[/bold] transcripts\n"
+            f"Words downloaded: [bold]{int(data.get('words', 0)):,}[/bold]\n"
+            f"Storage: {data.get('storage', '')}",
+            title="Summary",
+            border_style=status_style[1],
+        ))
+
+    if continuation.get("available"):
+        import shlex
+
+        console.print(
+            "[yellow]More uploads are available. Continue upload enumeration "
+            "with:[/yellow]\n"
+            "[bold]{}[/bold]".format(
+                shlex.join([str(item) for item in continuation.get("argv") or []])
+            )
+        )
 
 
 def _render_channel_status(outcome: CommandResult[dict]) -> None:
@@ -1260,14 +1487,13 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             if library.exists(transcript_data['video_id'], save_to):
                 if discovery_candidate is not None:
                     try:
-                        enrichment = library.enrich_metadata(
+                        enrichment = _apply_discovery_metadata(
+                            library,
                             transcript_data["video_id"],
                             save_to,
                             discovery_candidate,
-                            provenance={
-                                "discovery_ref": discovery_ref,
-                                "artifact_path": str(discovery),
-                            },
+                            discovery_ref=discovery_ref,
+                            artifact_path=str(discovery),
                         )
                         log_event(
                             "metadata_enrichment",
@@ -1282,10 +1508,14 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                             provider=discovery_candidate.get("provider"),
                             filled_fields=enrichment.get("filled_fields"),
                             conflicts=enrichment.get("conflicts"),
+                            changed_paths=enrichment.get("changed_paths"),
+                            removed_paths=enrichment.get("removed_paths"),
+                            conflict_paths=enrichment.get("conflict_paths"),
+                            lifecycle_state=enrichment.get("state"),
                         )
                         if enrichment.get("status") == "updated":
                             deferred_diagnostics.append(
-                                "[green]Updated missing metadata from discovery "
+                                "[green]Updated owned metadata from discovery "
                                 "artifact.[/green]"
                             )
                     except Exception as metadata_error:
@@ -1399,6 +1629,47 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                     metadata=metadata,
                     segments=transcript_data.get("segments", []),
                 )
+                if discovery_candidate is not None:
+                    try:
+                        enrichment = _apply_discovery_metadata(
+                            library,
+                            transcript_data["video_id"],
+                            save_to,
+                            discovery_candidate,
+                            discovery_ref=discovery_ref,
+                            artifact_path=str(discovery),
+                        )
+                        log_event(
+                            "metadata_enrichment",
+                            topic=save_to,
+                            video_id=transcript_data["video_id"],
+                            status="completed",
+                            discovery_ref=discovery_ref,
+                            provider=discovery_candidate.get("provider"),
+                            changed_paths=enrichment.get("changed_paths"),
+                            conflict_paths=enrichment.get("conflict_paths"),
+                            lifecycle_state=enrichment.get("state"),
+                        )
+                    except Exception as metadata_error:
+                        # The transcript is already atomically saved and the
+                        # explicit provider provenance makes this record
+                        # adoptable by a later `yt-data refresh` run.
+                        message = (
+                            "Saved transcript, but YouTube metadata lifecycle "
+                            "registration failed: {}"
+                        ).format(_whole_word_summary(metadata_error, 500))
+                        outcome.warnings.append(message)
+                        deferred_diagnostics.append(
+                            "[yellow]{}[/yellow]".format(message)
+                        )
+                        log_event(
+                            "metadata_enrichment",
+                            topic=save_to,
+                            video_id=transcript_data["video_id"],
+                            status="failed",
+                            discovery_ref=discovery_ref,
+                            error=message,
+                        )
                 log_event(
                     "transcript_save",
                     topic=save_to,
@@ -1586,16 +1857,43 @@ def transcript_search(video_id: str, query: str, context: int, lang: str):
 @click.argument("channel_id", metavar="CHANNEL")
 @click.option("--delay", "-d", default=1.0, type=click.FloatRange(min=0), help="Seconds between downloads (rate limiting, default: 1.0)")
 @click.option("--lang", "-l", default="en", help="Preferred language code (default: en)")
-@click.option("--limit", default=None, type=click.IntRange(1), help="Limit transcripts selected after full upload enumeration")
+@click.option(
+    "--pages", default=10, type=click.IntRange(1, 100), show_default=True,
+    help="Maximum uploads-playlist pages to enumerate",
+)
+@click.option(
+    "--max-results", default=500, type=click.IntRange(1, 5000),
+    show_default=True, help="Maximum distinct uploads to enumerate",
+)
+@click.option(
+    "--page-token", default=None,
+    help="Resume upload enumeration from a YouTube nextPageToken",
+)
+@click.option(
+    "--limit", default=None, type=click.IntRange(1),
+    help="Limit transcripts selected after bounded upload enumeration",
+)
 @click.option("--workers", "-w", default=1, type=click.IntRange(1), help="Parallel download workers (default: 1, try 4 for speed)")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy, connect directly with your IP")
 @click.option("--fresh", is_flag=True, help="Ignore existing manifest, start fresh")
-def channel_download(channel_id: str, delay: float, lang: str, limit: int, workers: int, no_proxy: bool, fresh: bool):
-    """Download ALL transcripts from a YouTube channel.
+def channel_download(
+    channel_id: str,
+    delay: float,
+    lang: str,
+    pages: int,
+    max_results: int,
+    page_token: Optional[str],
+    limit: int,
+    workers: int,
+    no_proxy: bool,
+    fresh: bool,
+):
+    """Download a bounded, resumable upload slice from a YouTube channel.
 
-    Enumerates every video on a channel via YouTube Data API, then downloads
-    each transcript. Keeps a manifest for resume — if interrupted, re-run the
-    same command to pick up where you left off (delta sync).
+    Enumerates at most PAGES/MAX_RESULTS through the YouTube Data API, then
+    downloads the selected transcripts. When another API page exists, the
+    summary prints an exact ``--page-token`` continuation command. Re-running
+    a slice also resumes transcript work from the manifest (delta sync).
 
     CHANNEL must be an exact 24-character UC ID, @handle, or canonical HTTPS
     youtube.com/channel/UC... or youtube.com/@handle URL. Use ``filmot
@@ -1608,12 +1906,16 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg
         filmot channel-download @GoogleDevelopers --delay 2
         filmot channel-download https://youtube.com/@GoogleDevelopers --limit 5
+        filmot channel-download @GoogleDevelopers --pages 2 --max-results 75
         filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg --workers 4
     """
     from rich.progress import Progress, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
     from ..channel_dl import ChannelDownloader, get_channel_info
     from ..ledger import log_event, log_result
     import shutil
+
+    if fresh and page_token:
+        raise click.UsageError("--fresh cannot be combined with --page-token")
 
     requested_channel = channel_id
     downloader = ChannelDownloader()
@@ -1624,6 +1926,9 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         channel_id=requested_channel,
         requested_channel=requested_channel,
         lang=lang,
+        pages=pages,
+        max_results=max_results,
+        page_token=page_token,
         limit=limit,
         workers=workers,
         delay=delay,
@@ -1720,17 +2025,26 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         border_style="blue",
     ))
 
-    # Phase 2: Enumerate videos
-    from ..channel_dl import list_all_video_ids
+    # Phase 2: Enumerate one explicitly bounded uploads-playlist slice.
+    from ..channel_dl import enumerate_uploads_detailed
 
-    stderr_console.print("[blue]Enumerating all videos...[/blue]")
+    stderr_console.print(
+        "[blue]Enumerating up to {} page(s) / {} upload(s)...[/blue]".format(
+            pages, max_results
+        )
+    )
 
     try:
-        all_videos = list_all_video_ids(
-            info['uploads_playlist_id'],
-            progress_callback=lambda cur, tot, pg: stderr_console.print(
-                f"  [dim]Listed {cur}/{tot} videos (page {pg})[/dim]"
-            ),
+        enumeration = _normalize_channel_enumeration_result(
+            enumerate_uploads_detailed(
+                info['uploads_playlist_id'],
+                max_pages=pages,
+                max_items=max_results,
+                page_token=page_token,
+                progress_callback=lambda cur, tot, pg: stderr_console.print(
+                    f"  [dim]Listed {cur}/{tot} videos (page {pg})[/dim]"
+                ),
+            )
         )
     except Exception as e:
         log_event(
@@ -1738,6 +2052,9 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
             requested_channel=requested_channel,
             status="failed", phase="enumerate",
             error=f"{type(e).__name__}: {e}",
+            pages=pages,
+            max_results=max_results,
+            page_token=page_token,
         )
         outcome = CommandResult.failed(
             "channel-download",
@@ -1756,11 +2073,47 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 "channel_id": canonical_channel_id,
                 "requested_channel": requested_channel,
                 "phase": "enumerate",
+                "pages": pages,
+                "max_results": max_results,
+                "page_token": page_token,
             },
         )
         _command_error(f"Error listing videos: {e}")
 
-    stderr_console.print(f"[green]Found {len(all_videos)} videos[/green]")
+    all_videos = enumeration["videos"]
+    enumeration_request = enumeration["request"]
+    enumeration_coverage = enumeration["coverage"]
+    enumeration_errors = _channel_enumeration_error_details(
+        enumeration["errors"]
+    )
+    enumeration_partial = bool(
+        enumeration_coverage.get("partial") or enumeration_errors
+    )
+    continuation = _channel_continuation(
+        requested_channel,
+        enumeration_coverage,
+        pages=pages,
+        max_results=max_results,
+    )
+    enumeration_checkpoint = {
+        "schema": "filmot.youtube-upload-enumeration/v1",
+        "provider": enumeration["provider"],
+        "observed_at": enumeration.get("observed_at"),
+        "expires_at": enumeration.get("expires_at"),
+        "request": enumeration_request,
+        "coverage": enumeration_coverage,
+    }
+
+    stderr_console.print(
+        "[green]Found {} upload(s); stopped: {}[/green]".format(
+            len(all_videos),
+            enumeration_coverage.get("stopping_reason"),
+        )
+    )
+    if continuation["available"]:
+        stderr_console.print(
+            "[yellow]A continuation token is available for the next slice.[/yellow]"
+        )
 
     # Phase 3: Determine delta — resolve corpus by channel ID so renames
     # resume in place and same-name channels never merge
@@ -1768,8 +2121,21 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     manifest = downloader._load_manifest(channel_dir)
     manifest["channel"] = info
     manifest["requested_channel"] = requested_channel
-    existing = manifest.get('videos', {})
+    manifest["upload_enumeration"] = enumeration_checkpoint
+    existing = manifest.get('videos')
+    if not isinstance(existing, dict):
+        existing = {}
+        manifest["videos"] = existing
     already_done = {k for k, v in existing.items() if v.get('status') == 'done'}
+
+    for video in all_videos:
+        if video["video_id"] not in existing:
+            existing[video["video_id"]] = {
+                "title": video["title"],
+                "published_at": video["published_at"],
+                "status": "pending",
+            }
+    manifest["total_videos"] = len(existing)
 
     to_download = [v for v in all_videos if v['video_id'] not in already_done]
 
@@ -1777,9 +2143,17 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
         to_download = to_download[:limit]
 
     if not to_download:
-        outcome = CommandResult.completed(
-            "channel-download",
-            {
+        already_synced = bool(
+            not continuation["available"] and not enumeration_partial
+        )
+        outcome = CommandResult(
+            command="channel-download",
+            status=(
+                ResultStatus.PARTIAL
+                if enumeration_partial
+                else ResultStatus.COMPLETED
+            ),
+            data={
                 "channel_id": canonical_channel_id,
                 "requested_channel": requested_channel,
                 "channel": info,
@@ -1792,8 +2166,12 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 "corpus_done": len(already_done),
                 "words": 0,
                 "storage": str(channel_dir),
-                "already_synced": True,
+                "already_synced": already_synced,
+                "enumeration": enumeration_checkpoint,
+                "continuation": continuation,
             },
+            errors=enumeration_errors,
+            warnings=enumeration["warnings"],
         )
         downloader._save_manifest(channel_dir, manifest)
         log_result(
@@ -1808,6 +2186,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 "downloaded": 0,
                 "failed": 0,
                 "already_done": len(already_done),
+                "enumeration": enumeration_checkpoint,
+                "continuation": continuation,
             },
         )
         _render_channel_download(outcome)
@@ -1850,17 +2230,6 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
     total_words = 0
     _lock = threading.Lock()  # Protects manifest, counters, and progress bar
     _interrupted = threading.Event()
-
-    # Ensure manifest structure
-    if 'videos' not in manifest:
-        manifest['videos'] = {}
-    for v in all_videos:
-        if v['video_id'] not in manifest['videos']:
-            manifest['videos'][v['video_id']] = {
-                'title': v['title'],
-                'published_at': v['published_at'],
-                'status': 'pending',
-            }
 
     def _download_one(v_item):
         """Download a single transcript. Thread-safe."""
@@ -1937,7 +2306,7 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 done_total = sum(1 for vv in manifest['videos'].values() if vv.get('status') == 'done')
                 manifest.update({
                     'channel': info,
-                    'total_videos': len(all_videos),
+                    'total_videos': len(manifest['videos']),
                     'downloaded_count': done_total,
                     'failed_count': sum(1 for vv in manifest['videos'].values() if vv.get('status') == 'failed'),
                     'last_updated': _dt.now().isoformat(),
@@ -2034,9 +2403,10 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                 type="Abort",
                 message="Channel download interrupted",
                 stage="download",
-            )
+            ),
+            *enumeration_errors,
         ]
-        warnings = []
+        warnings = list(enumeration["warnings"])
     elif all_failed:
         status = ResultStatus.FAILED
         errors = [
@@ -2046,17 +2416,20 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
                     f"All {failed} selected channel transcripts failed."
                 ),
                 stage="download",
-            )
+            ),
+            *enumeration_errors,
         ]
-        warnings = []
-    elif failed:
+        warnings = list(enumeration["warnings"])
+    elif failed or enumeration_partial:
         status = ResultStatus.PARTIAL
-        errors = []
-        warnings = [f"{failed} selected transcript download(s) failed"]
+        errors = list(enumeration_errors)
+        warnings = list(enumeration["warnings"])
+        if failed:
+            warnings.append(f"{failed} selected transcript download(s) failed")
     else:
         status = ResultStatus.COMPLETED
         errors = []
-        warnings = []
+        warnings = list(enumeration["warnings"])
 
     outcome = CommandResult(
         command="channel-download",
@@ -2077,6 +2450,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
             "routing_plan": route_plan,
             "interrupted": interrupted,
             "already_synced": False,
+            "enumeration": enumeration_checkpoint,
+            "continuation": continuation,
         },
         errors=errors,
         warnings=warnings,
@@ -2096,6 +2471,8 @@ def channel_download(channel_id: str, delay: float, lang: str, limit: int, worke
             "corpus_done": done_total,
             "words": total_words,
             "routing_plan": route_plan,
+            "enumeration": enumeration_checkpoint,
+            "continuation": continuation,
         },
     )
     _render_channel_download(outcome)
@@ -2334,6 +2711,9 @@ def download(
     try:
         raw_input = sys.stdin.read()
         results = json_mod.loads(raw_input)
+        discovery_ref = "sha256:{}".format(
+            hashlib.sha256(raw_input.encode("utf-8")).hexdigest()
+        )
     except (json_mod.JSONDecodeError, ValueError) as e:
         outcome = CommandResult.failed(
             "download",
@@ -2381,6 +2761,7 @@ def download(
             fallback=fallback,
             dedupe=dedupe,
             lang=lang,
+            discovery_ref=discovery_ref,
         )
     except click.ClickException as error:
         outcome = CommandResult.failed(
@@ -2452,12 +2833,19 @@ def download(
     summary = dict(summary or {})
     selected = int(summary.get("selected", 0))
     failed = int(summary.get("failed", 0))
+    metadata_failures = int(summary.get("metadata_failures", 0))
     if selected == 0:
         status = ResultStatus.EMPTY
         warnings = []
-    elif failed:
+    elif failed or metadata_failures:
         status = ResultStatus.PARTIAL
-        warnings = [f"{failed} selected transcript download(s) failed"]
+        warnings = []
+        if failed:
+            warnings.append(f"{failed} selected transcript download(s) failed")
+        if metadata_failures:
+            warnings.append(
+                f"{metadata_failures} YouTube metadata lifecycle registration(s) failed"
+            )
     else:
         status = ResultStatus.COMPLETED
         warnings = []
@@ -2471,6 +2859,7 @@ def download(
             "fallback": fallback,
             "dedupe": dedupe,
             "no_proxy": no_proxy,
+            "discovery_ref": discovery_ref,
             **summary,
             "human_messages": progress_console.final_messages,
         },
@@ -2487,6 +2876,7 @@ def download(
             "fallback": fallback,
             "dedupe": dedupe,
             "no_proxy": no_proxy,
+            "discovery_ref": discovery_ref,
             **summary,
         },
     )

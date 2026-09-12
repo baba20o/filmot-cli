@@ -1,9 +1,9 @@
 """YouTube Data API discovery and public video metadata.
 
 The original list-returning helpers remain compatible.  The additive
-``search_recent_detailed`` provider API records request/coverage information,
-keeps discoveries when optional enrichment is partial, and exposes only
-credential-safe failures.
+``search_recent_detailed`` and ``get_video_details_detailed`` provider APIs
+record request/coverage information, preserve completed work after optional
+or later-batch failures, and expose only credential-safe failures.
 """
 
 from __future__ import annotations
@@ -738,6 +738,7 @@ def _fetch_video_details(
     sleep: Callable[[float], None],
     now: Optional[Any],
     allow_partial: bool,
+    batch_size: int = 50,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     unique_ids = _dedupe_ids(video_ids)
     observed_at = _clock_now(now)
@@ -745,9 +746,18 @@ def _fetch_video_details(
     calls = 0
     completed_ids: List[str] = []
     error_data: Optional[Dict[str, Any]] = None
+    malformed_items = 0
+    batches_attempted = 0
+    failed_batch_index: Optional[int] = None
 
-    for offset in range(0, len(unique_ids), 50):
-        batch = unique_ids[offset:offset + 50]
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise ValueError("YouTube detail batch_size must be an integer")
+    if not 1 <= batch_size <= 50:
+        raise ValueError("YouTube detail batch_size must be between 1 and 50")
+
+    for offset in range(0, len(unique_ids), batch_size):
+        batch = unique_ids[offset:offset + batch_size]
+        batches_attempted += 1
         params = {
             "id": ",".join(batch),
             "part": ",".join(VIDEO_DETAIL_PARTS),
@@ -765,16 +775,20 @@ def _fetch_video_details(
                 params = {}
                 raise
             error_data = error.to_dict()
+            failed_batch_index = batches_attempted
             break
         calls += result.attempts
         completed_ids.extend(batch)
         items = result.data.get("items", [])
         if not isinstance(items, list):
             items = []
+            malformed_items += 1
         for item in items:
             parsed = _video_detail(item, observed_at)
-            if parsed is not None:
-                details.append(parsed)
+            if parsed is None:
+                malformed_items += 1
+                continue
+            details.append(parsed)
 
     found_ids = {row["video_id"] for row in details}
     missing_ids = [
@@ -786,12 +800,22 @@ def _fetch_video_details(
     return details, {
         "requested_count": len(unique_ids),
         "api_calls": calls,
-        "batches_completed": math.ceil(len(completed_ids) / 50) if completed_ids else 0,
+        "api_attempts": calls,
+        "batch_size": batch_size,
+        "batches_planned": math.ceil(len(unique_ids) / batch_size)
+        if unique_ids
+        else 0,
+        "batches_attempted": batches_attempted,
+        "batches_completed": math.ceil(len(completed_ids) / batch_size)
+        if completed_ids
+        else 0,
+        "failed_batch_index": failed_batch_index,
         "matched_count": len(found_ids),
         "missing_count": len(missing_ids),
         "missing_video_ids": missing_ids,
         "unprocessed_video_ids": unprocessed_ids,
         "completed_ids": completed_ids,
+        "malformed_items_skipped": malformed_items,
         "error": error_data,
         "partial": len(found_ids) != len(unique_ids),
     }
@@ -823,6 +847,276 @@ def get_video_details(
         session = None
         raise
     return details
+
+
+def get_video_details_detailed(
+    video_ids: Sequence[str],
+    *,
+    batch_size: int = 50,
+    timeout: Optional[Any] = None,
+    retries: Optional[int] = None,
+    session: Optional[Any] = None,
+    retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Return ordered public video metadata with explicit lookup coverage.
+
+    Input IDs are de-duplicated without changing first-occurrence order.  The
+    ``videos`` list contains only resources returned by ``videos.list`` and is
+    restored to that request order even if YouTube returns a different order.
+    ``id_outcomes`` covers every unique requested ID and distinguishes a
+    completed request that did not return an ID (``not_returned``) from an ID
+    whose batch was never completed (``unprocessed``).  ``not_returned`` is a
+    deliberately neutral transport observation; it does not assert that a
+    video is deleted, private, invalid, or otherwise unavailable.
+
+    A YouTube failure is returned in the credential-safe ``errors`` array and
+    preserves metadata from earlier successful batches.  Configuration and
+    argument errors still raise before any network request.  The legacy
+    :func:`get_video_details` helper retains its original list/raise contract.
+    """
+    if isinstance(video_ids, (str, bytes)):
+        raise TypeError("video_ids must be a sequence of ID strings")
+
+    try:
+        supplied_ids = list(video_ids)
+    except TypeError:
+        raise TypeError("video_ids must be a sequence of ID strings") from None
+
+    unique_ids = _dedupe_ids(supplied_ids)
+    invalid_ids_skipped = sum(
+        1 for value in supplied_ids if not isinstance(value, str) or not value
+    )
+    valid_input_count = len(supplied_ids) - invalid_ids_skipped
+    duplicate_ids_skipped = valid_input_count - len(unique_ids)
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise ValueError("batch_size must be an integer")
+    if not 1 <= batch_size <= 50:
+        raise ValueError("batch_size must be between 1 and 50")
+    if retries is None:
+        max_retries = DEFAULT_MAX_RETRIES
+    elif isinstance(retries, bool) or not isinstance(retries, int):
+        raise ValueError("retries must be an integer")
+    else:
+        max_retries = retries
+    if max_retries < 0:
+        raise ValueError("retries cannot be negative")
+
+    connect_timeout, read_timeout = _resolve_timeout(timeout)
+    try:
+        connect_timeout = float(connect_timeout)
+        read_timeout = float(read_timeout)
+        retry_backoff = float(retry_backoff)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            "timeout and retry_backoff values must be numeric"
+        ) from None
+    if (
+        not math.isfinite(connect_timeout)
+        or not math.isfinite(read_timeout)
+        or connect_timeout <= 0
+        or read_timeout <= 0
+    ):
+        raise ValueError("timeouts must be finite and greater than zero")
+    if not math.isfinite(retry_backoff) or retry_backoff < 0:
+        raise ValueError("retry_backoff must be finite and non-negative")
+
+    requested_at_dt = _clock_now(now)
+    requested_at = _format_rfc3339(requested_at_dt)
+    batches_planned = (
+        math.ceil(len(unique_ids) / batch_size) if unique_ids else 0
+    )
+    request = {
+        "video_ids": unique_ids,
+        "input_count": len(supplied_ids),
+        "unique_id_count": len(unique_ids),
+        "requested_at": requested_at,
+        "parts": list(VIDEO_DETAIL_PARTS),
+        "batch_size": batch_size,
+        "batches_planned": batches_planned,
+        "timeout": {
+            "connect_seconds": connect_timeout,
+            "read_seconds": read_timeout,
+        },
+        "retries": max_retries,
+        "retry_backoff_seconds": retry_backoff,
+    }
+
+    if unique_ids:
+        validate_youtube_api()
+        details, metadata = _fetch_video_details(
+            unique_ids,
+            session=session,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            sleep=sleep,
+            now=requested_at_dt,
+            allow_partial=True,
+            batch_size=batch_size,
+        )
+    else:
+        details = []
+        metadata = {
+            "requested_count": 0,
+            "api_calls": 0,
+            "api_attempts": 0,
+            "batch_size": batch_size,
+            "batches_planned": 0,
+            "batches_attempted": 0,
+            "batches_completed": 0,
+            "failed_batch_index": None,
+            "matched_count": 0,
+            "missing_count": 0,
+            "missing_video_ids": [],
+            "unprocessed_video_ids": [],
+            "completed_ids": [],
+            "malformed_items_skipped": 0,
+            "error": None,
+            "partial": False,
+        }
+
+    # YouTube normally returns ID-filtered resources in request order, but the
+    # API contract does not require callers to depend on response ordering.
+    # Keep the first usable row for each requested ID and deterministically
+    # restore the exact first-occurrence request order here.
+    requested_set = set(unique_ids)
+    details_by_id: Dict[str, Dict[str, Any]] = {}
+    unexpected_items = 0
+    duplicate_response_items = 0
+    for detail in details:
+        video_id = detail.get("video_id")
+        if video_id not in requested_set:
+            unexpected_items += 1
+            continue
+        if video_id in details_by_id:
+            duplicate_response_items += 1
+            continue
+        details_by_id[video_id] = detail
+    ordered_videos = [
+        details_by_id[video_id]
+        for video_id in unique_ids
+        if video_id in details_by_id
+    ]
+
+    completed_ids = set(metadata.pop("completed_ids"))
+    matched_ids = [
+        video_id for video_id in unique_ids if video_id in details_by_id
+    ]
+    missing_ids = [
+        video_id
+        for video_id in unique_ids
+        if video_id in completed_ids and video_id not in details_by_id
+    ]
+    unprocessed_ids = [
+        video_id for video_id in unique_ids if video_id not in completed_ids
+    ]
+
+    observed_at = requested_at if completed_ids else None
+    expires_at = (
+        _format_rfc3339(requested_at_dt + timedelta(days=METADATA_TTL_DAYS))
+        if completed_ids
+        else None
+    )
+    id_outcomes = []
+    matched_set = set(matched_ids)
+    missing_set = set(missing_ids)
+    for video_id in unique_ids:
+        if video_id in matched_set:
+            status = "observed"
+        elif video_id in missing_set:
+            status = "not_returned"
+        else:
+            status = "unprocessed"
+        id_outcomes.append({
+            "video_id": video_id,
+            "status": status,
+            "observed_at": observed_at if status != "unprocessed" else None,
+            "expires_at": expires_at if status != "unprocessed" else None,
+        })
+
+    malformed_items = (
+        metadata["malformed_items_skipped"] + unexpected_items
+    )
+    error_data = metadata.get("error")
+    partial = bool(missing_ids or unprocessed_ids)
+    stopping_reason = (
+        "empty"
+        if not unique_ids
+        else "partial_failure"
+        if error_data is not None
+        else "not_returned"
+        if missing_ids
+        else "completed"
+    )
+    coverage = {
+        "requested_count": len(unique_ids),
+        "matched_count": len(matched_ids),
+        "missing_count": len(missing_ids),
+        "unprocessed_count": len(unprocessed_ids),
+        "matched_video_ids": matched_ids,
+        "missing_video_ids": missing_ids,
+        "unprocessed_video_ids": unprocessed_ids,
+        "batch_size": batch_size,
+        "batches_planned": batches_planned,
+        "batches_attempted": metadata["batches_attempted"],
+        "batches_completed": metadata["batches_completed"],
+        "failed_batch_index": metadata["failed_batch_index"],
+        "api_attempts": metadata["api_attempts"],
+        "api_calls": metadata["api_attempts"],
+        "malformed_items_skipped": malformed_items,
+        "unexpected_items_skipped": unexpected_items,
+        "duplicate_response_items_skipped": duplicate_response_items,
+        "duplicate_input_ids_skipped": duplicate_ids_skipped,
+        "invalid_input_ids_skipped": invalid_ids_skipped,
+        "stopping_reason": stopping_reason,
+        "partial": partial,
+    }
+
+    warnings: List[str] = []
+    errors: List[Dict[str, Any]] = []
+    if error_data is not None:
+        errors.append({
+            "stage": "video-details",
+            "batch_index": metadata["failed_batch_index"],
+            **error_data,
+        })
+        warnings.append(
+            "Video metadata lookup stopped after a batch failed; completed "
+            "batch results were preserved."
+        )
+    if missing_ids:
+        warnings.append(
+            "Some requested video IDs were not returned by videos.list; no "
+            "availability reason was inferred."
+        )
+    if malformed_items:
+        warnings.append("Malformed or unexpected video detail items were skipped.")
+    if duplicate_response_items:
+        warnings.append("Duplicate video detail items were skipped.")
+    if duplicate_ids_skipped:
+        warnings.append("Duplicate requested video IDs were de-duplicated in order.")
+    if invalid_ids_skipped:
+        warnings.append("Empty or non-string requested video IDs were skipped.")
+
+    return {
+        "provider": "youtube-data-api-v3",
+        "videos": ordered_videos,
+        "id_outcomes": id_outcomes,
+        "request": request,
+        "coverage": coverage,
+        "observed_at": observed_at,
+        "expires_at": expires_at,
+        "warnings": warnings,
+        "errors": errors,
+        "api_calls": {
+            "details": metadata["api_attempts"],
+            "total": metadata["api_attempts"],
+        },
+    }
 
 
 def _filters_dict(**values: Any) -> Dict[str, Any]:

@@ -25,13 +25,14 @@ import unicodedata
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from .paths import (
     exclusive_file_guard,
     project_data_dir,
     publish_file_exclusive,
 )
+from .redaction import redact_sensitive_value
 
 
 _WINDOWS_RESERVED_NAMES = frozenset({
@@ -54,6 +55,102 @@ _SOURCE_METADATA_ALIASES = {
     "views": ("views", "viewcount"),
 }
 _UNKNOWN_METADATA_TEXT = frozenset({"", "unknown", "n/a", "not available"})
+
+YOUTUBE_METADATA_SCHEMA = "filmot.youtube-metadata/v1"
+YOUTUBE_METADATA_PROVIDER = "youtube-data-api-v3"
+YOUTUBE_METADATA_AUDIT_LIMIT = 32
+YOUTUBE_METADATA_TTL_DAYS = 30
+
+# YouTube's public video resource is stored in the library's long-standing
+# metadata vocabulary.  This table is also the authoritative ownership list
+# for refresh and purge: transcript/acquisition fields are intentionally absent.
+_YOUTUBE_CANDIDATE_METADATA_ALIASES = {
+    "title": "title",
+    "description": "description",
+    "channel_title": "channel",
+    "channel_id": "channel_id",
+    "published_at": "published_at",
+    "views": "views",
+    "likes": "likes",
+    "comments": "comments",
+    "favorites": "favorites",
+    "duration": "youtube_duration",
+    "thumbnail": "thumbnail",
+    "thumbnails": "thumbnails",
+    "definition": "definition",
+    "dimension": "dimension",
+    "caption": "caption",
+    "licensed_content": "licensed_content",
+    "category_id": "category_id",
+    "tags": "tags",
+    "default_language": "default_language",
+    "default_audio_language": "default_audio_language",
+    "localized": "localized",
+    "live_broadcast_content": "live_broadcast_content",
+    "upload_status": "upload_status",
+    "failure_reason": "failure_reason",
+    "rejection_reason": "rejection_reason",
+    "privacy_status": "privacy_status",
+    "scheduled_publish_at": "scheduled_publish_at",
+    "license": "youtube_license",
+    "embeddable": "embeddable",
+    "public_stats_viewable": "public_stats_viewable",
+    "made_for_kids": "made_for_kids",
+    "self_declared_made_for_kids": "self_declared_made_for_kids",
+    "contains_synthetic_media": "contains_synthetic_media",
+    "paid_product_placement": "paid_product_placement",
+    "has_paid_product_placement": "paid_product_placement",
+    "paid_product_placement_disclosure": (
+        "paid_product_placement_disclosure"
+    ),
+    "region_restriction": "region_restriction",
+    "content_rating": "content_rating",
+    "projection": "projection",
+    "actual_start_time": "actual_start_time",
+    "actual_end_time": "actual_end_time",
+    "scheduled_start_time": "scheduled_start_time",
+    "scheduled_end_time": "scheduled_end_time",
+    "concurrent_viewers": "concurrent_viewers",
+    "active_live_chat_id": "active_live_chat_id",
+    "topic_ids": "topic_ids",
+    "relevant_topic_ids": "relevant_topic_ids",
+    "topic_categories": "topic_categories",
+}
+_YOUTUBE_CANDIDATE_SOURCE_ALIASES = {
+    "title": "title",
+    "channel_title": "channel",
+    "channel_id": "channel_id",
+    "published_at": "published_at",
+    "views": "views",
+}
+
+# Records written before the lifecycle contract copied these fields directly
+# from a YouTube discovery candidate.  Adoption is allowed only when the record
+# also carries explicit YouTube provider provenance.
+_LEGACY_YOUTUBE_METADATA_KEYS = frozenset({
+    *_YOUTUBE_CANDIDATE_METADATA_ALIASES.values(),
+    # The original fill-only enrichment used ``duration`` while pipeline saves
+    # used ``youtube_duration``.
+    "duration",
+    "metadata_observed_at",
+    "metadata_expires_at",
+    "views_observed_at",
+})
+_LEGACY_YOUTUBE_SOURCE_KEYS = frozenset({
+    *_YOUTUBE_CANDIDATE_SOURCE_ALIASES.values(),
+    "views_observed_at",
+})
+
+_YOUTUBE_LIFECYCLE_STATES = frozenset({"current", "not_returned", "purged"})
+_SHA256_REFERENCE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YOUTUBE_PURGE_REASONS = frozenset({
+    "operator",
+    "expired",
+    "refresh_failed",
+    "policy",
+})
+_MISSING = object()
 
 
 def _metadata_value_missing(value: Any) -> bool:
@@ -211,6 +308,411 @@ def _replace_with_retry(source: Path, destination: Path, attempts: int = 6) -> N
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 0.5)
+
+
+def _utc_timestamp(value: datetime) -> str:
+    """Return one stable UTC spelling for lifecycle timestamps."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("metadata lifecycle timestamps must include a timezone")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_metadata_timestamp(value: Any, field_name: str) -> datetime:
+    """Parse an RFC3339-like lifecycle timestamp as aware UTC."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("{} must be a timezone-aware timestamp".format(field_name))
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(
+            text[:-1] + "+00:00" if text.endswith("Z") else text
+        )
+    except ValueError as error:
+        raise ValueError(
+            "{} must be a timezone-aware timestamp".format(field_name)
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("{} must include a timezone".format(field_name))
+    return parsed.astimezone(timezone.utc)
+
+
+def _metadata_now(value: Optional[datetime] = None) -> datetime:
+    current = value or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must include a timezone")
+    return current.astimezone(timezone.utc)
+
+
+def _validate_observation_window(
+    observed_at: Any,
+    expires_at: Any,
+) -> tuple[str, str]:
+    """Validate and normalize a non-authorized-data refresh window."""
+    observed = _parse_metadata_timestamp(observed_at, "observed_at")
+    expires = _parse_metadata_timestamp(expires_at, "expires_at")
+    if expires <= observed:
+        raise ValueError("expires_at must be later than observed_at")
+    if expires > observed + timedelta(days=YOUTUBE_METADATA_TTL_DAYS):
+        raise ValueError("expires_at cannot be more than 30 days after observed_at")
+    return _utc_timestamp(observed), _utc_timestamp(expires)
+
+
+def _validate_request_ref(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _SHA256_REFERENCE_RE.fullmatch(value):
+        raise ValueError("request_ref must be a sha256: reference")
+    return value
+
+
+def _pointer_escape(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def _pointer_unescape(value: str) -> str:
+    decoded = value.replace("~1", "/").replace("~0", "~")
+    if _pointer_escape(decoded) != value:
+        raise ValueError("owned path contains invalid JSON Pointer escaping")
+    return decoded
+
+
+def _metadata_path(key: str) -> str:
+    return "/metadata/{}".format(_pointer_escape(key))
+
+
+def _source_path(key: str) -> str:
+    return "/source/{}".format(_pointer_escape(key))
+
+
+def _provider_field_path(key: str) -> str:
+    return "/metadata/provider_fields/{}".format(_pointer_escape(key))
+
+
+def _owned_path_parts(path: Any) -> tuple[str, str]:
+    """Decode one supported provider-owned path into container/key."""
+    if not isinstance(path, str):
+        raise ValueError("owned paths must be strings")
+    parts = path.split("/")
+    if len(parts) == 3 and parts[0] == "" and parts[1] in {"metadata", "source"}:
+        key = _pointer_unescape(parts[2])
+        if parts[1] == "metadata" and key == "provider_fields":
+            raise ValueError("provider_fields ownership must name an exact child")
+        return parts[1], key
+    if (
+        len(parts) == 4
+        and parts[:3] == ["", "metadata", "provider_fields"]
+    ):
+        return "provider_fields", _pointer_unescape(parts[3])
+    raise ValueError("unsupported provider-owned path: {!r}".format(path))
+
+
+def _container_for_owned_path(
+    raw: Dict[str, Any],
+    container_name: str,
+    *,
+    create: bool,
+) -> Optional[Dict[str, Any]]:
+    outer_name = "metadata" if container_name == "provider_fields" else container_name
+    outer = raw.get(outer_name)
+    if outer is None:
+        if not create:
+            return None
+        outer = {}
+        raw[outer_name] = outer
+    if not isinstance(outer, dict):
+        raise ValueError("saved transcript {} must be an object".format(outer_name))
+    if container_name != "provider_fields":
+        return outer
+    provider_fields = outer.get("provider_fields")
+    if provider_fields is None:
+        if not create:
+            return None
+        provider_fields = {}
+        outer["provider_fields"] = provider_fields
+    if not isinstance(provider_fields, dict):
+        raise ValueError("saved transcript metadata.provider_fields must be an object")
+    return provider_fields
+
+
+def _owned_value(raw: Dict[str, Any], path: str) -> Any:
+    container_name, key = _owned_path_parts(path)
+    container = _container_for_owned_path(raw, container_name, create=False)
+    if container is None:
+        return _MISSING
+    return container.get(key, _MISSING)
+
+
+def _delete_owned_value(raw: Dict[str, Any], path: str) -> bool:
+    container_name, key = _owned_path_parts(path)
+    container = _container_for_owned_path(raw, container_name, create=False)
+    if container is None or key not in container:
+        return False
+    del container[key]
+    if container_name == "provider_fields" and not container:
+        metadata = raw.get("metadata")
+        if isinstance(metadata, dict):
+            metadata.pop("provider_fields", None)
+    return True
+
+
+def _set_owned_value(raw: Dict[str, Any], path: str, value: Any) -> None:
+    container_name, key = _owned_path_parts(path)
+    container = _container_for_owned_path(raw, container_name, create=True)
+    assert container is not None
+    container[key] = value
+
+
+def _provider_is_youtube(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = re.sub(r"[^a-z0-9]", "", value.casefold())
+    return normalized.startswith("youtube")
+
+
+def _legacy_youtube_provenance(raw: Dict[str, Any]) -> bool:
+    metadata = raw.get("metadata")
+    if isinstance(metadata, dict) and _provider_is_youtube(
+        metadata.get("discovery_provider")
+    ):
+        return True
+    enrichment = raw.get("metadata_enrichment")
+    return isinstance(enrichment, dict) and _provider_is_youtube(
+        enrichment.get("provider")
+    )
+
+
+def _legacy_youtube_owned_paths(raw: Dict[str, Any]) -> List[str]:
+    """Infer only the documented pre-contract YouTube fields."""
+    if not _legacy_youtube_provenance(raw):
+        return []
+    paths: List[str] = []
+    metadata = raw.get("metadata")
+    if isinstance(metadata, dict):
+        for key in sorted(_LEGACY_YOUTUBE_METADATA_KEYS):
+            if key in metadata:
+                paths.append(_metadata_path(key))
+        provider_fields = metadata.get("provider_fields")
+        if isinstance(provider_fields, dict):
+            paths.extend(
+                _provider_field_path(str(key))
+                for key in sorted(provider_fields, key=str)
+            )
+    source = raw.get("source")
+    if isinstance(source, dict):
+        for key in sorted(_LEGACY_YOUTUBE_SOURCE_KEYS):
+            if key in source:
+                paths.append(_source_path(key))
+    return sorted(set(paths))
+
+
+def _legacy_youtube_timestamps(
+    raw: Dict[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """Return independently valid timestamps from an adoptable old record."""
+    if not _legacy_youtube_provenance(raw):
+        return None, None
+    metadata = raw.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    provider_fields = metadata.get("provider_fields")
+    provider_fields = provider_fields if isinstance(provider_fields, dict) else {}
+    source = raw.get("source")
+    source = source if isinstance(source, dict) else {}
+    enrichment = raw.get("metadata_enrichment")
+    enrichment = enrichment if isinstance(enrichment, dict) else {}
+    observed_value = (
+        metadata.get("metadata_observed_at")
+        or provider_fields.get("metadata_observed_at")
+        or provider_fields.get("observed_at")
+        or metadata.get("views_observed_at")
+        or source.get("views_observed_at")
+        or enrichment.get("observed_at")
+    )
+    expires_value = (
+        metadata.get("metadata_expires_at")
+        or provider_fields.get("metadata_expires_at")
+        or provider_fields.get("expires_at")
+        or enrichment.get("expires_at")
+    )
+    observed = None
+    expires = None
+    try:
+        if observed_value is not None:
+            observed = _utc_timestamp(
+                _parse_metadata_timestamp(observed_value, "observed_at")
+            )
+    except ValueError:
+        pass
+    try:
+        if expires_value is not None:
+            expires = _utc_timestamp(
+                _parse_metadata_timestamp(expires_value, "expires_at")
+            )
+    except ValueError:
+        pass
+    return observed, expires
+
+
+def _project_audit_events(value: Any) -> List[Dict[str, Any]]:
+    """Keep only value-free lifecycle audit fields from prior events."""
+    if not isinstance(value, list):
+        return []
+    output: List[Dict[str, Any]] = []
+    path_fields = {"changed_paths", "removed_paths", "conflict_paths"}
+    for item in value[-YOUTUBE_METADATA_AUDIT_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        action = item.get("action")
+        state = item.get("state")
+        at = item.get("at")
+        if action not in {"enrich", "adopt", "refresh", "not_returned", "purge"}:
+            continue
+        if state not in _YOUTUBE_LIFECYCLE_STATES:
+            continue
+        try:
+            at = _utc_timestamp(_parse_metadata_timestamp(at, "audit.at"))
+        except ValueError:
+            continue
+        projected = {"action": action, "at": at, "state": state}
+        request_ref = item.get("request_ref")
+        try:
+            request_ref = _validate_request_ref(request_ref)
+        except ValueError:
+            request_ref = None
+        if request_ref is not None:
+            projected["request_ref"] = request_ref
+        reason = item.get("reason")
+        if reason in _YOUTUBE_PURGE_REASONS:
+            projected["reason"] = reason
+        for key in path_fields:
+            paths = item.get(key)
+            if not isinstance(paths, list):
+                continue
+            valid_paths = []
+            for path in paths:
+                try:
+                    _owned_path_parts(path)
+                except ValueError:
+                    continue
+                valid_paths.append(path)
+            projected[key] = sorted(set(valid_paths))
+        if projected:
+            output.append(projected)
+    return output
+
+
+def _read_youtube_lifecycle(
+    raw: Dict[str, Any],
+    video_id: str,
+    *,
+    strict: bool,
+) -> Optional[Dict[str, Any]]:
+    root = raw.get("metadata_lifecycle")
+    if root is None:
+        return None
+    if not isinstance(root, dict):
+        if strict:
+            raise ValueError("saved transcript metadata_lifecycle must be an object")
+        return None
+    value = root.get("youtube")
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, dict):
+            raise ValueError("YouTube metadata lifecycle must be an object")
+        if value.get("schema") != YOUTUBE_METADATA_SCHEMA:
+            raise ValueError("unsupported YouTube metadata lifecycle schema")
+        if value.get("provider") != YOUTUBE_METADATA_PROVIDER:
+            raise ValueError("unsupported YouTube metadata lifecycle provider")
+        if value.get("resource") != "video":
+            raise ValueError("YouTube metadata lifecycle resource must be video")
+        if value.get("id") != video_id:
+            raise ValueError("YouTube metadata lifecycle ID does not match record")
+        state = value.get("state")
+        if state not in _YOUTUBE_LIFECYCLE_STATES:
+            raise ValueError("unsupported YouTube metadata lifecycle state")
+        owned_paths = value.get("owned_paths")
+        if not isinstance(owned_paths, list):
+            raise ValueError("YouTube metadata lifecycle owned_paths must be an array")
+        if len(set(owned_paths)) != len(owned_paths):
+            raise ValueError("YouTube metadata lifecycle owned_paths contains duplicates")
+        for path in owned_paths:
+            _owned_path_parts(path)
+        request_ref = _validate_request_ref(value.get("request_ref"))
+        observed_at = value.get("observed_at")
+        expires_at = value.get("expires_at")
+        if state in {"current", "not_returned"}:
+            observed_at, expires_at = _validate_observation_window(
+                observed_at, expires_at
+            )
+        elif observed_at is not None:
+            observed_at = _utc_timestamp(
+                _parse_metadata_timestamp(observed_at, "observed_at")
+            )
+        elif expires_at is not None:
+            raise ValueError("purged lifecycle cannot have expires_at without observed_at")
+        if state == "purged" and expires_at is not None:
+            expires_at = _utc_timestamp(
+                _parse_metadata_timestamp(expires_at, "expires_at")
+            )
+        projected = {
+            "schema": YOUTUBE_METADATA_SCHEMA,
+            "provider": YOUTUBE_METADATA_PROVIDER,
+            "resource": "video",
+            "id": video_id,
+            "observed_at": observed_at,
+            "expires_at": expires_at,
+            "state": state,
+            "owned_paths": sorted(owned_paths),
+            "audit": _project_audit_events(value.get("audit")),
+        }
+        if request_ref is not None:
+            projected["request_ref"] = request_ref
+        return projected
+    except (TypeError, ValueError):
+        if strict:
+            raise
+        return None
+
+
+def _candidate_youtube_assignments(
+    candidate: Dict[str, Any],
+    observed_at: str,
+    expires_at: str,
+) -> Dict[str, Any]:
+    """Project one public video observation into owned library paths."""
+    provider_fields = candidate.get("provider_fields")
+    provider_fields = provider_fields if isinstance(provider_fields, dict) else {}
+    observed = dict(provider_fields)
+    observed.update(candidate)
+    assignments: Dict[str, Any] = {}
+    for candidate_key, metadata_key in _YOUTUBE_CANDIDATE_METADATA_ALIASES.items():
+        value = observed.get(candidate_key, _MISSING)
+        if value is _MISSING or value is None:
+            continue
+        assignments[_metadata_path(metadata_key)] = redact_sensitive_value(value)
+    for candidate_key, source_key in _YOUTUBE_CANDIDATE_SOURCE_ALIASES.items():
+        value = observed.get(candidate_key, _MISSING)
+        if value is _MISSING or value is None:
+            continue
+        assignments[_source_path(source_key)] = redact_sensitive_value(value)
+
+    # Retain the established observation aliases for compatible readers while
+    # making them explicitly removable through ownership.
+    assignments[_metadata_path("metadata_observed_at")] = observed_at
+    assignments[_metadata_path("metadata_expires_at")] = expires_at
+    assignments[_metadata_path("views_observed_at")] = observed_at
+    if observed.get("views") is not None:
+        assignments[_source_path("views_observed_at")] = observed_at
+
+    for key, value in provider_fields.items():
+        if value is None:
+            continue
+        if key in {"metadata_observed_at", "observed_at"}:
+            value = observed_at
+        elif key in {"metadata_expires_at", "expires_at"}:
+            value = expires_at
+        assignments[_provider_field_path(str(key))] = redact_sensitive_value(value)
+    _require_finite_json(assignments)
+    return assignments
 
 
 class TranscriptLibrary:
@@ -785,6 +1287,501 @@ class TranscriptLibrary:
             "path": str(file_path),
             "filled_fields": filled,
             "conflicts": conflicts,
+        }
+
+    def youtube_metadata_inventory(
+        self,
+        *,
+        topic: Optional[str] = None,
+        video_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Inspect YouTube metadata freshness without network or mutation.
+
+        ``classification`` is deliberately limited to ``current``, ``expired``,
+        or ``unmanaged``.  ``state`` retains the more precise lifecycle state
+        (including ``not_returned`` and ``purged``), while ``legacy_adoptable``
+        identifies pre-contract records with explicit YouTube provenance.
+        Malformed records remain visible as unmanaged inventory rows rather
+        than silently shrinking a maintenance scope.
+        """
+        current = _metadata_now(now)
+        if video_id is not None and (
+            not isinstance(video_id, str) or not video_id.strip()
+        ):
+            raise ValueError("video_id must be non-empty text")
+
+        if topic is not None:
+            topic_dirs = self._topic_dirs_for_read(topic)
+        elif self.transcripts_dir.exists():
+            topic_dirs = [
+                path
+                for path in sorted(self.transcripts_dir.iterdir())
+                if path.is_dir() and not path.name.startswith("_")
+            ]
+        else:
+            topic_dirs = []
+
+        safe_id = self._sanitize_video_id(video_id) if video_id else None
+        rows: List[Dict[str, Any]] = []
+        for topic_dir in topic_dirs:
+            paths = (
+                [topic_dir / "{}.json".format(safe_id)]
+                if safe_id is not None
+                else sorted(topic_dir.glob("*.json"))
+            )
+            for file_path in paths:
+                if not file_path.exists():
+                    continue
+                base: Dict[str, Any] = {
+                    "topic": topic_dir.name,
+                    "video_id": video_id or file_path.stem,
+                    "path": str(file_path),
+                    "classification": "unmanaged",
+                    "state": "unmanaged",
+                    "managed": False,
+                    "legacy_adoptable": False,
+                    "owned_paths": [],
+                    "owned_path_count": 0,
+                    "observed_at": None,
+                    "expires_at": None,
+                    "request_ref": None,
+                }
+                try:
+                    with open(file_path, "r", encoding="utf-8") as handle:
+                        raw = json.load(handle, parse_constant=_reject_json_constant)
+                    if not isinstance(raw, dict):
+                        raise ValueError("saved transcript record must be an object")
+                    _require_finite_json(raw)
+                    record_id = raw.get("video_id")
+                    if not isinstance(record_id, str) or not record_id.strip():
+                        raise ValueError("saved transcript video_id is missing")
+                    if video_id is not None and record_id != video_id:
+                        raise ValueError("saved transcript video_id does not match its path")
+                    base["video_id"] = record_id
+                    lifecycle_root = raw.get("metadata_lifecycle")
+                    has_youtube_lifecycle = (
+                        lifecycle_root is not None
+                        and (
+                            not isinstance(lifecycle_root, dict)
+                            or "youtube" in lifecycle_root
+                        )
+                    )
+                    lifecycle = _read_youtube_lifecycle(
+                        raw, record_id, strict=False
+                    )
+                    if lifecycle is None:
+                        if has_youtube_lifecycle:
+                            base["state"] = "invalid"
+                            base["invalid_lifecycle"] = True
+                        else:
+                            legacy_adoptable = _legacy_youtube_provenance(raw)
+                            base["legacy_adoptable"] = legacy_adoptable
+                            if legacy_adoptable:
+                                base["state"] = "legacy"
+                                legacy_observed, legacy_expires = (
+                                    _legacy_youtube_timestamps(raw)
+                                )
+                                base["observed_at"] = legacy_observed
+                                base["expires_at"] = legacy_expires
+                                if legacy_expires is not None:
+                                    expires = _parse_metadata_timestamp(
+                                        legacy_expires, "expires_at"
+                                    )
+                                    base["classification"] = (
+                                        "expired"
+                                        if expires <= current
+                                        else "current"
+                                    )
+                        rows.append(base)
+                        continue
+
+                    base.update({
+                        "state": lifecycle["state"],
+                        "managed": True,
+                        "owned_paths": list(lifecycle["owned_paths"]),
+                        "owned_path_count": len(lifecycle["owned_paths"]),
+                        "observed_at": lifecycle.get("observed_at"),
+                        "expires_at": lifecycle.get("expires_at"),
+                        "request_ref": lifecycle.get("request_ref"),
+                    })
+                    if lifecycle["state"] == "purged":
+                        base["classification"] = "unmanaged"
+                    else:
+                        expires = _parse_metadata_timestamp(
+                            lifecycle["expires_at"], "expires_at"
+                        )
+                        base["classification"] = (
+                            "expired" if expires <= current else "current"
+                        )
+                    rows.append(base)
+                except (
+                    json.JSONDecodeError,
+                    OSError,
+                    TypeError,
+                    UnicodeError,
+                    ValueError,
+                ) as error:
+                    base["state"] = "invalid"
+                    base["invalid_record"] = True
+                    base["error_type"] = type(error).__name__
+                    rows.append(base)
+        return rows
+
+    def replace_youtube_metadata(
+        self,
+        video_id: str,
+        topic: str,
+        candidate: Optional[Dict[str, Any]],
+        *,
+        observed_at: Optional[str] = None,
+        expires_at: Optional[str] = None,
+        request_ref: Optional[str] = None,
+        adopt_legacy: bool = True,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Atomically replace one record's provider-owned YouTube metadata.
+
+        ``candidate=None`` means a successful API response did not return the
+        requested ID.  It removes prior provider-owned values and records the
+        neutral ``not_returned`` state; it does not infer deletion or privacy.
+        A refresh removes the previous ownership set before applying the new
+        observation, so fields omitted upstream cannot survive as stale data.
+        Existing values outside that ownership set are never overwritten.
+        """
+        if not isinstance(video_id, str) or not _YOUTUBE_VIDEO_ID_RE.fullmatch(
+            video_id
+        ):
+            raise ValueError("video_id must be an 11-character YouTube ID")
+        if not isinstance(topic, str) or not topic.strip():
+            raise ValueError("topic must be non-empty text")
+        if candidate is not None and not isinstance(candidate, dict):
+            raise ValueError("candidate must be an object or null")
+        if candidate is not None:
+            candidate_id = candidate.get("video_id")
+            if candidate_id != video_id:
+                raise ValueError("candidate video_id does not match record")
+            provider = candidate.get("provider")
+            if provider is not None and not _provider_is_youtube(provider):
+                raise ValueError("candidate provider is not YouTube")
+        request_ref = _validate_request_ref(request_ref)
+
+        provider_fields = (
+            candidate.get("provider_fields")
+            if isinstance(candidate, dict) else None
+        )
+        provider_fields = provider_fields if isinstance(provider_fields, dict) else {}
+        observation_value = observed_at
+        if observation_value is None and candidate is not None:
+            observation_value = (
+                candidate.get("metadata_observed_at")
+                or candidate.get("observed_at")
+                or provider_fields.get("metadata_observed_at")
+                or provider_fields.get("observed_at")
+            )
+        if observation_value is None:
+            observation_value = _utc_timestamp(_metadata_now(now))
+        observed = _parse_metadata_timestamp(observation_value, "observed_at")
+
+        expiry_value = expires_at
+        if expiry_value is None and candidate is not None:
+            expiry_value = (
+                candidate.get("metadata_expires_at")
+                or candidate.get("expires_at")
+                or provider_fields.get("metadata_expires_at")
+                or provider_fields.get("expires_at")
+            )
+        if expiry_value is None:
+            expiry_value = _utc_timestamp(
+                observed + timedelta(days=YOUTUBE_METADATA_TTL_DAYS)
+            )
+        observed_text, expires_text = _validate_observation_window(
+            observation_value, expiry_value
+        )
+        assignments = (
+            _candidate_youtube_assignments(
+                candidate, observed_text, expires_text
+            )
+            if candidate is not None
+            else {}
+        )
+
+        topic_dir = self.transcripts_dir / self._normalize_topic(topic)
+        file_path = topic_dir / "{}.json".format(video_id)
+        guard_path = topic_dir / ".{}.metadata.guard".format(video_id)
+        if not file_path.exists():
+            raise FileNotFoundError(
+                "Transcript is not saved at {}/{}".format(
+                    self._normalize_topic(topic), video_id
+                )
+            )
+
+        with exclusive_file_guard(guard_path):
+            with open(file_path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle, parse_constant=_reject_json_constant)
+            if not isinstance(raw, dict):
+                raise ValueError("saved transcript record must be an object")
+            _require_finite_json(raw)
+            if raw.get("video_id") != video_id:
+                raise ValueError("saved transcript video_id does not match its path")
+
+            previous = _read_youtube_lifecycle(raw, video_id, strict=True)
+            legacy_paths: List[str] = []
+            if previous is not None:
+                old_owned = list(previous["owned_paths"])
+            elif adopt_legacy:
+                legacy_paths = _legacy_youtube_owned_paths(raw)
+                old_owned = list(legacy_paths)
+            else:
+                if _legacy_youtube_provenance(raw):
+                    raise ValueError(
+                        "record has legacy YouTube metadata; enable adoption or "
+                        "purge it before refresh"
+                    )
+                old_owned = []
+
+            old_values = {
+                path: _owned_value(raw, path)
+                for path in old_owned
+            }
+            for path in old_owned:
+                _delete_owned_value(raw, path)
+
+            new_owned: List[str] = []
+            conflict_paths: List[str] = []
+            changed_paths: List[str] = []
+            for path in sorted(assignments):
+                incoming = assignments[path]
+                # A path not owned by the prior YouTube observation belongs to
+                # another source or to the operator.  Preserve it and report a
+                # provenance conflict instead of silently claiming ownership.
+                if _owned_value(raw, path) is not _MISSING:
+                    conflict_paths.append(path)
+                    continue
+                _set_owned_value(raw, path, incoming)
+                new_owned.append(path)
+                if (
+                    old_values.get(path, _MISSING) is _MISSING
+                    or old_values[path] != incoming
+                ):
+                    changed_paths.append(path)
+
+            removed_paths = sorted(
+                path
+                for path, value in old_values.items()
+                if value is not _MISSING and path not in new_owned
+            )
+            state = "current" if candidate is not None else "not_returned"
+            if previous is not None:
+                audit = list(previous.get("audit") or [])
+                action = "refresh" if candidate is not None else "not_returned"
+            else:
+                audit = []
+                action = (
+                    "adopt" if legacy_paths and candidate is not None
+                    else "not_returned" if candidate is None
+                    else "enrich"
+                )
+            audit_event: Dict[str, Any] = {
+                "action": action,
+                "at": observed_text,
+                "state": state,
+                "changed_paths": sorted(changed_paths),
+                "removed_paths": removed_paths,
+                "conflict_paths": sorted(conflict_paths),
+            }
+            if request_ref is not None:
+                audit_event["request_ref"] = request_ref
+            audit.append(audit_event)
+            audit = audit[-YOUTUBE_METADATA_AUDIT_LIMIT:]
+
+            lifecycle: Dict[str, Any] = {
+                "schema": YOUTUBE_METADATA_SCHEMA,
+                "provider": YOUTUBE_METADATA_PROVIDER,
+                "resource": "video",
+                "id": video_id,
+                "observed_at": observed_text,
+                "expires_at": expires_text,
+                "state": state,
+                "owned_paths": sorted(new_owned),
+                "audit": audit,
+            }
+            if request_ref is not None:
+                lifecycle["request_ref"] = request_ref
+            lifecycle_root = raw.get("metadata_lifecycle")
+            if lifecycle_root is None:
+                lifecycle_root = {}
+            elif not isinstance(lifecycle_root, dict):
+                raise ValueError("saved transcript metadata_lifecycle must be an object")
+            lifecycle_root = dict(lifecycle_root)
+            lifecycle_root["youtube"] = lifecycle
+            raw["metadata_lifecycle"] = lifecycle_root
+
+            temporary = _write_json_temporary(file_path, raw)
+            try:
+                _replace_with_retry(temporary, file_path)
+            finally:
+                if temporary.exists():
+                    try:
+                        temporary.unlink()
+                    except OSError:
+                        pass
+
+        return {
+            "status": "updated",
+            "state": state,
+            "path": str(file_path),
+            "adopted_legacy": bool(legacy_paths),
+            "changed_paths": sorted(changed_paths),
+            "removed_paths": removed_paths,
+            "conflict_paths": sorted(conflict_paths),
+            "owned_paths": sorted(new_owned),
+            "observed_at": observed_text,
+            "expires_at": expires_text,
+            "request_ref": request_ref,
+        }
+
+    def purge_youtube_metadata(
+        self,
+        video_id: str,
+        topic: str,
+        *,
+        reason: str = "operator",
+        adopt_legacy: bool = True,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Remove exactly the provider-owned YouTube fields, without an API.
+
+        A clearly YouTube-derived pre-contract record can be adopted directly
+        into the purged state.  Unmanaged records are a no-op because deleting
+        fields whose ownership is unknown could destroy locally sourced data.
+        """
+        if not isinstance(video_id, str) or not _YOUTUBE_VIDEO_ID_RE.fullmatch(
+            video_id
+        ):
+            raise ValueError("video_id must be an 11-character YouTube ID")
+        if not isinstance(topic, str) or not topic.strip():
+            raise ValueError("topic must be non-empty text")
+        if reason not in _YOUTUBE_PURGE_REASONS:
+            raise ValueError(
+                "reason must be one of {}".format(
+                    ", ".join(sorted(_YOUTUBE_PURGE_REASONS))
+                )
+            )
+        action_at = _utc_timestamp(_metadata_now(now))
+        topic_dir = self.transcripts_dir / self._normalize_topic(topic)
+        file_path = topic_dir / "{}.json".format(video_id)
+        guard_path = topic_dir / ".{}.metadata.guard".format(video_id)
+        if not file_path.exists():
+            raise FileNotFoundError(
+                "Transcript is not saved at {}/{}".format(
+                    self._normalize_topic(topic), video_id
+                )
+            )
+
+        with exclusive_file_guard(guard_path):
+            with open(file_path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle, parse_constant=_reject_json_constant)
+            if not isinstance(raw, dict):
+                raise ValueError("saved transcript record must be an object")
+            _require_finite_json(raw)
+            if raw.get("video_id") != video_id:
+                raise ValueError("saved transcript video_id does not match its path")
+
+            previous = _read_youtube_lifecycle(raw, video_id, strict=True)
+            legacy_paths: List[str] = []
+            if previous is not None:
+                old_owned = list(previous["owned_paths"])
+            elif adopt_legacy:
+                legacy_paths = _legacy_youtube_owned_paths(raw)
+                old_owned = list(legacy_paths)
+            else:
+                old_owned = []
+            if (
+                previous is not None
+                and previous["state"] == "purged"
+                and not old_owned
+            ):
+                return {
+                    "status": "noop",
+                    "state": "purged",
+                    "path": str(file_path),
+                    "adopted_legacy": False,
+                    "removed_paths": [],
+                    "owned_paths": [],
+                }
+            if previous is None and not old_owned:
+                return {
+                    "status": "noop",
+                    "state": "unmanaged",
+                    "path": str(file_path),
+                    "adopted_legacy": False,
+                    "removed_paths": [],
+                    "owned_paths": [],
+                }
+
+            removed_paths = sorted(
+                path for path in old_owned if _delete_owned_value(raw, path)
+            )
+            audit = (
+                list(previous.get("audit") or [])
+                if previous is not None else []
+            )
+            audit.append({
+                "action": "purge",
+                "at": action_at,
+                "state": "purged",
+                "reason": reason,
+                "changed_paths": [],
+                "removed_paths": removed_paths,
+                "conflict_paths": [],
+            })
+            audit = audit[-YOUTUBE_METADATA_AUDIT_LIMIT:]
+            lifecycle: Dict[str, Any] = {
+                "schema": YOUTUBE_METADATA_SCHEMA,
+                "provider": YOUTUBE_METADATA_PROVIDER,
+                "resource": "video",
+                "id": video_id,
+                "observed_at": (
+                    previous.get("observed_at")
+                    if previous is not None else action_at
+                ),
+                "expires_at": (
+                    previous.get("expires_at")
+                    if previous is not None else None
+                ),
+                "state": "purged",
+                "owned_paths": [],
+                "audit": audit,
+            }
+            if previous is not None and previous.get("request_ref") is not None:
+                lifecycle["request_ref"] = previous["request_ref"]
+            lifecycle_root = raw.get("metadata_lifecycle")
+            if lifecycle_root is None:
+                lifecycle_root = {}
+            elif not isinstance(lifecycle_root, dict):
+                raise ValueError("saved transcript metadata_lifecycle must be an object")
+            lifecycle_root = dict(lifecycle_root)
+            lifecycle_root["youtube"] = lifecycle
+            raw["metadata_lifecycle"] = lifecycle_root
+
+            temporary = _write_json_temporary(file_path, raw)
+            try:
+                _replace_with_retry(temporary, file_path)
+            finally:
+                if temporary.exists():
+                    try:
+                        temporary.unlink()
+                    except OSError:
+                        pass
+
+        return {
+            "status": "updated",
+            "state": "purged",
+            "path": str(file_path),
+            "adopted_legacy": bool(legacy_paths),
+            "removed_paths": removed_paths,
+            "owned_paths": [],
         }
     
     def get(self, video_id: str, topic: Optional[str] = None) -> Optional[Dict[str, Any]]:

@@ -44,6 +44,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   content/status, live-stream, topic, regional/content-rating,
   made-for-kids, synthetic-media, and `paid_product_placement` metadata, with missing
   counters preserved as unknown and 30-day UTC observation/expiry timestamps.
+- `yt-video` for ordered exact-ID/URL `videos.list` lookups without caption
+  acquisition. It validates and deduplicates inputs before quota use, batches
+  by 50, emits pipeline-compatible raw output, and distinguishes returned,
+  neutrally omitted, and unprocessed IDs while preserving completed batches.
+- `yt-data status`, `refresh`, and `purge` for explicit saved-YouTube metadata
+  maintenance. Status and purge are offline; refresh defaults to expired
+  records, fetches each unique ID once across topic copies, supports dry-run
+  and quota budgets, and never acquires captions.
+- A durable `filmot.youtube-metadata/v1` lifecycle with exact JSON Pointer
+  ownership, 30-day observation windows, optional content-addressed request
+  references, neutral `not_returned` state, bounded value-free audit history,
+  explicit legacy adoption, and guarded atomic per-record replacement/purge.
+- `filmot.channel_dl.enumerate_uploads_detailed()` for bounded, resumable
+  uploads-playlist traversal with page/item budgets, cooperative cancellation,
+  continuation and stopping state, API-call/row-quality coverage, and partial
+  preservation after a later-page failure.
 - A provider-neutral discovery candidate contract for Filmot, direct YouTube,
   and bare/list/result/videos/items artifacts. It provides all-row preflight,
   strict YouTube identities, zero-vs-missing preservation, bounded sanitized
@@ -115,6 +131,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cannot leave an unintentionally partial mutation. Its bounded native-field
   copy prioritizes freshness, disclosure, status, and topic provenance ahead
   of bulky provider extras.
+- Pipeline download now hashes the exact decoded stdin text and registers the
+  YouTube-owned metadata lifecycle for each saved direct-YouTube candidate.
+  Lifecycle registration failures retain the transcript, surface a partial
+  outcome, and leave explicit provenance for later adoption.
+- Explicit discovery-backed saves now apply provider-aware ownership:
+  Filmot-derived candidates retain fill-only enrichment, while a new YouTube
+  observation replaces only the previous YouTube-owned path set and preserves
+  conflicting manual or other-provider values.
 - `channel-download` now accepts only exact 24-character `UC...` IDs,
   `@handles`, and canonical `https://[www.]youtube.com/channel/UC...` or
   `https://[www.]youtube.com/@handle` URLs instead of guessing arbitrary
@@ -122,6 +146,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolved canonical identity separately, resolves the uploads playlist with
   `channels.list`, and retains richer channel/playlist-item provenance with
   30-day observation/expiry timestamps.
+- `channel-download` now enumerates bounded, resumable upload slices instead of
+  an unbounded pre-download crawl. It defaults to 10 pages/500 distinct
+  uploads, exposes `--pages`, `--max-results`, and `--page-token`, prints a
+  copyable continuation, preserves usable earlier pages on later failure, and
+  checkpoints request/coverage/expiry state in the corpus manifest.
 
 ### Fixed
 

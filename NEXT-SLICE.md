@@ -1,16 +1,16 @@
 # Filmot: next implementation slice and follow-up backlog
 
 Updated 2026-09-12. **Status: implemented but unreleased; live API and policy
-operator checks remain before release.** The implementation was prepared on
-`main` at
-`aa42e54aba85abd9d5c210369a2aa4e89a146668`; none of the status statements in
-this file should be read as a released-version claim.
+operator checks remain before release.** The current work builds on `main` at
+`bb33246`; none of the status statements in this file should be read as a
+released-version claim.
 
 The implementation direction remains **preserving fresh discovery metadata
-through library persistence**, now accompanied by bounded YouTube transport,
-coverage, and channel-upload improvements. A researcher should find a newly
-uploaded video, save its transcript, and later recover its identity and
-discovery context without manually joining separate JSON files.
+through library persistence**, now accompanied by exact-ID metadata retrieval,
+an explicit saved-data lifecycle, bounded YouTube transport/coverage, and
+channel-upload improvements. A researcher should find a newly uploaded video,
+save its transcript, later refresh or purge only the API-owned fields, and
+recover its identity and discovery reference without manually joining files.
 
 This document records outstanding work from the insight and Astra-reaction
 investigations. It supplements the historical [feature plan](AGENT_FEATURES_PLAN.md)
@@ -42,11 +42,12 @@ Research's internal scout already maps those fields for selected candidates. Reu
 |---|---|---|
 | N01 shared normalization | Implemented | None in the deterministic contract; retain a live handoff smoke check. |
 | N02 explicit manual handoff | Implemented | Live recent-upload check. |
-| N03 fill-only enrichment | Partial | Atomic primitive and explicit existing-record path exist, but there is no metadata-only CLI; `transcript --discovery` still acquires captions before the existing-record check. |
-| N04 durable scope/reference | Partial | Exact request bounds, typed raw/ledger scope, RFC3339 replay, and manual artifact hashes exist. Pipeline saves do not yet retain one content hash plus the complete request/coverage envelope as a single durable discovery object. |
+| N03 provider-aware enrichment/lifecycle | Implemented | Live refresh/purge check; `transcript --discovery` still acquires captions, but `yt-data refresh` is metadata-only. |
+| N04 durable scope/reference | Partial | Exact request bounds, typed raw/ledger scope, RFC3339 replay, manual artifact hashes, stdin hashes, and refresh-request hashes exist. Saved records still do not retain the complete request/coverage envelope as a durable object. |
 | N05 direct-YouTube summary | Implemented | Inspect one live ledger rendering. |
 | N06 bounded transport | Partial | Per-request connect/read timeouts and retries exist; one overall wall-clock operation deadline does not. |
 | N07 pagination/coverage | Implemented | Live continuation check and quota-aware operational review. |
+| Bounded channel enumeration | Implemented | Live `--page-token` continuation/checkpoint check. |
 
 ## Slice 1: fresh discovery to durable evidence
 
@@ -92,7 +93,7 @@ bytes. An invalid/mismatched artifact fails before transcript/library work; an
 explicit candidate supplies known metadata before the optional Filmot
 missing-field lookup.
 
-### N03 — Explicit metadata enrichment for existing records · P1 · partially implemented
+### N03 — Explicit metadata enrichment for existing records · P1 · implemented
 
 Provide a narrowly scoped operation to fill missing fields and recognized `Unknown` placeholders from an explicitly supplied, matching discovery record. Known conflicting values should remain unchanged and be reported. General replacement of known metadata is deferred.
 
@@ -100,12 +101,16 @@ Preserve transcript text, original caption segments/timing, original `saved_at`,
 
 Acceptance: repair an existing `Unknown` record without another caption download. Verify preserved text/segments and acquisition fields, conflict reporting, consistent metadata views, and a no-change outcome when repeating the same enrichment. A failed write must not leave that record half updated. Detect/reconcile stale concurrent updates or serialize writes so enrichment cannot discard another writer's newly known fields. Retain normal existing-record skip behavior unless enrichment is explicitly requested.
 
-Implementation: the library primitive performs guarded reread,
-fill-only/conflict accounting, strict temporary serialization, and atomic
-replacement; tests cover preservation, repeat no-op, mismatch, write failure,
-and concurrent independent fills. The explicit CLI path invokes it for an
-existing record, but only after normal transcript acquisition, so the first
-sentence of the acceptance target is not yet satisfied end to end.
+Implementation: Filmot-provider enrichment retains the guarded fill-only path.
+Direct-YouTube records now use `filmot.youtube-metadata/v1`, whose exact owned
+paths are removed before applying a fresh observation so omitted API fields do
+not remain stale. Unowned conflicts are preserved. `yt-data refresh` provides
+the caption-free CLI, defaults to expired records, fetches a unique ID once for
+all selected topic copies, and never advances an unprocessed record's expiry.
+`yt-data purge` removes only owned paths. Both use strict guarded atomic
+replacement per record; deterministic tests cover preservation, legacy
+adoption, neutral omission, conflict, write failure, concurrency, and audit
+bounds.
 
 ### N04 — Durable discovery references and accurate time scope · P1 · partially implemented
 
@@ -118,10 +123,11 @@ Acceptance: trace a selected video from discovery to save/enrichment in structur
 Implementation: direct discovery records `requested_at`, normalized
 second-level UTC bounds, filters, budgets, timeouts/retries, page/call coverage,
 and stopping state in raw output and compact events. The CLI accepts RFC3339
-bounds for exact replay. Manual handoff hashes the artifact and stores selected
-candidate provenance. A complete content-addressed discovery envelope is not
-yet persisted for stdin pipeline saves, and old records remain incomplete by
-design.
+bounds for exact replay. Manual handoff hashes artifact bytes; pipeline download
+hashes the exact decoded stdin text; lifecycle refresh hashes the
+credential-free effective request. Those references are durable, but the
+complete discovery request/coverage envelope is not yet content-addressed and
+persisted with the saved record. Old records remain incomplete by design.
 
 ### Slice 1 deterministic coverage
 
@@ -129,11 +135,20 @@ design.
   including zero views, empty metadata, legacy envelopes, invalid IDs, and
   malformed input.
 - Regressions cover one unchanged `yt-search` payload through download and an
-  explicit discovery-backed manual save, including both metadata views and
-  source identity.
-- Enrichment coverage includes repeat/no-op, known-value conflict, write
-  failure, concurrency, and unchanged captions/timestamps. Batch behavior does
-  not imply a cross-record transaction.
+  explicit discovery-backed manual save, including content-addressed handoff,
+  both metadata views, and source identity. `yt-video --raw` shares the same
+  pipeline candidate shape.
+- Exact-ID and lifecycle coverage includes ordered 50-ID batching, neutral
+  `not_returned` versus `unprocessed`, dry runs, expiry selection, topic-copy
+  deduplication, exact owned-path replacement, legacy adoption, purge,
+  known-value conflict, write failure, concurrency, and unchanged
+  captions/timestamps. Batch behavior does not imply a cross-record
+  transaction.
+- Channel enumeration coverage includes required page/item budgets, exact
+  continuation, duplicate/malformed/ID-less accounting, cancellation, repeated
+  token protection, first-page failure, later-page partial preservation, and a
+  30-day manifest checkpoint. The CLI defaults to 10 pages/500 uploads and
+  keeps `--limit` as a later transcript-selection cap.
 - Raw-capable commands emit one versioned JSON value on stdout with diagnostics
   separated. Existing `download` has no `--raw`; adding that capability remains
   a separate interface decision, not an assumed prerequisite.
@@ -143,10 +158,10 @@ design.
   enrichment behavior. Focused and repository-wide deterministic suites were
   green during integration; historical test counts are not acceptance criteria.
 
-The remaining release check is a small live recent-upload and page-continuation
-run plus operator review of its provenance and preservation. Keep
-network-dependent checks separate from deterministic tests. No AWS fallback is
-needed for this slice.
+The remaining release check is a small live recent-upload plus search/channel
+page-continuation run and operator review of its provenance and preservation.
+Keep network-dependent checks separate from deterministic tests. No AWS
+fallback is needed for this slice.
 
 ## Follow-up backlog
 
@@ -175,11 +190,12 @@ means an enhancement to assess before building.
 The implementation does not change relevance scoring, scout admission, probe
 behavior, caption-search grammar, or transcript content. It does add bounded
 direct-YouTube pagination and transport policy because accurate provenance and
-partial preservation depend on them. It does not add automatic background
-metadata refresh/deletion, silently overwrite known values, or claim to
-reconstruct missing historical provenance. YouTube-derived public metadata is
-timestamped with a 30-day expiry, but operators remain responsible for
-refreshing or deleting persisted/raw API data by that expiry.
+partial preservation depend on them. It adds explicit saved-record inspection,
+refresh, and purge—not an automatic background scheduler—and never silently
+claims unowned values or reconstructs missing historical provenance.
+YouTube-derived public metadata is timestamped with a 30-day expiry. Operators
+remain responsible for running lifecycle commands and separately maintaining
+raw exports and channel manifests.
 
 No semantic verifier or credibility score is proposed as a substitute for source judgment. Saved reactions, source similarity, popularity, and claim assessments retain their existing evidence limits.
 
@@ -189,12 +205,12 @@ No semantic verifier or credibility score is proposed as a substitute for source
 |---|---|
 | Direct YouTube discovery, transport, enrichment, and absolute dates | [youtube_search.py](filmot/youtube_search.py) |
 | Shared provider-neutral candidate boundary | [discovery.py](filmot/discovery.py) |
-| Bulk candidate consumption and `yt-search` command | [commands/search.py](filmot/commands/search.py) |
+| Bulk candidate consumption, `yt-search`, and `yt-video` | [commands/search.py](filmot/commands/search.py) |
 | `download`, explicit discovery handoff, and manual transcript save | [commands/transcript.py](filmot/commands/transcript.py) |
 | Existing scout normalization and persistence | [commands/research.py](filmot/commands/research.py) |
-| Library normalization, guarded fill-only enrichment, and record writes | [library.py](filmot/library.py) |
+| Library normalization, provider ownership, lifecycle, and atomic record writes | [library.py](filmot/library.py) |
 | Exact channel resolution and uploads-playlist enumeration | [channel_dl.py](filmot/channel_dl.py) |
-| Event recording and session folding | [ledger.py](filmot/ledger.py), [commands/library.py](filmot/commands/library.py) |
+| `yt-data`, event recording, and session folding | [commands/library.py](filmot/commands/library.py), [ledger.py](filmot/ledger.py) |
 | Shared credential redaction and typed result boundaries | [redaction.py](filmot/redaction.py), [schemas.py](filmot/schemas.py) |
 
 ## Local evidence and restart notes
@@ -229,16 +245,17 @@ detection, and the Atlas adapter does not enable paid AWS fallback.
 
 ## Remaining YouTube/API work after this implementation
 
-- Add a metadata-only refresh/enrichment CLI that does not acquire captions,
-  plus explicit refresh/delete behavior for expired API-derived fields.
 - Persist a single bounded, content-addressed discovery request/coverage object
-  for stdin pipeline saves, not only candidate-level provenance or a manual
-  artifact path/hash.
+  for saved pipeline candidates, not only candidate-level provenance and
+  manual/stdin/request hashes.
 - Add an overall discovery wall-clock deadline/cancellation budget beyond
   per-request timeouts and retries.
-- Give uploads-playlist enumeration a caller-controlled page/item budget and
-  cancellation path, and report ID-less malformed rows instead of silently
-  skipping them.
+- Consolidate direct YouTube request/retry/redaction/paging mechanics behind a
+  shared transport where doing so reduces duplicated policy without weakening
+  endpoint-specific contracts.
+- Add useful research bridges such as playlist shelves, comment discovery, and
+  channel/catalog views only with explicit quotas, bounded output, and the same
+  provenance/lifecycle semantics.
 - Decide whether useful read-only endpoints such as video categories and
   supported i18n regions/languages belong in the CLI; keep OAuth/write APIs out
   unless a separately authorized use case requires them.
