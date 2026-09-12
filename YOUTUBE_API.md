@@ -1,10 +1,10 @@
 # YouTube Data API behavior
 
 Filmot uses the public, read-only YouTube Data API v3 to discover recent
-videos, fetch exact-ID public video metadata, refresh API-owned fields in saved
-records, and resolve/enumerate channel uploads. Transcript retrieval is a
-separate capability; a YouTube Data API key does not grant access to caption
-text.
+videos, fetch exact-ID public video metadata, inspect public playlists and
+channel playlist shelves, refresh API-owned fields in saved records, and
+resolve/enumerate channel uploads. Transcript retrieval is a separate
+capability; a YouTube Data API key does not grant access to caption text.
 
 ## Configuration and attribution
 
@@ -32,8 +32,8 @@ and [Google Privacy Policy](https://policies.google.com/privacy).
 - As of September 2026, Google documents a default project allocation of 100
   `search.list` calls per day in a separate search bucket, with each call also
   described as costing one search-query unit. Other read methods used here,
-  including `videos.list`, `channels.list`, and `playlistItems.list`, cost one
-  regular quota unit per request. Check Google's current
+  including `videos.list`, `channels.list`, `playlists.list`, and
+  `playlistItems.list`, cost one regular quota unit per request. Check Google's current
   [quota calculator](https://developers.google.com/youtube/v3/determine_quota_cost)
   before planning a large crawl.
 - A `videos.list` enrichment request can cover up to 50 IDs. Filmot preserves
@@ -179,6 +179,55 @@ resumption. Repeated tokens fail safely rather than looping.
 The compatibility `list_all_video_ids()` API retains its historical unbounded,
 fail-fast, list-returning behavior for older Python callers; the CLI uses the
 bounded detailed API.
+
+## Public playlist provider APIs
+
+Python integrations can inspect an exact public playlist or enumerate a
+channel's public playlist shelf without using `search.list`:
+
+```python
+from filmot.youtube_resources import (
+    get_playlist_detailed,
+    list_channel_playlists_detailed,
+)
+
+page = get_playlist_detailed(
+    "https://www.youtube.com/playlist?list=PLAYLIST_ID",
+    max_pages=2,
+    max_results=75,
+    page_token=None,
+)
+next_token = page["coverage"]["next_page_token"]
+
+shelf = list_channel_playlists_detailed(
+    "@exact_handle",
+    max_pages=2,
+    max_results=75,
+)
+```
+
+Both APIs validate controls before quota use and return credential-free
+request, coverage, warning, error, API-call, and 30-day observation envelopes.
+Playlist input accepts a bare bounded ID or a supported HTTPS YouTube URL; only
+the parsed ID and a canonical playlist URL are retained, so unrelated URL
+parameters do not enter output. Shelf lookup accepts the same exact channel
+forms as channel download.
+
+`get_playlist_detailed()` spends one `playlists.list` request, up to the
+explicit number of `playlistItems.list` pages, and enough `videos.list` calls
+to cover distinct video IDs in the retained slice. The full ordered slice stays
+in `playlist_items`, including an item that no longer exposes a usable video
+ID. Repeated videos remain visible at each playlist position but are enriched
+once. Top-level `videos` contains only resources returned by completed
+`videos.list` calls, making that projection safe for a later transcript
+pipeline. Omitted resources and ID-less items are neutral observations, not
+proof of deletion, privacy, or unavailability.
+
+A later playlist-item or video-detail failure preserves usable completed work
+and marks coverage partial. Page and result budgets are independent; resume
+with the opaque `next_page_token` and the same bounds. These are provider APIs,
+not yet top-level CLI commands, and their returned metadata has the same
+30-day refresh-or-delete responsibility as other YouTube API observations.
 
 ## Interpretation
 

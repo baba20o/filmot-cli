@@ -60,6 +60,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   uploads-playlist traversal with page/item budgets, cooperative cancellation,
   continuation and stopping state, API-call/row-quality coverage, and partial
   preservation after a later-page failure.
+- `filmot.youtube_resources` provider APIs for bounded public-playlist and
+  channel-playlist-shelf inspection. They retain playlist-item order and
+  provenance, enrich each distinct returned video ID once, preserve usable
+  earlier pages after later failures, expose opaque continuation tokens, and
+  canonicalize supplied playlist URLs before recording request metadata.
 - A provider-neutral discovery candidate contract for Filmot, direct YouTube,
   and bare/list/result/videos/items artifacts. It provides all-row preflight,
   strict YouTube identities, zero-vs-missing preservation, bounded sanitized

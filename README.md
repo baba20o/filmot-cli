@@ -384,6 +384,41 @@ warnings, and typed errors. `observed` means YouTube returned the resource;
 preserved if a later batch fails. Counts preserve observed zero separately
 from missing values.
 
+### Inspect Public Playlists from Python
+
+The provider layer also offers bounded, resumable playlist reads for agent and
+library integrations:
+
+```python
+from filmot.youtube_resources import (
+    get_playlist_detailed,
+    list_channel_playlists_detailed,
+)
+
+playlist = get_playlist_detailed(
+    "https://www.youtube.com/playlist?list=PLAYLIST_ID",
+    max_pages=2,
+    max_results=75,
+)
+
+shelf = list_channel_playlists_detailed(
+    "@exact_handle",
+    max_pages=2,
+    max_results=75,
+)
+```
+
+`get_playlist_detailed()` preserves ordered playlist-item evidence, looks up
+each distinct usable video ID once, and exposes only videos returned by a
+completed metadata request in its pipeline-safe `videos` projection.
+`list_channel_playlists_detailed()` resolves an exact channel ID or handle and
+enumerates its public playlist shelf. Both results record independent page and
+row budgets, API attempts, stopping reason, opaque continuation, partial
+failures, and 30-day observation/expiry timestamps. Supplied playlist URLs are
+reduced to a public ID and canonical URL before request metadata is returned;
+extra query parameters are never retained. Top-level CLI commands for this
+provider surface are planned but are not part of the current release.
+
 ### Query Syntax (Full-Text Operators)
 
 Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The following operators are supported in your search queries:

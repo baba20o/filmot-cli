@@ -1108,6 +1108,20 @@ When a search is unnecessary because the IDs are already known, use
 returns one ordered, pipeline-compatible result with per-ID
 `observed`/`not_returned`/`unprocessed` coverage.
 
+For a curated research path, Python agents can call
+`filmot.youtube_resources.get_playlist_detailed()` with an exact playlist ID
+or HTTPS YouTube playlist URL. It returns ordered `playlist_items`, a
+pipeline-safe `videos` projection enriched once per distinct ID, explicit
+page/result budgets, API-call accounting, partial-failure state, and an opaque
+continuation token. Use
+`list_channel_playlists_detailed()` with an exact channel ID or handle to
+inspect the channel's public playlist shelf first. Resume tokens only with the
+same bounds. Do not infer deletion or privacy from an ID-less or omitted item,
+and treat all returned YouTube metadata as a 30-day observation. Playlist URL
+input is canonicalized before it reaches result metadata, so query parameters
+do not become research provenance. This provider surface is currently Python
+only; use existing CLI commands for transcript acquisition and persistence.
+
 ### Pattern 3: Deep Discovery (Probe)
 ```bash
 # Full pipeline: scout latest, search transcripts, auto-probe for connections

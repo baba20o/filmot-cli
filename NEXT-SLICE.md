@@ -253,8 +253,12 @@ detection, and the Atlas adapter does not enable paid AWS fallback.
 - Consolidate direct YouTube request/retry/redaction/paging mechanics behind a
   shared transport where doing so reduces duplicated policy without weakening
   endpoint-specific contracts.
-- Add useful research bridges such as playlist shelves, comment discovery, and
-  channel/catalog views only with explicit quotas, bounded output, and the same
+- Expose the landed bounded public-playlist and channel-playlist-shelf provider
+  through typed CLI commands and pipeline handoff; keep its independent
+  page/result budgets, opaque continuation, canonical request identity, and
+  partial-preservation semantics intact.
+- Add further research bridges such as comment discovery and channel/catalog
+  views only with explicit quotas, bounded output, and the same
   provenance/lifecycle semantics.
 - Decide whether useful read-only endpoints such as video categories and
   supported i18n regions/languages belong in the CLI; keep OAuth/write APIs out
