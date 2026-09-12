@@ -85,14 +85,50 @@ def _require_sqlite_state_path(path: Path) -> Path:
     return path
 
 
+
+# Query-string parameter names that commonly carry API keys, tokens, or other
+# bearer-style credentials (e.g. YouTube Data API's ``?key=...``, AWS
+# pre-signed URLs, generic ``access_token``/``auth`` params). Matched
+# case-insensitively; the value is replaced but the key/structure is kept so
+# the rest of the URL remains useful for diagnostics.
+_CREDENTIAL_QUERY_PARAM_NAMES = (
+    "key",
+    "apikey",
+    "api_key",
+    "access_token",
+    "auth",
+    "token",
+    "secret",
+    "password",
+    "signature",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+)
+
+_CREDENTIAL_QUERY_PARAM_RE = re.compile(
+    r"(?i)\b(" + "|".join(re.escape(name) for name in _CREDENTIAL_QUERY_PARAM_NAMES)
+    + r")=[^&#\s]+"
+)
+
+
 def redact_sensitive_text(value: object, secrets: Iterable[str] = ()) -> str:
-    """Remove proxy URL userinfo and caller-known secrets from diagnostics."""
+    """Remove proxy URL userinfo, URL query credentials, and caller-known
+    secrets from diagnostics.
+
+    Covers ``scheme://user:pass@host`` userinfo (proxy URLs) and URL query
+    parameters that commonly hold API keys/tokens (e.g. ``?key=...``), so an
+    exception message built from a ``requests`` URL (including
+    ``raise_for_status`` and connection-error text) never leaks a credential
+    even when the caller doesn't know its exact value.
+    """
     text = str(value)
     text = re.sub(
         r"(?i)(https?://)[^/\s@]+@",
         r"\1***:***@",
         text,
     )
+    text = _CREDENTIAL_QUERY_PARAM_RE.sub(r"\1=***", text)
     for secret in secrets:
         if secret:
             text = text.replace(str(secret), "***")

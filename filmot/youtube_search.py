@@ -14,10 +14,31 @@ from typing import Optional, List, Dict, Any
 # Importing config runs the explicit user-config/project-.env sequence without
 # python-dotenv's implicit parent-directory search.
 from . import config as _config  # noqa: F401
+from .proxy_pool import redact_sensitive_text
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+
+
+def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """GET ``url`` and return its JSON body, or raise a credential-safe error.
+
+    The YouTube Data API takes its API key as a ``?key=...`` query parameter.
+    ``requests`` embeds the full request URL — key included — in
+    ``raise_for_status()`` messages and in connection/transport error text.
+    Sanitize at this native diagnostic boundary (before the exception can
+    reach command output or the ledger) so every caller gets a redacted
+    message for free, without needing to know the key value in advance.
+    """
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        safe_message = redact_sensitive_text(exc)
+        raise type(exc)(safe_message, request=getattr(exc, "request", None),
+                         response=getattr(exc, "response", None)) from None
+    return response.json()
 
 
 def validate_youtube_api():
@@ -154,10 +175,8 @@ def search_videos(
     if topic_id:
         params["topicId"] = topic_id
     
-    response = requests.get(YOUTUBE_SEARCH_URL, params=params)
-    response.raise_for_status()
-    data = response.json()
-    
+    data = _get_json(YOUTUBE_SEARCH_URL, params)
+
     videos = []
     for item in data.get("items", []):
         snippet = item.get("snippet", {})
@@ -194,10 +213,8 @@ def get_video_details(video_ids: List[str]) -> List[Dict[str, Any]]:
         "part": "snippet,statistics,contentDetails",
     }
     
-    response = requests.get(YOUTUBE_VIDEOS_URL, params=params)
-    response.raise_for_status()
-    data = response.json()
-    
+    data = _get_json(YOUTUBE_VIDEOS_URL, params)
+
     videos = []
     for item in data.get("items", []):
         snippet = item.get("snippet", {})
