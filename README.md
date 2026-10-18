@@ -1812,8 +1812,9 @@ filmot search "python basics" --full --min-views 100000 --lang en
 # Pipe to file for processing
 filmot search "data science" --raw > results.json
 
-# Use with jq for filtering
-filmot search "tutorial" --raw | jq '.result[0].hits'
+# Use with jq for filtering; keep the status beside the rows, because failed,
+# interrupted, and zero-match searches all have no first hit
+filmot search "tutorial" --raw | jq '{status: ._filmot.status, hits: .result[0].hits}'
 
 # Run the compound workflow with one final JSON result.
 filmot research "agent memory" --depth 5 --raw > research.json
