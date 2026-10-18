@@ -755,6 +755,23 @@ actually returned by completed metadata calls. Only `yt-playlist` has that
 pipeline array; `yt-playlists` returns playlist-shelf rows and must first hand
 one playlist ID to `yt-playlist`.
 
+Because `filmot download` validates candidate array presence (`result`,
+`videos`, or `items`) and row identities rather than `_filmot.status`,
+`scope.partial`, or `coverage.partial`, an interrupted `search --raw`
+(`"result": []`, `status: "interrupted"`) or a total-batch-failure
+`yt-video --raw` (`"videos": []`, `status: "failed"`) piped directly into
+`download` is treated as an empty candidate list (`download` prints `"No videos
+to download."` and exits `0`), and a `"partial"` discovery envelope downloads
+its truncated slice without failing preflight. In automated workflows, stage
+the discovery envelope to a file and gate the entire command chain on both
+process exit and `_filmot`:
+
+```bash
+filmot search "deep sea mining" --title "deep sea mining" --raw > discovery.json \
+  && jq -e '._filmot.schema == "filmot.result/v1" and (._filmot.status == "completed" or ._filmot.status == "empty") and ((._filmot.errors | length) == 0) and ((.scope.partial // false) | not) and ((.coverage.partial // false) | not)' discovery.json >/dev/null \
+  && filmot download -t deep-sea --dedupe < discovery.json
+```
+
 For one selected video, preserve the exact discovery handoff explicitly:
 
 ```bash
@@ -1413,8 +1430,10 @@ filmot library compare "benefit" --sort density
 
 ### Pattern 5: Pipeline for Custom Filtering
 ```bash
-# Raw search → custom filter → download
-filmot search "your query" --raw | filmot download -t my-topic --dedupe -n 20
+# Stage raw search → verify exit and envelope status → download
+filmot search "your query" --raw > discovery.json \
+  && jq -e '._filmot.schema == "filmot.result/v1" and ._filmot.command == "search" and ._filmot.status == "completed" and ((._filmot.errors | length) == 0) and ((.scope.partial // false) | not)' discovery.json >/dev/null \
+  && filmot download -t my-topic --dedupe -n 20 < discovery.json
 ```
 
 ---
@@ -1501,18 +1520,20 @@ use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
 
 ### Exit and raw-output contracts
 
-- A successful empty search exits 0.
-- Configuration, API, and total transport failures exit nonzero.
+- A successful empty search exits `0`, and partial item/page success (`status: "partial"`) also exits `0`.
+- Configuration, API, and total transport or item failures (`status: "failed"`), as well as handled `KeyboardInterrupt` exits (`status: "interrupted"`), exit `1`.
 - Commands that permit partial item success print and log the partial counts;
   total item failure exits nonzero.
 - Once Click accepts the command line, `--raw` emits exactly one JSON value on
   stdout. Interactive route progress is suppressed and other diagnostics stay
-  off stdout; JSON error output still carries a nonzero exit. Invalid CLI
-  syntax/options use Click's text usage error and exit 2 before raw mode runs.
-  External user interruption and a broken stdout pipe can stop the process
-  before a complete value is written and are outside this result contract.
-  Search JSON reflects client-side filters, ranking, limits, and scope metadata
-  rather than an untouched upstream response.
+  off stdout; JSON error output still carries exit `1`. Invalid CLI
+  syntax/options and explicit Click usage errors use Click's text usage error on
+  stderr and exit `2` before raw mode runs. Semantic validation after parsing
+  emits the versioned JSON error envelope with exit `1`. External user
+  interruption and a broken stdout pipe can stop the process before a complete
+  value is written and are outside this result contract. Search JSON reflects
+  client-side filters, ranking, limits, and `scope` metadata rather than an
+  untouched upstream response.
 - Strict raw serialization rejects `NaN`/`Infinity` and emits ASCII-escaped
   JSON. Unicode strings therefore appear with JSON escapes on the wire but
   decode to the original code points. `main.py` propagates `main()`'s return
@@ -1536,6 +1557,33 @@ use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
   `sessions NAME --raw` exposes its replay in `events`, while
   `sessions NAME --summary --raw` uses `summary`; every replayed event uses the
   durable `filmot.event/v1` envelope with the same outcome vocabulary.
+- **Zero-match status and bounded coverage differ by command**: `search --raw`
+  reports `_filmot.status == "completed"` with `"result": []` on zero matches
+  (never `"empty"`). By contrast, `video`, `channels`, `yt-search`, `yt-video`,
+  `yt-playlist`, `yt-playlists`, `yt-comments`, `yt-replies`,
+  `transcript --grep`, `research` (without `--probe`), `library`, `yt-data`,
+  `claims show`, and `sessions` report `"empty"` on zero matches, while
+  disabled `yt-comments` (`availability.status == "disabled"`) and idempotent
+  `claims add/cite/assess` (`created == false`) report `"skipped"`.
+  `_filmot.status == "completed"` means the requested slice finished without
+  transport/page errors, not that all upstream matches were returned: check
+  `scope` (`api_total`, `candidates_fetched`, `pages_fetched`, `partial`) on
+  `search`, `coverage` (`stopping_reason`, `partial`) and `continuation` on
+  YouTube commands (`stopping_reason` is `"page_budget"` or `"result_budget"`
+  when capped cleanly by `--pages` or `--max-results`), and top-level run
+  counters (`selected`, `saved`, `skipped`, `failed`, `deduped`, `probe_saved`)
+  rather than `len(data["sources"])` on `research --raw`.
+- **Programmatic consumption**: never iterate `data.get("result", [])` (or
+  other domain lists) without first checking process exit code,
+  `_filmot.schema == "filmot.result/v1"`, `_filmot.command`, `_filmot.status`,
+  `_filmot.errors`, and `scope.partial` / `coverage.partial`. On operational
+  failure (`exit 1`, `status: "failed"`), `--raw` commands emit a JSON error
+  object with no `"result"` key, and on interruption (`exit 1`,
+  `status: "interrupted"`), `search --raw` emits `"result": []`; partial runs
+  (`exit 0`, `status: "partial"`, or `yt-video` with an empty first batch and
+  failed later batch where `coverage.partial` is `true`) still exit `0`. See
+  [README.md](README.md#example-agent-workflow-python) for a copyable Python 3.9+
+  standard-library workflow.
 - Raw mode affects presentation only. It does not make a read-only command log
   or make a mutating command read-only.
 

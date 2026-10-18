@@ -899,6 +899,29 @@ failure does not discard the transcript; the command reports a partial result,
 and the explicitly recorded YouTube provenance makes the record eligible for
 later adoption by `yt-data refresh`.
 
+Because `download` validates candidate array presence (`result`, `videos`, or
+`items`) and row identities rather than `_filmot.status`, `scope.partial`, or
+`coverage.partial`, an interrupted `search --raw` (`"result": []`,
+`status: "interrupted"`) or a total batch failure in `yt-video --raw`
+(`"videos": []`, `status: "failed"`) would be read as an empty candidate list,
+and a `"partial"` discovery envelope would still download its truncated slice.
+In shell pipelines, `filmot download` also starts concurrently with the
+upstream command, so an upstream failure or aborted filter still feeds empty
+stdin to `download` and logs an input failure. Stage discovery to a file and
+gate the entire command chain on both process exit and the `_filmot` envelope:
+
+```bash
+filmot search "deep sea mining" --title "deep sea mining" --pages 2 --raw > discovery.json \
+  && jq -e '
+    ._filmot.schema == "filmot.result/v1"
+    and ._filmot.command == "search"
+    and ._filmot.status == "completed"
+    and ((._filmot.errors | length) == 0)
+    and ((.scope.partial // false) | not)
+  ' discovery.json >/dev/null \
+  && filmot download -t deep-sea --dedupe < discovery.json
+```
+
 ### Saved YouTube Metadata Lifecycle
 
 Maintain API-derived fields in saved transcript records without reacquiring
@@ -1800,11 +1823,12 @@ filmot search "python basics" --full --min-views 100000 --lang en
 ### Raw JSON for Programmatic Access
 
 ```bash
-# Pipe to file for processing
+# Save one raw result envelope for inspection
 filmot search "data science" --raw > results.json
 
-# Use with jq for filtering
-filmot search "tutorial" --raw | jq '.result[0].hits'
+# Gate on process exit and _filmot.status before indexing .result
+filmot search "tutorial" --raw > results.json \
+  && jq -e 'if (._filmot.schema == "filmot.result/v1" and ._filmot.command == "search" and ._filmot.status == "completed" and ((._filmot.errors | length) == 0) and ((.scope.partial // false) | not)) then (.result[0].hits // []) else error(._filmot) end' results.json
 
 # Run the compound workflow with one final JSON result.
 filmot research "agent memory" --depth 5 --raw > research.json
@@ -1869,23 +1893,114 @@ inventory; use run counters and checkpoints to distinguish new work.
 
 ### Example Agent Workflow (Python)
 
+Do not parse `result.stdout` and iterate `data.get("result", [])` without
+checking process exit and `_filmot`: on operational failure (`exit 1`,
+`status: "failed"`), `search --raw` outputs a JSON error object with no
+`"result"` key, and on interruption (`exit 1`, `status: "interrupted"`), it
+outputs `"result": []`—both of which `data.get("result", [])` silently mistakes
+for a zero-hit search. Partial multi-page runs (`exit 0`, `status: "partial"`)
+also populate `"result"` with a truncated slice, and a zero-match `search --raw`
+reports `status: "completed"` with `"result": []` (never `"empty"`).
+
 ```python
-import subprocess
 import json
+import subprocess
 
-# Search for relevant content
-result = subprocess.run(
-    ["filmot", "search", "python tutorial", "--raw"],
-    capture_output=True, text=True
+
+def run_filmot_search(argv, allow_partial=False):
+    """Run `filmot search ... --raw` and validate its filmot.result/v1 envelope."""
+    proc = subprocess.run(argv, capture_output=True, text=True)
+
+    # Click usage errors (exit 2), signals, or broken pipes emit no/incomplete JSON on stdout.
+    try:
+        data = json.loads(proc.stdout) if proc.stdout and proc.stdout.strip() else None
+    except json.JSONDecodeError as exc:
+        stderr = (proc.stderr or "").strip()
+        raise RuntimeError(f"Invalid JSON on stdout (exit {proc.returncode}): {stderr or exc}") from exc
+
+    if not isinstance(data, dict):
+        stderr = (proc.stderr or "").strip()
+        raise RuntimeError(f"Expected JSON object (exit {proc.returncode}): {stderr or 'empty stdout'}")
+
+    meta = data.get("_filmot")
+    if not isinstance(meta, dict) or meta.get("schema") != "filmot.result/v1" or meta.get("command") != "search":
+        raise RuntimeError(f"Unsupported or mismatched _filmot envelope: {meta!r}")
+
+    status = meta.get("status")
+    raw_errors = meta.get("errors")
+    if not isinstance(raw_errors, list) or any(not isinstance(e, dict) for e in raw_errors):
+        raise RuntimeError("Malformed _filmot.errors in search envelope")
+    error_summary = "; ".join(
+        f"{e.get('stage', '?')}/{e.get('type', 'Error')}: {e.get('message', '')}" for e in raw_errors
+    ) or str(data.get("error") or (proc.stderr or "").strip() or "unknown error")
+
+    # Operational failures (no "result" key) and interruptions ("result": []) exit 1.
+    if proc.returncode != 0 or status in ("failed", "interrupted"):
+        raise RuntimeError(f"filmot search {status or 'error'} (exit {proc.returncode}): {error_summary}")
+    if status not in ("completed", "partial"):
+        raise RuntimeError(f"Unexpected _filmot.status for search: {status!r}")
+
+    scope = data.get("scope")
+    if not isinstance(scope, dict):
+        raise RuntimeError("Malformed search payload: missing scope object")
+    if (status == "partial" or raw_errors or scope.get("partial")) and not allow_partial:
+        raise RuntimeError(f"filmot search returned partial results: {error_summary}")
+
+    videos = data.get("result")
+    if not isinstance(videos, list) or not all(isinstance(v, dict) for v in videos):
+        raise RuntimeError("Malformed search payload: expected list of video objects in 'result'")
+
+    return data, videos
+
+
+data, videos = run_filmot_search(
+    ["filmot", "search", "python tutorial", "--pages", "2", "--limit", "10", "--raw"]
 )
-data = json.loads(result.stdout)
+scope = data["scope"]
+api_total = int(scope.get("api_total", data.get("totalresultcount", len(videos))) or 0)
+fetched = int(scope.get("candidates_fetched", len(videos)) or 0)
+pages_fetched = int(scope.get("pages_fetched", data.get("pages_fetched", 1)) or 1)
+is_bounded_slice = fetched < api_total or len(videos) < fetched or len(videos) < api_total
 
-# Process results in your agent
-for video in data.get("result", []):
-    title = video["title"]
-    hits = video["hits"]
-    # Feed to LLM for analysis...
+if not videos:
+    if is_bounded_slice:
+        print(
+            f"0 matching videos in inspected slice "
+            f"({fetched} fetched of {api_total} upstream matches across {pages_fetched} page(s))."
+        )
+    else:
+        print("Search completed with 0 matching videos.")
+else:
+    slice_note = "bounded slice" if is_bounded_slice else "complete match set"
+    print(
+        f"Returned {len(videos)} video(s) from {fetched} fetched across {pages_fetched} page(s) "
+        f"(API total: {api_total}; {slice_note})."
+    )
+    for video in videos:
+        video_id = video.get("id") or video.get("videoid") or "<unknown>"
+        title = video.get("title", "Untitled")
+        hits = video.get("hits") if isinstance(video.get("hits"), list) else []
+        print(f"{video_id}: {title} ({len(hits)} hit(s))")
 ```
+
+When adapting this pattern to other `--raw` commands, adjust the expected
+`_filmot.command`, status vocabulary, domain key, and coverage fields:
+
+- **Direct YouTube discovery (`yt-search`, `yt-video`, `yt-playlist`, `yt-playlists`)**:
+  read `"videos"` (or `"playlists"`), accept `status in ("completed", "empty")`,
+  and check `coverage.get("partial")` (including when `yt-video` reports
+  `status == "empty"` after an empty first batch and a failed later batch) plus
+  `coverage.get("stopping_reason")` and `continuation.get("available")`.
+- **Comments, transcripts, library, `yt-data`, `claims`, and `sessions`**: read
+  `"comment_threads"` (`yt-comments`, where `status == "skipped"` indicates
+  disabled comments), `"replies"` (`yt-replies`), `"full_text"`/`"segments"`
+  (`transcript`), `"matches"` (`transcript --grep`), `"rows"` (`library`,
+  `yt-data`, `claims`, `sessions`), or `"events"`/`"summary"` (`sessions NAME`),
+  where zero matches report `status == "empty"` and idempotent claim mutations
+  report `"skipped"`.
+- **Compound `research --raw`**: inspect the top-level run counters (`selected`,
+  `saved`, `skipped`, `failed`, `deduped`, `probe_saved`) rather than
+  `len(data["sources"])`, which retains previously saved topic transcripts.
 
 ## Contributing
 
