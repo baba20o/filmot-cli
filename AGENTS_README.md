@@ -739,6 +739,14 @@ filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw \
 list: their top-level schemas contain neither `result`, `videos`, nor `items`,
 and they cannot be piped into `download` or persisted as transcript records.
 
+`download` reads only the candidate array and does not check the upstream
+`_filmot.status`. A failed first `yt-video` batch (exit 1, `videos: []`)
+becomes "No videos to download" with exit 0, and a plain shell pipeline reports
+only that last status; a `partial` upstream result is downloaded as the
+incomplete set it contains. In unattended runs, save raw discovery output to a
+file, stop on a nonzero exit, check `_filmot.status`, then redirect the file
+into `download`.
+
 The provider-neutral boundary accepts bare candidate arrays and
 `result`/`videos`/`items` envelopes, normalizes Filmot and YouTube aliases, and
 preflights the complete input before any transcript request or library write.
@@ -1536,6 +1544,17 @@ use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
   `sessions NAME --raw` exposes its replay in `events`, while
   `sessions NAME --summary --raw` uses `summary`; every replayed event uses the
   durable `filmot.event/v1` envelope with the same outcome vocabulary.
+- Check the exit code and `_filmot.status` before trusting domain rows. The
+  shared raw emitter exits 1 only for `failed` or `interrupted`, so `partial`
+  and `empty` exit 0. A failed or interrupted payload can still carry an empty
+  array: for example a failed first `yt-video` batch has `videos: []`, a failed
+  `library list` has `rows: []`, and an interrupted `search` has `result: []`.
+  Status rules differ by command: `search` reports a clean zero-match search as
+  `completed` with an empty `result`; `yt-search`, `yt-video`, and `library list`
+  use `empty`; a `yt-playlist` `partial` can contain zero rows. A `completed`
+  search covers only the fetched pages; compare `scope.api_total` with
+  `scope.candidates_fetched`. The README's Python agent example applies these
+  checks to `search`.
 - Raw mode affects presentation only. It does not make a read-only command log
   or make a mutating command read-only.
 

@@ -899,6 +899,15 @@ failure does not discard the transcript; the command reports a partial result,
 and the explicitly recorded YouTube provenance makes the record eligible for
 later adoption by `yt-data refresh`.
 
+`download` reads only the candidate array; it does not check the upstream
+`_filmot.status`. For example, when `yt-video`'s first metadata batch fails,
+its raw failure (exit 1) still contains `videos: []`; `download` reports "No
+videos to download" and exits 0, and a plain shell pipeline reports only that
+last exit status. A `partial` upstream result is downloaded as the incomplete
+candidate set it contains. In unattended scripts, write raw discovery output to
+a file, stop on a nonzero exit, check `_filmot.status`, and only then redirect
+the file into `download`.
+
 ### Saved YouTube Metadata Lifecycle
 
 Maintain API-derived fields in saved transcript records without reacquiring
@@ -1869,19 +1878,61 @@ inventory; use run counters and checkpoints to distinguish new work.
 
 ### Example Agent Workflow (Python)
 
+Check the exit code and `_filmot` metadata before reading rows. A failed or
+interrupted result can still carry an empty domain array, and `partial` exits
+0. Status rules differ by command: `search` reports a clean zero-match search
+as `completed` with an empty `result`, while commands such as `yt-search`,
+`yt-video`, and `library list` use `empty`.
+
 ```python
 import subprocess
 import json
+import sys
 
 # Search for relevant content
-result = subprocess.run(
+proc = subprocess.run(
     ["filmot", "search", "python tutorial", "--raw"],
     capture_output=True, text=True
 )
-data = json.loads(result.stdout)
 
-# Process results in your agent
-for video in data.get("result", []):
+# Click usage errors (exit 2) print text, and an interrupted process may not
+# write a complete value. Neither is an empty search.
+try:
+    data = json.loads(proc.stdout)
+except json.JSONDecodeError:
+    raise RuntimeError(
+        f"filmot exited {proc.returncode} without a JSON result: "
+        f"{proc.stderr.strip()}"
+    )
+
+meta = data.get("_filmot") if isinstance(data, dict) else None
+if (not isinstance(meta, dict)
+        or meta.get("schema") != "filmot.result/v1"
+        or meta.get("command") != "search"):
+    raise RuntimeError("Unexpected filmot output; not treating it as results")
+
+status = meta.get("status")
+if proc.returncode != 0 or status not in ("completed", "partial"):
+    # failed/interrupted: any rows present are not a search result
+    raise RuntimeError(
+        f"filmot search {status} (exit {proc.returncode}): {meta.get('errors')}"
+    )
+if status == "partial":
+    # Earlier pages were kept, but a later page failed.
+    print(f"Incomplete search: {meta['errors']}", file=sys.stderr)
+
+# "completed" covers the pages fetched (one by default), not every API match.
+scope = data["scope"]
+if scope["api_total"] > scope["candidates_fetched"]:
+    print(
+        f"Fetched {scope['candidates_fetched']} of {scope['api_total']} matches; "
+        "raise --pages for more",
+        file=sys.stderr,
+    )
+
+# Process results in your agent. After "completed", an empty list means no
+# fetched candidate survived the query, client-side filters, and --limit.
+for video in data["result"]:
     title = video["title"]
     hits = video["hits"]
     # Feed to LLM for analysis...
