@@ -1,0 +1,23 @@
+[
+  {
+    "id": "recorded-video-001",
+    "uploaddate": "2026-01-01",
+    "duration": 3882,
+    "title": null,
+    "channelid": "recorded-channel-001",
+    "channelname": "Recorded channel 001",
+    "description": null,
+    "autosubs": null,
+    "manualsubs": null,
+    "category": "Science & Technology",
+    "viewcount": 104088,
+    "likecount": null,
+    "isunlisted": 0,
+    "islivestream": 0,
+    "license": "",
+    "ispartialdata": 1,
+    "lastfetchdate": "2026-01-02",
+    "channelsubcount": 253000,
+    "channelcountryname": "Recorded country"
+  }
+]

@@ -1767,20 +1767,21 @@ def _display_video_results(
         return
 
     for video in videos:
-        title = video.get("title", "Unknown Title")
-        video_id = video.get("id", "")
-        channel = video.get("channelname", "Unknown")
-        channel_id = video.get("channelid", "")
-        duration = video.get("duration", 0)
-        upload_date = video.get("uploaddate", "N/A")
-        views = video.get("viewcount", 0)
-        likes = video.get("likecount", 0)
-        category = video.get("category", "")
-        lang = video.get("lang", "")
-        channel_subs = video.get("channelsubcount", 0)
-        channel_country = video.get("channelcountryname", "")
+        # Partial index records carry nulls; show placeholders for them.
+        title = video.get("title") or "Unknown Title"
+        video_id = video.get("id") or ""
+        channel = video.get("channelname") or "Unknown"
+        channel_id = video.get("channelid") or ""
+        duration = video.get("duration")
+        upload_date = video.get("uploaddate") or "N/A"
+        views = video.get("viewcount") or 0
+        likes = video.get("likecount") or 0
+        category = video.get("category") or ""
+        lang = video.get("lang") or ""
+        channel_subs = video.get("channelsubcount") or 0
+        channel_country = video.get("channelcountryname") or ""
 
-        duration_str = _format_duration(duration)
+        duration_str = _format_duration(duration) if duration is not None else "unknown"
 
         # Upstream text is shown literally, never parsed as Rich markup.
         table = Table(title=Text(str(title), style="bold"), show_header=False)
@@ -1828,7 +1829,8 @@ def _display_video_results(
             shown = description if len(description) <= 400 else description[:400].rstrip() + "…"
             table.add_row("Description", Text(shown))
         table.add_row("Video URL", Text(f"https://youtube.com/watch?v={video_id}"))
-        table.add_row("Channel URL", Text(f"https://youtube.com/channel/{channel_id}"))
+        if channel_id:
+            table.add_row("Channel URL", Text(f"https://youtube.com/channel/{channel_id}"))
 
         console.print(table)
 

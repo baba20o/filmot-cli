@@ -31,6 +31,14 @@ def row(video_id=VIDEO_ID, **changes):
     return value
 
 
+def partial_row(video_id=VIDEO_ID, **changes):
+    """The recorded partial index record: null title, description, and captions."""
+    path = FIXTURE.parent / "get_videos_columns_partial.json"
+    value = dict(json.loads(path.read_text(encoding="utf-8"))[0], id=video_id)
+    value.update(changes)
+    return value
+
+
 def basic_row(video_id=VIDEO_ID, **changes):
     return {key: value for key, value in row(video_id, **changes).items() if key in BASIC_FIELDS}
 
@@ -166,6 +174,37 @@ def test_video_display_marks_unknown_captions_and_never_parses_markup(http, run)
         assert literal in result.stdout
 
 
+NULLABLE_CORE = dict.fromkeys(("title", "duration", "uploaddate", "channelid", "channelname"))
+
+
+def test_video_displays_a_partial_index_record(http, run):
+    http.queues["rapidapi"].append(FakeResponse([partial_row(**NULLABLE_CORE)]))
+
+    result = run("video", VIDEO_ID)
+
+    assert result.exit_code == 0, result.output
+    assert "Unknown Title" in result.stdout
+    assert "partial record in Filmot's index" in result.stdout
+    assert "unknown" in next(line for line in result.stdout.splitlines() if "Duration" in line)
+    assert "Channel URL" not in result.stdout
+
+
+def test_watchlist_add_and_list_accept_a_partial_basic_record(run):
+    from filmot.watchlist import get_watchlist
+
+    basic = {key: value for key, value in partial_row(**NULLABLE_CORE).items() if key in BASIC_FIELDS}
+    with patch("filmot.cli.FilmotClient") as client:
+        client.return_value.get_videos.return_value = [basic]
+        added = run("watchlist", "add", VIDEO_ID)
+    listed = run("watchlist", "list")
+
+    assert added.exit_code == 0, added.output
+    entry = get_watchlist().get_watchlist()[0]
+    assert (entry["video_id"], entry["title"], entry["duration"]) == (VIDEO_ID, "", 0)
+    assert listed.exit_code == 0, listed.output
+    assert VIDEO_ID in listed.stdout
+
+
 def test_video_rejects_a_drifted_column_type(http, run):
     http.queues["rapidapi"].append(FakeResponse([row(viewcount="many")]))
 
@@ -291,6 +330,23 @@ def test_library_enrich_reports_lookup_failures_and_truncation(two_records, run)
     payload = json.loads(missing.stdout)
     assert payload["_filmot"]["status"] == "completed"
     assert payload["summary"]["not_returned"] == 1
+
+
+def test_library_enrich_keeps_a_batch_that_contains_a_partial_record(two_records, http, run):
+    # Through the real client and contract: one partial row (null title)
+    # previously rejected the whole 200-video batch.
+    http.queues["rapidapi"].append(FakeResponse([row(), partial_row(OTHER_ID)]))
+
+    result = run("library", "enrich", "--raw")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["_filmot"]["status"] == "completed"
+    assert payload["summary"]["updated"] == 2
+    partial = two_records.get(OTHER_ID, "ufo")["metadata"]
+    assert partial["title"] == "Known"
+    assert partial["partial_metadata"] is True
+    assert partial["category"] == "Science & Technology"
 
 
 def test_library_enrich_renders_a_mixed_batch_failure(two_records, run):

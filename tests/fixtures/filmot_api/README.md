@@ -36,6 +36,15 @@ python scripts/record_filmot_api_fixtures.py --only get_videos_columns --force
 Under the default `auto` policy that request uses RapidAPI. With
 `--provider direct` it costs 2 credits.
 
+`get_videos_columns_partial.json` is the same request for a video that Filmot
+holds only as a partial record (`ispartialdata: 1`). Its title, description,
+like count, and caption languages are null. It was recorded on 2026-10-22 with:
+
+```bash
+python scripts/record_filmot_api_fixtures.py --only get_videos_columns \
+  --video-id EXB8HokGVMI --suffix _partial --force
+```
+
 The recorder validates both the live body and its sanitized form. Runtime
 validation accepts additive fields but returns a machine-readable error when a
 required container or consumed field changes incompatibly.
