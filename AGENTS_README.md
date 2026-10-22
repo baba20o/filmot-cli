@@ -4,7 +4,7 @@
 
 *Written by an agent, for agents, based on real-world research sessions.*
 
-> **Also read: [AGENTS_RESEARCH_GUIDE.md](AGENTS_RESEARCH_GUIDE.md)** — How to evaluate sources, detect AI misinformation, cross-reference claims, and separate truth from hype. Essential methodology for any serious research task.
+> **Also read: [AGENTS_RESEARCH_GUIDE.md](docs/AGENTS_RESEARCH_GUIDE.md)** — How to evaluate sources, detect AI misinformation, cross-reference claims, and separate truth from hype. Essential methodology for any serious research task.
 
 ---
 
@@ -963,7 +963,7 @@ sensitive-trait inference, and no derived engagement metrics.
 
 Deterministic provider/CLI coverage and a bounded live thread → reply → emitted
 continuation drive are complete. Future YouTube endpoint priorities and
-OAuth/policy boundaries belong in [YOUTUBE_ROADMAP.md](YOUTUBE_ROADMAP.md).
+OAuth/policy boundaries belong in [YOUTUBE_ROADMAP.md](docs/YOUTUBE_ROADMAP.md).
 
 ### Saved-data maintenance
 
@@ -1282,7 +1282,7 @@ time-stamped observation with a 30-day expiry. Exported JSON is not maintained
 automatically. Direct-YouTube fields saved in the transcript library can be
 inspected and explicitly refreshed or purged with `yt-data`; scheduling
 remains the operator's responsibility. See [YouTube Data API
-behavior](YOUTUBE_API.md).
+behavior](docs/YOUTUBE_API.md).
 
 Add `--transcript` (and optionally
 `--transcript-query`) to attach the same per-video `transcript_search` object to
@@ -1628,4 +1628,4 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 
 *This guide was written based on actual research sessions using Filmot CLI across topics including AI security, nuclear fusion, solid-state batteries, brain-computer interfaces, humanoid robotics, and multilingual AI discourse (Hebrew, Chinese, Hindi, Russian).*
 
-> **Next**: Read **[AGENTS_RESEARCH_GUIDE.md](AGENTS_RESEARCH_GUIDE.md)** for the methodology behind evaluating sources, detecting AI misinformation, cross-referencing claims across languages, and reporting findings with appropriate confidence levels.
+> **Next**: Read **[AGENTS_RESEARCH_GUIDE.md](docs/AGENTS_RESEARCH_GUIDE.md)** for the methodology behind evaluating sources, detecting AI misinformation, cross-referencing claims across languages, and reporting findings with appropriate confidence levels.

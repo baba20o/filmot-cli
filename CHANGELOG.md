@@ -12,11 +12,11 @@ complete. A bounded live thread, reply, emitted-continuation, and isolated
 ledger identity/text/token privacy drive has also passed. A final two-call
 post-hardening replay verified exact named-session continuation, disjoint
 resumed rows, and the response-free minimal ledger contract; the full audit is
-recorded in `FIELD_TEST_LOG.md`.
+recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Added
 
-- `YOUTUBE_ROADMAP.md`, a durable ranked queue for future public read surfaces,
+- `docs/YOUTUBE_ROADMAP.md`, a durable ranked queue for future public read surfaces,
   OAuth/policy gates, and the admission checklist for each new YouTube slice.
 - Named search-session routing through `--session` and `FILMOT_SESSION`, with
   bulk-download TOPIC inference and an explicit CLI → environment → bulk TOPIC
@@ -133,6 +133,11 @@ recorded in `FIELD_TEST_LOG.md`.
 
 ### Changed
 
+- Planning and reference documents moved from the repository root into
+  `docs/`: `AGENTS_RESEARCH_GUIDE.md`, `AGENT_FEATURES_PLAN.md`,
+  `FIELD_TEST_LOG.md`, `NEXT-SLICE.md`, `YOUTUBE_API.md`, and
+  `YOUTUBE_ROADMAP.md`. Links, `MANIFEST.in`, and `.env.example` follow the new
+  paths, and `scripts/check_doc_links.py` verifies relative Markdown links.
 - Public-playlist and public-discussion providers now share bounded request
   controls, credential-detached errors, page-information parsing, request
   options, and opaque next-token handling through

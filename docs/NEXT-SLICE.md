@@ -248,25 +248,25 @@ No semantic verifier or credibility score is proposed as a substitute for source
 
 | Area | Current owner |
 |---|---|
-| Direct YouTube discovery, transport, enrichment, and absolute dates | [youtube_search.py](filmot/youtube_search.py) |
-| Shared provider-neutral candidate boundary | [discovery.py](filmot/discovery.py) |
-| Bulk candidate consumption, `yt-search`, and `yt-video` | [commands/search.py](filmot/commands/search.py) |
-| Public playlist providers and `yt-playlist`/`yt-playlists` | [youtube_resources.py](filmot/youtube_resources.py), [commands/youtube.py](filmot/commands/youtube.py) |
-| Public comment/reply providers and commands | [youtube_comments.py](filmot/youtube_comments.py), [commands/youtube_comments.py](filmot/commands/youtube_comments.py) |
-| Shared bounded YouTube controls, safe errors, and pagination primitives | [youtube_api_support.py](filmot/youtube_api_support.py) |
-| `download`, explicit discovery handoff, and manual transcript save | [commands/transcript.py](filmot/commands/transcript.py) |
-| Existing scout normalization and persistence | [commands/research.py](filmot/commands/research.py) |
-| Library normalization, provider ownership, lifecycle, and atomic record writes | [library.py](filmot/library.py) |
-| Exact channel resolution and uploads-playlist enumeration | [channel_dl.py](filmot/channel_dl.py) |
-| `yt-data`, event recording, and session folding | [commands/library.py](filmot/commands/library.py), [ledger.py](filmot/ledger.py) |
-| Shared credential redaction and typed result boundaries | [redaction.py](filmot/redaction.py), [schemas.py](filmot/schemas.py) |
+| Direct YouTube discovery, transport, enrichment, and absolute dates | [youtube_search.py](../filmot/youtube_search.py) |
+| Shared provider-neutral candidate boundary | [discovery.py](../filmot/discovery.py) |
+| Bulk candidate consumption, `yt-search`, and `yt-video` | [commands/search.py](../filmot/commands/search.py) |
+| Public playlist providers and `yt-playlist`/`yt-playlists` | [youtube_resources.py](../filmot/youtube_resources.py), [commands/youtube.py](../filmot/commands/youtube.py) |
+| Public comment/reply providers and commands | [youtube_comments.py](../filmot/youtube_comments.py), [commands/youtube_comments.py](../filmot/commands/youtube_comments.py) |
+| Shared bounded YouTube controls, safe errors, and pagination primitives | [youtube_api_support.py](../filmot/youtube_api_support.py) |
+| `download`, explicit discovery handoff, and manual transcript save | [commands/transcript.py](../filmot/commands/transcript.py) |
+| Existing scout normalization and persistence | [commands/research.py](../filmot/commands/research.py) |
+| Library normalization, provider ownership, lifecycle, and atomic record writes | [library.py](../filmot/library.py) |
+| Exact channel resolution and uploads-playlist enumeration | [channel_dl.py](../filmot/channel_dl.py) |
+| `yt-data`, event recording, and session folding | [commands/library.py](../filmot/commands/library.py), [ledger.py](../filmot/ledger.py) |
+| Shared credential redaction and typed result boundaries | [redaction.py](../filmot/redaction.py), [schemas.py](../filmot/schemas.py) |
 
 ## Local evidence and restart notes
 
 These captures are ignored local research artifacts, not Git-tracked fixtures. This document includes the key findings so another checkout can understand the scope without them. Create minimal sanitized fixtures for implementation tests rather than committing entire research corpora.
 
-- [Insight investigation: CLI experience](Insights/astra-insight-understanding-2026-09-06/CLI-EXPERIENCE.md) and [manifest](Insights/astra-insight-understanding-2026-09-06/MANIFEST.json).
-- [Freshness investigation: observations](Insights/astra-fresh-reactions-2026-09-06/FRESHNESS-AND-REACTIONS.md) and [manifest with exact video-ID metadata joins](Insights/astra-fresh-reactions-2026-09-06/MANIFEST.json).
+- [Insight investigation: CLI experience](../Insights/astra-insight-understanding-2026-09-06/CLI-EXPERIENCE.md) and [manifest](../Insights/astra-insight-understanding-2026-09-06/MANIFEST.json).
+- [Freshness investigation: observations](../Insights/astra-fresh-reactions-2026-09-06/FRESHNESS-AND-REACTIONS.md) and [manifest with exact video-ID metadata joins](../Insights/astra-fresh-reactions-2026-09-06/MANIFEST.json).
 - Concrete metadata examples: `fEvXSrHPzb4`, `KM_AIwCT5Dc`, `Spuza-KwTJ4`, and `vm_R4uT8ntE` saved with unknown identity fields; direct discovery supplied their titles/channels. `GGzT7zVrRTU` retained metadata and is a useful contrasting case.
 - Freshness session: `astra-fresh-reactions-2026-09-06`; insight session: `astra-insight-understanding-2026-09-06`. The live session summaries are preserved under each artifact folder's `runs/` directory.
 - Playlist session: `curated-active-inference-2026-09-12`. Its bounded shelf
