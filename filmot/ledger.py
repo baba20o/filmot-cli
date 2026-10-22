@@ -916,9 +916,14 @@ def log_result(
 ) -> None:
     """Append a compact event derived from a typed command result.
 
-    Like :func:`log_event`, this is deliberately best-effort.
+    Like :func:`log_event`, this is deliberately best-effort. Results that
+    reached the raw-output boundary already carry Filmot API usage; others pick
+    up this process's usage here.
     """
     try:
+        from .api_usage import attach_usage
+
+        result = attach_usage(result)
         topic_slug = _normalize(topic) if topic else None
         migration_name = current_session() or topic
         if migration_name:
@@ -985,6 +990,8 @@ def log_event(
                         break
             migrate_legacy_session(migration_name, data_dir)
 
+        from .api_usage import snapshot as api_snapshot
+
         record = EventRecord(
             kind=kind,
             command=kind.replace("_", "-"),
@@ -993,6 +1000,8 @@ def log_event(
             errors=errors,
             topic=topic_slug,
             ts=datetime.now().isoformat(timespec="seconds"),
+            # Failure events need provider provenance as much as results do.
+            api=api_snapshot(),
         )
         _append_record(record, data_dir)
     except Exception:

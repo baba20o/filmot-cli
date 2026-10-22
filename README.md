@@ -79,7 +79,8 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 ## Requirements
 
 - Python 3.9+
-- RapidAPI account with Filmot API subscription
+- A Filmot API key from [filmot.com/api-keys](https://filmot.com/api-keys),
+  an existing RapidAPI Filmot subscription, or both
 - Optional Google Cloud YouTube Data API v3 key for `yt-search`, `yt-video`,
   `yt-playlist`, `yt-playlists`, `yt-comments`, `yt-replies`, `yt-data refresh`,
   and `channel-download`
@@ -116,8 +117,13 @@ python main.py --help
 
 ### Configure API credentials
 
-Create a `.env` file in the directory where you run Filmot:
+Filmot supports two API providers side by side. Create a `.env` file in the
+directory where you run Filmot:
 ```env
+# Direct Filmot API (recommended): create a key at https://filmot.com/api-keys
+FILMOT_API_KEY=your_filmot_api_key_here
+
+# Legacy RapidAPI gateway (optional; existing subscriptions keep working)
 RAPIDAPI_KEY=your_rapidapi_key_here
 RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com
 
@@ -125,7 +131,10 @@ RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com
 YOUTUBE_API_KEY=your_restricted_youtube_data_api_key_here
 ```
 
-Get your API key from [Filmot API on RapidAPI](https://filmot.com/api).
+Either Filmot key is enough for subtitle search, video metadata, and channel
+lookup. Features served only by the direct API need `FILMOT_API_KEY`. The
+Filmot listing on RapidAPI is private and invite-only for new users, so new
+setups should use a direct key.
 For credentials shared across projects, use Filmot's per-user `config.env`
 instead. See [Storage and configuration](#storage-and-configuration).
 Restrict `YOUTUBE_API_KEY` to the YouTube Data API and the hosts/IPs that run
@@ -133,6 +142,40 @@ Filmot. See [YouTube Data API behavior](docs/YOUTUBE_API.md) for quota, attribut
 and 30-day metadata refresh/deletion expectations. Future read-only API
 opportunities and their admission gates live in the
 [YouTube API enhancement roadmap](docs/YOUTUBE_ROADMAP.md).
+
+### API providers, routing, and credits
+
+| Policy | Subtitle search, video metadata, channel lookup | Direct-only features |
+| --- | --- | --- |
+| `auto` (default) | RapidAPI when configured, then the direct API | Direct API |
+| `direct` | Direct API | Direct API |
+| `rapidapi` | RapidAPI | Unavailable, with a clear error |
+
+Choose a policy with `FILMOT_API_PROVIDER=auto|direct|rapidapi`, or for one
+command with `filmot --api-provider direct COMMAND ...`. The `auto` policy is
+cost-aware: the direct API charges credits from a monthly allowance (an
+unscoped subtitle-search page costs 5 credits, or 1 when `--channel-id` names
+one to five channels), while a RapidAPI plan counts requests.
+
+Under `auto`, a request that fails because the provider rejected its
+credentials, ran out of quota, lacks the route, returned a server error or a
+non-JSON response, or could not be reached is retried on the other provider.
+Bad requests and response-contract violations are not retried, and a pinned
+provider never fails over. Quota exhaustion is reported immediately rather
+than retried; rate limiting still backs off before failing over.
+
+After any command that used the Filmot API, a one-line summary is printed on
+stderr:
+
+```text
+Filmot API: direct 1 request, 1 credit (7,980 credits left; resets 2026-11-19) | rapidapi 1 request | failover rapidapi -> direct on /getsearchchannels (auth)
+```
+
+`--raw` results carry the same details under `_filmot.api`: requests and cache
+hits per provider, credits charged and remaining, plan requests remaining, and
+any failovers. The session ledger records them with the command's event.
+`filmot config` shows which keys are configured and how routes resolve,
+without printing credentials. Responses are cached separately per provider.
 
 ### Storage and configuration
 

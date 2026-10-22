@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 
 
 _SENSITIVE_KEY_PARTS = (
+    "api-key",
+    "apikey",
     "authorization",
     "credential",
     "headers",
@@ -33,6 +35,14 @@ _SENSITIVE_KEYS = {
     "api_token",
     "refresh_token",
 }
+
+
+_FIXTURE_NAMES = (
+    "search_subtitles_context",
+    "search_subtitles_lines",
+    "search_channels",
+    "get_videos",
+)
 
 
 def _safe_url(value: str) -> str:
@@ -54,7 +64,7 @@ def _sanitize_string(key: str, value: str, ordinal: int) -> str:
         return "Recorded video title {:03d}".format(ordinal)
     if lowered in {"channelname", "label", "name"}:
         return "Recorded channel {:03d}".format(ordinal)
-    if lowered in {"newshortname"}:
+    if lowered in {"newshortname", "handle"}:
         return "@recorded-channel-{:03d}".format(ordinal)
     if lowered in {"token", "text", "ctx_before", "ctx_after"}:
         return {
@@ -65,7 +75,7 @@ def _sanitize_string(key: str, value: str, ordinal: int) -> str:
         }[lowered]
     if lowered in {"uploaddate", "published_at"}:
         return "2026-01-01"
-    if lowered in {"channelcountryname", "country"}:
+    if lowered in {"channelcountryname", "countryname", "country"}:
         return "Recorded country"
     if re.search(r"(?i)https?://[^/\s@]+@", value):
         return "https://example.invalid/resource"
@@ -126,6 +136,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel-term", default="SQLite")
     parser.add_argument("--video-id", default="dQw4w9WgXcQ")
     parser.add_argument(
+        "--provider",
+        choices=("auto", "direct", "rapidapi"),
+        default="auto",
+        help="Filmot API provider policy used for recording",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        choices=_FIXTURE_NAMES,
+        help="Record only this fixture (repeatable)",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="",
+        help="Append to fixture file names, e.g. _direct for provider shapes",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite existing fixture files",
@@ -141,25 +168,31 @@ def main() -> int:
     # Import only after dotenv loading: filmot.config reads credentials at
     # module import time and applies the normal explicit user/CWD files when
     # no recorder-specific file was supplied.
+    from filmot import config
     from filmot.api import FilmotClient
     from filmot.api_contract import validate_api_response
 
+    config.API_PROVIDER = args.provider
+    configured_secrets = (config.DIRECT_API_KEY, config.RAPIDAPI_KEY)
     client = FilmotClient(use_cache=False)
-    responses = {
-        "search_subtitles_context": client.search_subtitles(
+    requests_by_name = {
+        "search_subtitles_context": lambda: client.search_subtitles(
             args.query,
             lang="en",
             page=1,
             hit_format=0,
         ),
-        "search_subtitles_lines": client.search_subtitles(
+        "search_subtitles_lines": lambda: client.search_subtitles(
             args.query,
             lang="en",
             page=1,
             hit_format=1,
         ),
-        "search_channels": client.search_channels(args.channel_term),
-        "get_videos": client.get_videos(args.video_id),
+        # Record the provider's raw body; search_channels() adds canonical fields.
+        "search_channels": lambda: client.get(
+            "/getsearchchannels", params={"term": args.channel_term},
+        ),
+        "get_videos": lambda: client.get_videos(args.video_id),
     }
     endpoints = {
         "search_subtitles_context": "/getsearchsubtitles",
@@ -169,12 +202,20 @@ def main() -> int:
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    for name, response in responses.items():
+    for name in args.only or _FIXTURE_NAMES:
+        response = requests_by_name[name]()
+        if isinstance(response, dict) and "error" in response:
+            raise SystemExit("{}: {}".format(name, response["error"]))
         endpoint = endpoints[name]
         validate_api_response(endpoint, response)
         sanitized = sanitize_response(compact_response(name, response))
         validate_api_response(endpoint, sanitized)
-        destination = args.output_dir / "{}.json".format(name)
+        rendered = json.dumps(sanitized, ensure_ascii=False)
+        if any(secret and secret in rendered for secret in configured_secrets):
+            raise SystemExit(
+                "{}: refusing to write a fixture containing a configured key".format(name)
+            )
+        destination = args.output_dir / "{}{}.json".format(name, args.suffix)
         if destination.exists() and not args.force:
             raise SystemExit(
                 "{} already exists; pass --force to replace fixtures".format(

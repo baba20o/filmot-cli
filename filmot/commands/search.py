@@ -17,7 +17,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from ..session_context import current_session, session_option
-from ..api import FilmotClient
+from ..api import FilmotClient, normalize_channel_suggestions
 from ..api_contract import FilmotAPIContractError, validate_api_response
 from ..cli_support import (
     command_error as _command_error,
@@ -102,7 +102,8 @@ def _resolve_channel_filter(client, term: str, count: Optional[int]) -> tuple[st
             f'Could not resolve --channel "{term}": {response["error"]}'
         )
 
-    candidates = _channel_candidates(response)
+    # Either provider's suggestion shape gains canonical channelid/name/handle.
+    candidates = normalize_channel_suggestions(_channel_candidates(response))
     requested = max(1, count or 10)
 
     # Exact labels/handles are safer than broad fuzzy matches.  If the API
@@ -111,28 +112,22 @@ def _resolve_channel_filter(client, term: str, count: Optional[int]) -> tuple[st
     folded = term.casefold().strip().lstrip("@")
     exact = [
         item for item in candidates
-        if str(item.get("label", "")).casefold().strip() == folded
-        or str(item.get("newshortname", "")).casefold().strip().lstrip("@") == folded
+        if str(item.get("name") or "").casefold().strip() == folded
+        or str(item.get("handle") or "").casefold().strip().lstrip("@") == folded
     ]
     selected = (exact or candidates)[:requested]
-    selected = [
-        item for item in selected
-        if item.get("value") or item.get("channelid") or item.get("id")
-    ]
+    selected = [item for item in selected if item.get("channelid")]
     if not selected:
         raise click.ClickException(
             f'No channels resolved for --channel "{term}". '
             "Use `filmot channels TERM` and pass an exact --channel-id."
         )
 
-    ids = [
-        str(item.get("value") or item.get("channelid") or item.get("id"))
-        for item in selected
-    ]
+    ids = [str(item["channelid"]) for item in selected]
     normalized = [
         {
             "id": channel_id,
-            "name": str(item.get("label") or item.get("name") or item.get("title") or "Unknown"),
+            "name": str(item.get("name") or "Unknown"),
         }
         for item, channel_id in zip(selected, ids)
     ]
@@ -1824,7 +1819,9 @@ def channels(term: str, raw: bool):
         candidates = _channel_candidates(result)
         if any(not isinstance(item, dict) for item in candidates):
             raise ValueError("Every channel response item must be an object")
-        candidates = [dict(item) for item in candidates]
+        candidates = normalize_channel_suggestions(
+            [dict(item) for item in candidates]
+        )
         data: ChannelResultData = {
             "query": term,
             "channels": candidates,
@@ -1907,7 +1904,7 @@ def _display_channel_results(
 ) -> None:
     """Display channel results from the shared command-result contract."""
     term = outcome.data.get("query", "")
-    channels = outcome.data.get("channels") or []
+    channels = normalize_channel_suggestions(outcome.data.get("channels") or [])
 
     if not channels:
         console.print("[yellow]No channels found.[/yellow]")
@@ -1915,34 +1912,41 @@ def _display_channel_results(
 
     console.print(Panel(f"[bold]Found {len(channels)} channels matching: {term}[/bold]"))
 
+    # The direct API reports channel countries; the RapidAPI gateway does not.
+    show_country = any(channel.get("countryname") for channel in channels[:20])
     table = Table()
     table.add_column("#", style="dim")
     table.add_column("Channel Name", style="cyan")
     table.add_column("Handle", style="green")
     table.add_column("Subscribers", justify="right", style="yellow")
     table.add_column("Total Views", justify="right")
+    if show_country:
+        table.add_column("Country")
     table.add_column("Channel ID", style="dim")
 
     for i, channel in enumerate(channels[:20], 1):  # Limit to first 20
-        name = channel.get("label", "Unknown")
-        channel_id = channel.get("value", "")
-        handle = channel.get("newshortname", "") or ""
-        subs = channel.get("subcountp", _format_count(channel.get("subcount", 0)))
-        views = channel.get("viewcountp", _format_count(channel.get("viewcount", 0)))
+        name = str(channel.get("name") or "Unknown")
+        channel_id = str(channel.get("channelid") or "")
+        handle = str(channel.get("handle") or "")
+        subs = channel.get("subcountp") or _format_count(channel.get("subcount") or 0)
+        views = channel.get("viewcountp") or _format_count(channel.get("totalviewcount") or 0)
 
         # Add @ prefix to handle if not already there
         if handle and not handle.startswith("@"):
             handle = f"@{handle}"
 
-        table.add_row(str(i), name, handle, str(subs), str(views), channel_id)
+        row = [str(i), name, handle, str(subs), str(views)]
+        if show_country:
+            row.append(str(channel.get("countryname") or ""))
+        table.add_row(*row, channel_id)
 
     console.print(table)
 
     # Show channel URLs for the top results
     console.print("\n[dim]Top channel URLs:[/dim]")
     for i, channel in enumerate(channels[:5], 1):
-        channel_id = channel.get("value", "")
-        name = channel.get("label", "Unknown")
+        channel_id = str(channel.get("channelid") or "")
+        name = str(channel.get("name") or "Unknown")
         console.print(f"   {i}. [cyan]{name}[/cyan]: https://youtube.com/channel/{channel_id}")
 
     if len(channels) > 20:

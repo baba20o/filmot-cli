@@ -14,6 +14,7 @@ from typing import Any, Optional
 import click
 from rich.console import Console
 
+from .api_usage import attach_usage
 from .redaction import redact_sensitive_text, redact_sensitive_value
 from .schemas import CommandResult, ErrorDetail
 
@@ -76,8 +77,10 @@ def prepare_raw_result(outcome: CommandResult) -> CommandResult:
 
     Logged commands call this before ``log_result`` so a serialization failure
     cannot be reported as completed in the durable session ledger and failed on
-    stdout.
+    stdout. The returned outcome also carries this process's Filmot API usage,
+    so the ledger records the same provider and credit details as stdout.
     """
+    outcome = attach_usage(outcome)
     try:
         json.dumps(
             outcome.to_raw_dict(),
@@ -88,7 +91,7 @@ def prepare_raw_result(outcome: CommandResult) -> CommandResult:
         message = "Result is not valid JSON: {}".format(
             redact_diagnostic(error)
         )
-        return CommandResult.failed(
+        return attach_usage(CommandResult.failed(
             outcome.command,
             {"error": message},
             ErrorDetail(
@@ -96,7 +99,7 @@ def prepare_raw_result(outcome: CommandResult) -> CommandResult:
                 message=message,
                 stage="serialize-result",
             ),
-        )
+        ))
     return outcome
 
 

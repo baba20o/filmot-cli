@@ -1,0 +1,29 @@
+[
+  {
+    "channelid": "recorded-channel-001",
+    "name": "Recorded channel 001",
+    "subcount": 21,
+    "totalviewcount": 10855,
+    "countryname": "Recorded country",
+    "thumbnailurl": "https://example.invalid/resource",
+    "handle": "@recorded-channel-001"
+  },
+  {
+    "channelid": "recorded-channel-002",
+    "name": "Recorded channel 002",
+    "subcount": 31,
+    "totalviewcount": 0,
+    "countryname": "Recorded country",
+    "thumbnailurl": "https://example.invalid/resource",
+    "handle": "@recorded-channel-002"
+  },
+  {
+    "channelid": "recorded-channel-003",
+    "name": "Recorded channel 003",
+    "subcount": 3,
+    "totalviewcount": 1795,
+    "countryname": "Recorded country",
+    "thumbnailurl": "https://example.invalid/resource",
+    "handle": "@recorded-channel-003"
+  }
+]

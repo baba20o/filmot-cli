@@ -42,6 +42,47 @@ def _isolated_proxy_state(monkeypatch, tmp_path):
     transcript_module._initialized = False
 
 
+@pytest.fixture(autouse=True)
+def _isolated_api_providers(monkeypatch):
+    """Never let a test reach a live Filmot API with the developer's real keys.
+
+    ``filmot.config`` loads the working directory's ``.env`` at import, so real
+    credentials may be in the environment. Fake keys on reserved ``.invalid``
+    hosts mean an accidentally unmocked request fails without spending credits.
+    The guard below covers only these Filmot hosts; it does not block other
+    network access.
+    """
+    import requests
+
+    import filmot.config as app_config
+    from filmot import api_usage
+
+    monkeypatch.setattr(app_config, "DIRECT_API_KEY", "test-direct-key")
+    monkeypatch.setattr(app_config, "DIRECT_BASE_URL", "https://direct.filmot.invalid/api/v1")
+    monkeypatch.setattr(app_config, "RAPIDAPI_KEY", "test-rapidapi-key")
+    monkeypatch.setattr(app_config, "API_HOST", "rapidapi.filmot.invalid")
+    monkeypatch.setattr(app_config, "RAPIDAPI_BASE_URL", "https://rapidapi.filmot.invalid")
+    monkeypatch.setattr(app_config, "API_PROVIDER", "auto")
+    monkeypatch.delenv("FILMOT_API_PROVIDER", raising=False)
+
+    # Tests that mock a client's session never reach this guard; any request
+    # that does is an unmocked Filmot API call and fails the test.
+    unmocked = []
+    real_request = requests.sessions.Session.request
+
+    def guarded_request(self, method, url, *args, **kwargs):
+        if ".filmot.invalid" in str(url):
+            unmocked.append(str(url).split("?", 1)[0])
+            raise requests.exceptions.ConnectionError("unmocked Filmot API request in tests")
+        return real_request(self, method, url, *args, **kwargs)
+
+    monkeypatch.setattr(requests.sessions.Session, "request", guarded_request)
+    api_usage.reset()
+    yield
+    api_usage.reset()
+    assert not unmocked, "Test made unmocked Filmot API requests: {}".format(unmocked)
+
+
 @pytest.fixture
 def tmp_dir(tmp_path):
     """Provide a clean temporary directory."""

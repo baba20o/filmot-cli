@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
+from .api import normalize_channel_suggestion
+
 
 def export_json(data: Dict[str, Any], filepath: str, pretty: bool = True) -> str:
     """
@@ -141,13 +143,14 @@ def _export_channels_csv(data: Dict[str, Any], path: Path) -> str:
         writer.writeheader()
         
         for channel in channels:
+            channel = normalize_channel_suggestion(channel)
             row = {
-                "channel_id": channel.get("value", ""),
-                "channel_name": channel.get("label", ""),
-                "handle": channel.get("newshortname", ""),
+                "channel_id": channel.get("channelid", ""),
+                "channel_name": channel.get("name", ""),
+                "handle": channel.get("handle", ""),
                 "subscribers": channel.get("subcount", 0),
-                "total_views": channel.get("viewcount", 0),
-                "channel_url": f"https://youtube.com/channel/{channel.get('value', '')}"
+                "total_views": channel.get("totalviewcount", 0),
+                "channel_url": f"https://youtube.com/channel/{channel.get('channelid', '')}"
             }
             writer.writerow(row)
     

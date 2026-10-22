@@ -40,29 +40,44 @@ class Cache:
                 except OSError:
                     pass
 
-    def _get_cache_key(self, endpoint: str, params: Dict[str, Any]) -> str:
-        """Generate a unique cache key from endpoint and params."""
+    def _get_cache_key(
+        self,
+        endpoint: str,
+        params: Dict[str, Any],
+        namespace: Optional[str] = None,
+    ) -> str:
+        """Generate a unique cache key from endpoint, params, and provider."""
         # Sort params for consistent hashing
         sorted_params = json.dumps(params, sort_keys=True)
         key_string = f"{endpoint}:{sorted_params}"
+        if namespace:
+            # Providers can shape the same route differently, so their
+            # responses must never answer for each other.
+            key_string = f"{namespace}:{key_string}"
         return hashlib.md5(key_string.encode()).hexdigest()
     
     def _get_cache_path(self, cache_key: str) -> Path:
         """Get the file path for a cache key."""
         return self.cache_dir / f"{cache_key}.json"
     
-    def get(self, endpoint: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def get(
+        self,
+        endpoint: str,
+        params: Dict[str, Any],
+        namespace: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Retrieve a cached response if valid.
-        
+
         Args:
             endpoint: API endpoint
             params: Request parameters
-            
+            namespace: Optional provider name isolating cached responses
+
         Returns:
             Cached data if valid, None otherwise
         """
-        cache_key = self._get_cache_key(endpoint, params)
+        cache_key = self._get_cache_key(endpoint, params, namespace)
         cache_path = self._get_cache_path(cache_key)
         
         if not cache_path.exists():
@@ -81,24 +96,33 @@ class Cache:
         except (json.JSONDecodeError, IOError):
             return None
     
-    def set(self, endpoint: str, params: Dict[str, Any], data: Dict[str, Any]) -> None:
+    def set(
+        self,
+        endpoint: str,
+        params: Dict[str, Any],
+        data: Dict[str, Any],
+        namespace: Optional[str] = None,
+    ) -> None:
         """
         Store a response in the cache.
-        
+
         Args:
             endpoint: API endpoint
             params: Request parameters
             data: Response data to cache
+            namespace: Optional provider name isolating cached responses
         """
-        cache_key = self._get_cache_key(endpoint, params)
+        cache_key = self._get_cache_key(endpoint, params, namespace)
         cache_path = self._get_cache_path(cache_key)
-        
+
         cache_entry = {
             "timestamp": time.time(),
             "endpoint": endpoint,
             "params": params,
             "data": data
         }
+        if namespace:
+            cache_entry["provider"] = namespace
         
         try:
             with open(cache_path, 'w', encoding='utf-8') as f:
