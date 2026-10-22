@@ -26,6 +26,7 @@ from ..cli_support import (
     whole_word_summary as _whole_word_summary,
 )
 from ..schemas import CommandResult, ErrorDetail, ResultStatus
+from ..video_metadata import enrich_after_save, enrichment_summary_line
 from .search import (
     _backfill_metadata,
     _bulk_download_transcripts,
@@ -998,6 +999,7 @@ class _DownloadProgressConsole:
     _FINAL_PREFIXES = (
         "[yellow]No videos to download.",
         "\n[bold]Complete:",
+        "[dim]Filmot metadata:",
         "[yellow]Proxy connection failures detected",
         "[dim]View with:",
     )
@@ -1669,6 +1671,25 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                             discovery_ref=discovery_ref,
                             error=message,
                         )
+                # After any YouTube lifecycle registration, so Filmot leaves
+                # YouTube-owned fields to it.
+                filmot_summary = enrich_after_save(
+                    library,
+                    [(save_to, transcript_data["video_id"])],
+                    FilmotClient,
+                    source="transcript",
+                )
+                if filmot_summary is not None:
+                    deferred_diagnostics.append(
+                        "[dim]{}[/dim]".format(enrichment_summary_line(filmot_summary))
+                    )
+                    outcome.warnings.extend(
+                        "Filmot metadata enrichment failed: {}".format(
+                            _whole_word_summary(item["error"], 500)
+                        )
+                        for item in filmot_summary["outcomes"]
+                        if item.get("error")
+                    )
                 log_event(
                     "transcript_save",
                     topic=save_to,

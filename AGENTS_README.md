@@ -363,6 +363,26 @@ record, writes strict JSON to a unique same-directory temporary, flushes and
 `fsync`s it, and atomically replaces the destination, so a failure before that
 replace preserves any existing record.
 
+After saving, every save path looks up the new records in Filmot's index, one
+`/getvideos` call per 200 videos (2 direct-API credits per call). It fills only
+missing fields: unknown title and channel, description, view and like counts,
+category, caption languages, license, flags, and channel details. Counts filled
+this way get Filmot's snapshot date in `views_observed_at`. `caption_languages`
+holds `automatic` and `manual` lists. An empty list means the video has none of
+that kind. A missing part means Filmot's record did not say, and a later lookup
+can still fill it. Each enriched record
+carries a `filmot_enrichment` block (`provider`, `enriched_at`, `observed_at`,
+`api_provider`, `filled_fields`). On records with YouTube Data API metadata,
+Filmot leaves the YouTube-owned fields to `yt-data`. On a record Filmot enriched
+first, a later `yt-data refresh` keeps those Filmot values and lists them in
+`conflict_paths`. A failed lookup never fails
+the save. `transcript --raw` reports it in `_filmot.warnings`. `research --raw`
+results and the logged `download` result include `filmot_metadata` counts
+(`records`, `updated`, `unchanged`, `not_returned`, `failed`,
+`lookup_errors`). The ledger gets one
+`filmot_enrichment` event per save batch. `FILMOT_ENRICH_ON_SAVE=0` turns the
+lookup off, and it is skipped when no Filmot key is configured.
+
 ### Bulk Download from Search
 
 ```bash
@@ -413,6 +433,11 @@ filmot library context prompt-injection --output exports/prompts/context.txt
 # Show library statistics
 filmot library stats
 
+# Fill missing metadata from Filmot's index: preview, then run
+filmot library enrich --dry-run --raw
+filmot library enrich prompt-injection --raw
+filmot library enrich --video VIDEO_ID --raw
+
 # Assign one ambiguous legacy directory after reviewing its ownership
 filmot library migrate-topic "AI 人工知能"
 
@@ -431,6 +456,17 @@ directories; parent-creation or file-write errors return the same typed
 `write-output` failure, exit nonzero, and log a failed delivery.
 `library echoes` never logs, even with `--persist`. Raw mode does not alter
 these rules.
+
+`library enrich [TOPIC]` repairs records saved before save-time lookups existed,
+or while they were off. By default it selects records with no
+`filmot_enrichment` block. `--video ID` (repeatable or comma-separated) selects
+exact IDs in every topic, `--all` rechecks enriched records, and
+`--max-videos` (default 1000) bounds unique IDs. `--dry-run` makes no request,
+writes nothing, and logs nothing. Its `summary` reports `selected_records`,
+`selected_videos`, `planned_calls`, and `unreadable_records`. A real run adds
+the outcome counts, returns one row per record (`status` is `updated`,
+`unchanged`, `not_returned`, or `failed`, with `filled_fields`), and is `failed`
+only when every selected record failed. A truncated selection is `partial`.
 
 ### Library Search: Word-Boundary Matching
 
@@ -1614,6 +1650,8 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Audit saved YouTube expiry** | `filmot yt-data status --expired --raw` |
 | **Refresh expired YouTube fields** | `filmot yt-data refresh --dry-run` then `filmot yt-data refresh` |
 | **Purge expired YouTube fields** | `filmot yt-data purge --dry-run` then `filmot yt-data purge --yes` |
+| **Fill missing library metadata from Filmot** | `filmot library enrich --dry-run` then `filmot library enrich` |
+| **Filmot-index video details** | `filmot video ID1,ID2 --raw` (add `--basic` for 1 direct credit) |
 | **Named follow-up search** | `filmot search "query" --session TOPIC` |
 | **Locate a phrase across sources** | `filmot library compare "claim phrase" --sort density` |
 | **Raw local citations** | `filmot library compare "claim phrase" --topic TOPIC --raw` |

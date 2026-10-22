@@ -24,6 +24,15 @@ MAX_RETRIES = 4
 DEFAULT_RETRY_WAIT = 5  # seconds, if no Retry-After header
 DEFAULT_REQUEST_TIMEOUT = (10, 45)  # connect, read seconds
 
+# Every non-subtitle /getvideos column. Raw subtitles are requested separately
+# because selecting them caps a batch at 10 IDs instead of 200.
+VIDEO_METADATA_COLUMNS = (
+    "description", "category", "viewcount", "likecount", "autosubs",
+    "manualsubs", "isunlisted", "islivestream", "license", "ispartialdata",
+    "lastfetchdate", "channelsubcount", "channelcountryname",
+)
+VIDEO_BATCH_LIMIT = 200
+
 # Canonical channel-suggestion fields follow the direct API; the RapidAPI
 # gateway returns the same values under legacy names.
 _CHANNEL_FIELD_ALIASES = (
@@ -461,13 +470,23 @@ class FilmotClient:
             self.get("/getsearchchannels", params={"term": term})
         )
 
-    def get_videos(self, video_ids: str, flags: Optional[int] = None) -> Any:
+    def get_videos(
+        self,
+        video_ids: str,
+        flags: Optional[int] = None,
+        columns: Optional[Any] = None,
+        lang: Optional[str] = None,
+    ) -> Any:
         """
-        Get basic metadata for a single video or list of videos.
+        Get metadata for a single video or list of videos.
 
         Args:
             video_ids: Single video ID or comma-separated list (e.g., "dQw4w9WgXcQ")
-            flags: Optional flags parameter
+            flags: Optional legacy flags parameter
+            columns: Optional extra fields, as a list or comma-separated string.
+                Either provider accepts ``VIDEO_METADATA_COLUMNS``; requesting
+                columns costs 2 direct-API credits instead of 1.
+            lang: Optional subtitle base-language token
 
         Returns:
             Video metadata
@@ -475,6 +494,10 @@ class FilmotClient:
         params = {"id": video_ids}
         if flags is not None:
             params["flags"] = flags
+        if columns:
+            params["columns"] = columns if isinstance(columns, str) else ",".join(columns)
+        if lang:
+            params["lang"] = lang
         return self.get("/getvideos", params=params)
 
     def search_subtitles(

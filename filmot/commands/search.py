@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
+from rich.text import Text
 
 from ..session_context import current_session, session_option
 from ..api import FilmotClient, normalize_channel_suggestions
@@ -1130,18 +1131,23 @@ def _backfill_metadata(video_id: str, title: str, channel: str) -> tuple:
     """
     if title not in ("Unknown", "") and channel not in ("Unknown", ""):
         return title, channel
+    from ..video_metadata import video_rows
+
     try:
         client = FilmotClient()
-        info = client.get_videos(video_id)
-        videos = info.get("result", info.get("videos", []))
-        if videos:
-            v = videos[0] if isinstance(videos, list) else videos
-            if title in ("Unknown", ""):
-                title = v.get("title", v.get("name", title))
-            if channel in ("Unknown", ""):
-                channel = v.get("channelname", v.get("channeltitle", channel))
+        rows = video_rows(client.get_videos(video_id))
     except Exception:
-        pass
+        return title, channel
+    # A row without an ID can only be the one video requested.
+    match = next(
+        (row for row in rows if (row.get("id") or row.get("videoid") or video_id) == video_id),
+        None,
+    )
+    if match is not None:
+        if title in ("Unknown", ""):
+            title = str(match.get("title") or match.get("name") or title)
+        if channel in ("Unknown", ""):
+            channel = str(match.get("channelname") or match.get("channeltitle") or channel)
     return title, channel
 
 
@@ -1174,6 +1180,11 @@ def _bulk_download_transcripts(
         get_transcript,
         get_transcript_with_fallback,
         routing_plan,
+    )
+    from ..video_metadata import (
+        enrich_after_save,
+        enrichment_counts,
+        enrichment_summary_line,
     )
 
     # Parse bulk_download format: "topic:10" or just "topic".
@@ -1219,6 +1230,7 @@ def _bulk_download_transcripts(
     dedupe_count = 0
     metadata_failure_count = 0
     proxy_errors = False
+    saved_records = []
 
     # Build dedup hash set from existing library entries
     seen_hashes = set()
@@ -1422,6 +1434,7 @@ def _bulk_download_transcripts(
                 discovery_provenance=video.get("provenance") or None,
             )
             success_count += 1
+            saved_records.append((topic, video_id))
             console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {title[:50]}...")
 
         except Exception as e:
@@ -1442,6 +1455,10 @@ def _bulk_download_transcripts(
     summary = f"\n[bold]Complete:[/bold] {success_count} saved, {skip_count} skipped, {fail_count} failed"
     if dedupe_count:
         summary += f", {dedupe_count} deduplicated"
+    # One batched lookup, after every YouTube lifecycle registration above.
+    filmot_summary = enrich_after_save(
+        library, saved_records, FilmotClient, source="bulk_download",
+    )
     outcome = {
         "selected": len(videos_to_download),
         "saved": success_count,
@@ -1450,6 +1467,8 @@ def _bulk_download_transcripts(
         "deduped": dedupe_count,
         "metadata_failures": metadata_failure_count,
     }
+    if filmot_summary is not None:
+        outcome["filmot_metadata"] = enrichment_counts(filmot_summary)
     log_event(
         "bulk_download",
         topic=topic,
@@ -1467,6 +1486,8 @@ def _bulk_download_transcripts(
         **outcome,
     )
     console.print(summary)
+    if filmot_summary is not None:
+        console.print(f"[dim]{enrichment_summary_line(filmot_summary)}[/dim]")
     if proxy_errors:
         console.print("[yellow]Proxy connection failures detected — your proxy may be down. Try --no-proxy to connect directly.[/yellow]")
     console.print(f"[dim]View with: filmot library list {topic}[/dim]")
@@ -1615,24 +1636,30 @@ def _display_subtitle_results(
 @click.command()
 @click.argument("video_ids")
 @click.option("--flags", "-f", default=None, type=int, help="Flags parameter")
+@click.option("--basic", is_flag=True, help="Only base fields (1 direct-API credit instead of 2)")
 @click.option("--raw", is_flag=True, help="Output one versioned JSON result")
-def video(video_ids: str, flags: int, raw: bool):
+def video(video_ids: str, flags: int, basic: bool, raw: bool):
     """Get metadata for one or more videos.
 
-    VIDEO_IDS can be a single ID or comma-separated list.
+    VIDEO_IDS can be a single ID or comma-separated list (up to 200). By
+    default this includes description, views, likes, category, caption
+    languages, license, and Filmot's snapshot date; --basic returns only
+    title, channel, duration, and upload date.
 
     Examples:
 
         filmot video dQw4w9WgXcQ
 
-        filmot video "dQw4w9WgXcQ,abc123,xyz789"
+        filmot video "dQw4w9WgXcQ,abc123,xyz789" --basic
     """
+    from ..api import VIDEO_METADATA_COLUMNS
     from ..ledger import log_event, log_result
 
+    columns = None if basic else VIDEO_METADATA_COLUMNS
     try:
         client = FilmotClient()
         with _search_status("[bold green]Fetching video metadata...", raw=raw):
-            result = client.get_videos(video_ids, flags=flags)
+            result = client.get_videos(video_ids, flags=flags, columns=columns)
 
         if isinstance(result, dict) and "error" in result:
             log_event(
@@ -1663,6 +1690,7 @@ def video(video_ids: str, flags: int, raw: bool):
         videos = [dict(item) for item in videos]
         data: VideoResultData = {
             "video_ids": video_ids,
+            "detail": "basic" if basic else "full",
             "videos": videos,
         }
         outcome = CommandResult(
@@ -1682,6 +1710,7 @@ def video(video_ids: str, flags: int, raw: bool):
             data={
                 "video_ids": video_ids,
                 "flags": flags,
+                "detail": data["detail"],
                 "results": len(videos),
                 "raw": raw,
             },
@@ -1729,6 +1758,8 @@ def _display_video_results(
     outcome: CommandResult[VideoResultData],
 ) -> None:
     """Display video metadata from the shared command-result contract."""
+    from ..video_metadata import caption_languages, creative_commons
+
     videos = outcome.data.get("videos") or []
 
     if not videos:
@@ -1751,35 +1782,61 @@ def _display_video_results(
 
         duration_str = _format_duration(duration)
 
-        table = Table(title=f"[bold]{title}[/bold]", show_header=False)
+        # Upstream text is shown literally, never parsed as Rich markup.
+        table = Table(title=Text(str(title), style="bold"), show_header=False)
         table.add_column("Field", style="cyan")
         table.add_column("Value")
 
-        table.add_row("Video ID", video_id)
+        table.add_row("Video ID", Text(str(video_id)))
         table.add_row("Duration", duration_str)
-        table.add_row("Uploaded", upload_date)
+        table.add_row("Uploaded", Text(str(upload_date)))
         if views:
             table.add_row("Views", f"{views:,}")
         if likes:
             table.add_row("Likes", f"{likes:,}")
         if category:
-            table.add_row("Category", category)
+            table.add_row("Category", Text(str(category)))
         if lang:
-            table.add_row("Language", lang)
-        table.add_row("Channel", channel)
-        table.add_row("Channel ID", channel_id)
+            table.add_row("Language", Text(str(lang)))
+        table.add_row("Channel", Text(str(channel)))
+        table.add_row("Channel ID", Text(str(channel_id)))
         if channel_subs:
             table.add_row("Channel Subscribers", _format_count(channel_subs))
         if channel_country:
-            table.add_row("Channel Country", channel_country)
-        table.add_row("Video URL", f"https://youtube.com/watch?v={video_id}")
-        table.add_row("Channel URL", f"https://youtube.com/channel/{channel_id}")
+            table.add_row("Channel Country", Text(str(channel_country)))
+        for field, label in (("autosubs", "Auto Captions"), ("manualsubs", "Manual Captions")):
+            if field in video:
+                # Blank means none; null means Filmot's record does not say.
+                value = video[field]
+                shown = (
+                    (", ".join(caption_languages(value)) or "none")
+                    if isinstance(value, str) else "unknown"
+                )
+                table.add_row(label, Text(shown))
+        license_cc = creative_commons(video.get("license"))
+        if license_cc is not None:
+            table.add_row("License", "Creative Commons" if license_cc else "Standard YouTube")
+        for field, label in (("isunlisted", "Unlisted"), ("islivestream", "Livestream")):
+            if video.get(field) in (1, "1"):
+                table.add_row(label, "yes")
+        if video.get("ispartialdata") in (1, "1"):
+            table.add_row("Data", "partial record in Filmot's index")
+        if video.get("lastfetchdate"):
+            table.add_row("Filmot Snapshot", Text(str(video["lastfetchdate"])))
+        description = str(video.get("description") or "").strip()
+        if description:
+            shown = description if len(description) <= 400 else description[:400].rstrip() + "…"
+            table.add_row("Description", Text(shown))
+        table.add_row("Video URL", Text(f"https://youtube.com/watch?v={video_id}"))
+        table.add_row("Channel URL", Text(f"https://youtube.com/channel/{channel_id}"))
 
         console.print(table)
 
-        # Warn if views/likes are missing (API returns sparse data for some endpoints)
-        if not views and not likes and not category:
-            console.print("[dim]Note: Views, likes, and category not available from this endpoint. Use 'filmot search' for full metadata.[/dim]")
+        if outcome.data.get("detail") == "basic":
+            console.print(
+                "[dim]Basic fields only. Run without --basic for views, likes, "
+                "category, caption languages, license, and description.[/dim]"
+            )
 
 
 # ========== SEARCH CHANNELS ==========

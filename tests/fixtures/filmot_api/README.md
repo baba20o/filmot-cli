@@ -24,6 +24,18 @@ python scripts/record_filmot_api_fixtures.py --provider direct \
 
 Each direct API request spends credits (`/getsearchchannels` costs 1).
 
+`get_videos_columns.json` was recorded on 2026-10-22 through the RapidAPI
+gateway with every column `filmot video` requests. Its description and
+snapshot date are replaced like the other human-readable content and dates.
+Refresh it with:
+
+```bash
+python scripts/record_filmot_api_fixtures.py --only get_videos_columns --force
+```
+
+Under the default `auto` policy that request uses RapidAPI. With
+`--provider direct` it costs 2 credits.
+
 The recorder validates both the live body and its sanitized form. Runtime
 validation accepts additive fields but returns a machine-readable error when a
 required container or consumed field changes incompatibly.

@@ -22,6 +22,7 @@ FIXTURE_ENDPOINTS = {
     "search_channels.json": "/getsearchchannels",
     "search_channels_direct.json": "/getsearchchannels",
     "get_videos.json": "/getvideos",
+    "get_videos_columns.json": "/getvideos",
 }
 
 
@@ -83,6 +84,32 @@ def test_search_contract_flags_container_type_drift():
 
     assert caught.value.path == "$.result"
     assert caught.value.actual == "dict"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("viewcount", "many"),
+    ("likecount", True),
+    ("description", 5),
+    ("license", True),
+    ("isunlisted", "yes"),
+    ("autosubs", ["en"]),
+])
+def test_video_contract_flags_drift_in_consumed_optional_columns(field, value):
+    payload = _fixture("get_videos_columns.json")
+    payload[0][field] = value
+
+    with pytest.raises(FilmotAPIContractError) as caught:
+        validate_api_response("/getvideos", payload)
+
+    assert caught.value.path == "$[0].{}".format(field)
+
+
+def test_video_contract_accepts_absent_null_and_legacy_optional_columns():
+    payload = _fixture("get_videos_columns.json")
+    payload[0].update(description=None, likecount=None, license=2, isunlisted=True)
+    del payload[0]["autosubs"]
+
+    assert validate_api_response("/getvideos", payload) is payload
 
 
 def test_supported_error_envelope_remains_a_normal_api_failure():

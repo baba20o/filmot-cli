@@ -257,6 +257,7 @@ class VideoResultData(TypedDict, total=False):
     """Normalized metadata payload emitted by the ``video`` command."""
 
     video_ids: str
+    detail: str
     videos: List[Dict[str, Any]]
 
 
@@ -380,6 +381,7 @@ class ResearchResultData(TypedDict, total=False):
     probe_download_failed: int
     probe_query_failed: int
     chars: int
+    filmot_metadata: Dict[str, int]
     sources: List[Dict[str, Any]]
     routing_plan: Dict[str, Any]
 

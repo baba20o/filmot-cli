@@ -34,6 +34,21 @@ recorded in `docs/FIELD_TEST_LOG.md`.
   `/getsearchchannels` records gain the direct API's `channelid`, `name`,
   `handle`, and `totalviewcount` fields while keeping their original fields.
   `channels` shows a Country column when the provider supplies one.
+- Richer Filmot video metadata on both providers. `video` now requests
+  `/getvideos` columns and shows the description, view and like counts,
+  category, automatic and manual caption languages, license, unlisted and
+  livestream flags, channel subscribers and country, and Filmot's snapshot date.
+  `--basic` keeps the old fields at 1 direct credit instead of 2. Runtime
+  contract validation covers the optional columns it consumes.
+- Library saves fill in missing metadata from Filmot. `transcript --save-to`,
+  `search --bulk-download`, `download`, and `research` look up the videos they
+  saved, one call per 200 videos, and fill only missing fields. Counts get
+  Filmot's snapshot date, and each record gets a `filmot_enrichment`
+  provenance block. On records with YouTube Data API metadata, Filmot fills
+  only fields YouTube does not own, so `yt-data refresh` and `purge` keep every
+  YouTube field. `FILMOT_ENRICH_ON_SAVE=0` turns the lookup off.
+- `library enrich [TOPIC]`, with `--video`, `--all`, `--max-videos`,
+  `--dry-run`, and `--raw`, repairs existing records in batches.
 - `docs/YOUTUBE_ROADMAP.md`, a durable ranked queue for future public read surfaces,
   OAuth/policy gates, and the admission checklist for each new YouTube slice.
 - Named search-session routing through `--session` and `FILMOT_SESSION`, with
@@ -239,6 +254,12 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- Filling in an unknown title and channel during bulk download and research
+  silently did nothing, because `/getvideos` returns a list and the lookup
+  expected an object. Those saves recorded "Unknown". The lookup now takes the
+  row matching the requested video from any response shape.
+- A provider's `repr` no longer includes its base URL, which an override could
+  give userinfo credentials.
 - An exhausted Filmot credit or plan quota (`429`) is reported immediately as
   `FilmotQuotaExhausted`, with cost, usage, limit, and reset time. Previously
   the client retried it like rate limiting for about 75 seconds before failing.
