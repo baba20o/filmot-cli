@@ -1,10 +1,13 @@
 """Shared test fixtures for Filmot CLI tests."""
 
+import inspect
 import os
 import pytest
 import tempfile
 import shutil
 from pathlib import Path
+
+from click.testing import CliRunner
 
 # Ensure tests run isolated from the developer's real Webshare credentials.
 # Individual tests opt back in by setting these or patching ``filmot.proxy_pool.get_pool``.
@@ -43,6 +46,21 @@ def _isolated_proxy_state(monkeypatch, tmp_path):
 def tmp_dir(tmp_path):
     """Provide a clean temporary directory."""
     return tmp_path
+
+
+@pytest.fixture
+def stream_runner():
+    """CliRunner whose results keep stdout and stderr apart on every supported Click.
+
+    Click 8.2+ always captures the streams separately (``output`` interleaves
+    both). Click 8.1, the newest release for Python 3.9, mixes stderr into
+    ``result.stdout`` unless ``mix_stderr=False`` is passed, an argument 8.2
+    removed; ``result.output`` then omits stderr. Use this runner for tests that
+    parse stdout or inspect stderr.
+    """
+    if "mix_stderr" in inspect.signature(CliRunner.__init__).parameters:
+        return CliRunner(mix_stderr=False)
+    return CliRunner()
 
 
 @pytest.fixture

@@ -300,7 +300,7 @@ def test_transcript_grep_filters_invalid_copy_before_ambiguity(runner):
     assert log_result.call_args.kwargs["topic"] == "valid-times"
 
 
-def test_transcript_grep_raw_cache_fallback_reason_stays_on_stderr(runner):
+def test_transcript_grep_raw_cache_fallback_reason_stays_on_stderr(stream_runner):
     from filmot.library import get_library
 
     _save_grep_record(
@@ -317,7 +317,7 @@ def test_transcript_grep_raw_cache_fallback_reason_stays_on_stderr(runner):
         patch("filmot.transcript.routing_plan", return_value=_route_plan()),
         patch("filmot.ledger.log_result"),
     ):
-        result = runner.invoke(
+        result = stream_runner.invoke(
             cli,
             ["transcript", "abc12345678", "--grep", "alpha", "--raw"],
         )
@@ -329,7 +329,7 @@ def test_transcript_grep_raw_cache_fallback_reason_stays_on_stderr(runner):
     assert "trustworthy timestamp" not in result.stdout
 
 
-def test_transcript_grep_raw_has_stable_match_rows(runner):
+def test_transcript_grep_raw_has_stable_match_rows(stream_runner):
     from filmot.library import get_library
 
     _save_grep_record(get_library(), topic="raw-topic")
@@ -337,7 +337,7 @@ def test_transcript_grep_raw_has_stable_match_rows(runner):
         patch("filmot.transcript.get_transcript") as fetch,
         patch("filmot.ledger.log_result") as log_result,
     ):
-        result = runner.invoke(
+        result = stream_runner.invoke(
             cli,
             ["transcript", "abc12345678", "--grep", "alpha", "--raw"],
         )
@@ -357,12 +357,12 @@ def test_transcript_grep_raw_has_stable_match_rows(runner):
     assert log_result.call_args.args[1].to_raw_dict() == payload
 
 
-def test_transcript_grep_raw_no_match_is_typed_empty(runner):
+def test_transcript_grep_raw_no_match_is_typed_empty(stream_runner):
     from filmot.library import get_library
 
     _save_grep_record(get_library(), topic="raw-topic")
     with patch("filmot.ledger.log_result") as log_result:
-        result = runner.invoke(
+        result = stream_runner.invoke(
             cli,
             ["transcript", "abc12345678", "--grep", "omega", "--raw"],
         )

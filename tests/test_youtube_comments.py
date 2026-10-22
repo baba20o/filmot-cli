@@ -122,10 +122,10 @@ def assert_traceback_is_credential_free(error, session=None):
     assert error.__context__ is None
     traceback = error.__traceback__
     frames = []
-    package_root = str(Path(comments.__file__).resolve().parent)
+    package_root = Path(comments.__file__).resolve().parent
     while traceback is not None:
-        filename = str(Path(traceback.tb_frame.f_code.co_filename).resolve())
-        if filename.startswith(package_root + "/"):
+        filename = Path(traceback.tb_frame.f_code.co_filename).resolve()
+        if package_root in filename.parents:
             frames.append(traceback.tb_frame)
         traceback = traceback.tb_next
     assert frames

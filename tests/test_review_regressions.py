@@ -21,7 +21,8 @@ from click.testing import CliRunner
 def runner():
     # Modern Click exposes stdout and stderr separately on Result while keeping
     # their interleaved form in ``output``. Older supported Click releases also
-    # work with the argument-free runner; ``mix_stderr`` was removed in 8.5.
+    # work with the argument-free runner; ``mix_stderr`` was removed in 8.2.
+    # Use the shared ``stream_runner`` fixture when stdout must be stderr-free.
     return CliRunner()
 
 
