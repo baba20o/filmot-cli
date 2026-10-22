@@ -263,6 +263,26 @@ def _validate_search_channels(endpoint: str, payload: Any) -> None:
             )
 
 
+# Optional /getvideos ``columns`` the CLI displays and saves. Absent or null is
+# fine (``--basic``, partial index records); any other type is drift.
+_OPTIONAL_VIDEO_FIELDS: dict[str, Tuple[ExpectedType, str]] = {
+    "description": (str, "string"),
+    "category": (str, "string"),
+    "autosubs": (str, "string"),
+    "manualsubs": (str, "string"),
+    "lastfetchdate": (str, "string"),
+    "channelcountryname": (str, "string"),
+    # Current endpoints send "CC" or ""; legacy search encodes 2 or 1.
+    "license": ((str, int), "string or int"),
+    "viewcount": (int, "int"),
+    "likecount": (int, "int"),
+    "channelsubcount": (int, "int"),
+    "isunlisted": ((int, bool), "int or bool"),
+    "islivestream": ((int, bool), "int or bool"),
+    "ispartialdata": ((int, bool), "int or bool"),
+}
+
+
 def _validate_video_record(endpoint: str, value: Any, path: str) -> None:
     video = _expect_mapping(endpoint, path, value)
     _expect_field(endpoint, path, video, "id", str)
@@ -278,6 +298,9 @@ def _validate_video_record(endpoint: str, value: Any, path: str) -> None:
     _expect_field(endpoint, path, video, "uploaddate", str)
     _expect_field(endpoint, path, video, "channelid", str)
     _expect_field(endpoint, path, video, "channelname", str)
+    for field, (expected_type, label) in _OPTIONAL_VIDEO_FIELDS.items():
+        if video.get(field) is not None:
+            _expect_field(endpoint, path, video, field, expected_type, label)
 
 
 def _validate_get_videos(endpoint: str, payload: Any) -> None:

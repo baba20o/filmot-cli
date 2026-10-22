@@ -42,6 +42,7 @@ _FIXTURE_NAMES = (
     "search_subtitles_lines",
     "search_channels",
     "get_videos",
+    "get_videos_columns",
 )
 
 
@@ -75,6 +76,12 @@ def _sanitize_string(key: str, value: str, ordinal: int) -> str:
         }[lowered]
     if lowered in {"uploaddate", "published_at"}:
         return "2026-01-01"
+    if lowered == "lastfetchdate":
+        # Keep the upstream layout (date-only today); replace only the instant.
+        value = re.sub(r"\d{4}-\d{2}-\d{2}", "2026-01-02", value)
+        return re.sub(r"\d{2}:\d{2}:\d{2}", "03:04:05", value)
+    if lowered == "description":
+        return "Recorded video description"
     if lowered in {"channelcountryname", "countryname", "country"}:
         return "Recorded country"
     if re.search(r"(?i)https?://[^/\s@]+@", value):
@@ -169,7 +176,7 @@ def main() -> int:
     # module import time and applies the normal explicit user/CWD files when
     # no recorder-specific file was supplied.
     from filmot import config
-    from filmot.api import FilmotClient
+    from filmot.api import VIDEO_METADATA_COLUMNS, FilmotClient
     from filmot.api_contract import validate_api_response
 
     config.API_PROVIDER = args.provider
@@ -193,12 +200,16 @@ def main() -> int:
             "/getsearchchannels", params={"term": args.channel_term},
         ),
         "get_videos": lambda: client.get_videos(args.video_id),
+        "get_videos_columns": lambda: client.get_videos(
+            args.video_id, columns=VIDEO_METADATA_COLUMNS,
+        ),
     }
     endpoints = {
         "search_subtitles_context": "/getsearchsubtitles",
         "search_subtitles_lines": "/getsearchsubtitles",
         "search_channels": "/getsearchchannels",
         "get_videos": "/getvideos",
+        "get_videos_columns": "/getvideos",
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

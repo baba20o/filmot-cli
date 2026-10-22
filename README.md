@@ -769,7 +769,7 @@ filmot search "нейросеть" --lang ru --full
 
 ### Get Filmot Video Metadata
 
-Retrieve Filmot-index metadata for one or more YouTube videos. Use
+Retrieve Filmot-index metadata for up to 200 YouTube videos at once. Use
 [`yt-video`](#fetch-exact-youtube-video-metadata) for a current public YouTube
 Data API observation:
 
@@ -780,9 +780,20 @@ filmot video dQw4w9WgXcQ
 # Multiple videos (comma-separated)
 filmot video "dQw4w9WgXcQ,aqz-KE-bpKQ,M7lc1UVf-VE"
 
+# Title, channel, duration, and upload date only
+filmot video dQw4w9WgXcQ --basic
+
 # Raw JSON output
 filmot video dQw4w9WgXcQ --raw
 ```
+
+By default `video` also shows the description, view and like counts, category,
+automatic and manual caption languages, license (Creative Commons or standard),
+unlisted and livestream flags, channel subscribers and country, and the date of
+Filmot's snapshot. These come from Filmot's index, which may lag YouTube; the
+snapshot date says how old they are. Both providers serve the full lookup. On
+the direct API it costs 2 credits per call, and `--basic` costs 1. Raw output
+marks the lookup with `"detail": "full"` or `"basic"`.
 
 ### Download Transcripts
 
@@ -1005,6 +1016,44 @@ manual or other-provider metadata, citations, acquisition details, and the
 lifecycle audit record. Mutations are guarded and atomic per record, but a
 multi-record refresh or purge is not one cross-record transaction.
 
+### Filmot Metadata in the Library
+
+Every library save (`transcript --save-to`, `search --bulk-download`,
+`download`, and `research`) looks up the videos it just saved in Filmot's index.
+It makes one call per 200 videos and fills in missing fields: title and channel
+when they were unknown, description, view and like counts, category, caption
+languages, license, flags, and channel details. Known values are never
+overwritten. Counts filled this way carry Filmot's snapshot date in
+`views_observed_at`, and the record keeps a `filmot_enrichment` block saying
+what was filled, when, and through which provider. The lookup is best effort:
+if it fails, the transcript is still saved and the command reports the failure.
+It is skipped silently when no Filmot key is configured. To turn it off, set
+`FILMOT_ENRICH_ON_SAVE=0`.
+
+Records saved before this feature, or while it was off, can be repaired in
+batches:
+
+```bash
+# Preview: records Filmot never enriched, and how many calls they need
+filmot library enrich --dry-run
+
+# Enrich one topic, or exact videos in every topic
+filmot library enrich ufo-research
+filmot library enrich --video dQw4w9WgXcQ,aqz-KE-bpKQ --raw
+
+# Recheck records Filmot already enriched, within a video budget
+filmot library enrich --all --max-videos 400
+```
+
+On a record with YouTube Data API metadata (a YouTube discovery, or any
+`yt-data` lifecycle), Filmot fills only fields YouTube does not provide:
+category, caption languages, license, flags, and channel details. Title,
+description, counts, and the other YouTube fields stay with
+`yt-data refresh` and `purge`. The reverse also holds: on a record Filmot
+enriched first, a later `yt-data refresh` keeps Filmot's title, description,
+and counts. It reports them under `conflict_paths` instead of replacing them,
+like any value another source filled.
+
 ### Transcript Library
 
 Manage a local library of transcripts organized by topic for building curated knowledge bases:
@@ -1054,6 +1103,9 @@ filmot library context deep-sea-mining --output exports/deep-sea/context.txt
 
 # Show library statistics
 filmot library stats
+
+# Fill missing metadata from Filmot's index (see "Filmot Metadata in the Library")
+filmot library enrich deep-sea-mining
 
 # Explicitly assign an ambiguous pre-Unicode topic directory
 filmot library migrate-topic "AI 人工知能"

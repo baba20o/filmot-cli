@@ -31,6 +31,11 @@ from ..schemas import (
     ResearchResultData,
     ResultStatus,
 )
+from ..video_metadata import (
+    enrich_after_save,
+    enrichment_counts,
+    enrichment_summary_line,
+)
 from .search import (
     _backfill_metadata,
     _detect_echo_clusters,
@@ -971,6 +976,8 @@ def research(
     search_page_errors = []
     scout_error = None
     recorded_outcome = None
+    saved_records = []
+    filmot_metadata = None
 
     def aggregate_data(*, include_sources=True) -> ResearchResultData:
         """Build the one result payload used by renderer and ledger."""
@@ -992,6 +999,7 @@ def research(
             "probe_download_failed": probe_fail_count,
             "probe_query_failed": probe_query_fail_count,
             "chars": total_chars + probe_chars,
+            **({"filmot_metadata": filmot_metadata} if filmot_metadata is not None else {}),
             "sources": (
                 library.list_transcripts(normalized_topic)
                 if library is not None and include_sources
@@ -1898,6 +1906,7 @@ def research(
                     segments=transcript_result.get("segments", []),
                 )
                 success_count += 1
+                saved_records.append((normalized_topic, video_id))
                 total_chars += len(full_text)
                 checkpoint(
                     "download_item",
@@ -2437,6 +2446,7 @@ def research(
                             segments=transcript_result.get("segments", []),
                         )
                         probe_success += 1
+                        saved_records.append((normalized_topic, video_id))
                         probe_chars += len(full_text)
                         checkpoint(
                             "probe_download",
@@ -2500,6 +2510,15 @@ def research(
                 )
         else:
             checkpoint("probe", status="disabled")
+
+        # One batched lookup fills what search hits lack: description,
+        # counts with their snapshot date, caption languages, and license.
+        filmot_summary = enrich_after_save(
+            library, saved_records, lambda: client, source="research",
+        )
+        if filmot_summary is not None:
+            filmot_metadata = enrichment_counts(filmot_summary)
+            console.print(f"[dim]{enrichment_summary_line(filmot_summary)}[/dim]")
 
         total_item_failure = (
             selected_count > 0

@@ -480,6 +480,16 @@ def _legacy_youtube_provenance(raw: Dict[str, Any]) -> bool:
     )
 
 
+def _has_youtube_provenance(raw: Dict[str, Any]) -> bool:
+    """True when the YouTube lifecycle owns, or may adopt, this record's fields."""
+    lifecycle_root = raw.get("metadata_lifecycle")
+    if lifecycle_root is not None and (
+        not isinstance(lifecycle_root, dict) or "youtube" in lifecycle_root
+    ):
+        return True
+    return _legacy_youtube_provenance(raw)
+
+
 def _legacy_youtube_owned_paths(raw: Dict[str, Any]) -> List[str]:
     """Infer only the documented pre-contract YouTube fields."""
     if not _legacy_youtube_provenance(raw):
@@ -1063,6 +1073,7 @@ class TranscriptLibrary:
         candidate: Dict[str, Any],
         *,
         provenance: Optional[Dict[str, Any]] = None,
+        filmot_snapshot: bool = False,
     ) -> Dict[str, Any]:
         """Fill only missing source metadata on an existing transcript.
 
@@ -1071,6 +1082,12 @@ class TranscriptLibrary:
         never overwritten; differing observations are reported as conflicts.
         Save and enrichment share the same per-record OS guard, preventing a
         read/merge/write race from losing a concurrent save.
+
+        ``filmot_snapshot=True`` marks an observation from Filmot's index. It is
+        kept under ``filmot_enrichment``, never replacing the
+        ``metadata_enrichment`` marker that identifies YouTube provenance, and
+        on a record with YouTube provenance it fills only fields outside the
+        YouTube lifecycle's vocabulary, so refresh and purge keep owning those.
         """
         if not isinstance(video_id, str) or not video_id.strip():
             raise ValueError("video_id must be non-empty text")
@@ -1164,6 +1181,18 @@ class TranscriptLibrary:
             "topic_categories": "topic_categories",
             "metadata_observed_at": "metadata_observed_at",
             "metadata_expires_at": "metadata_expires_at",
+            # Filmot index snapshot fields. Their names are distinct from the
+            # YouTube-owned vocabulary so lifecycle refresh and purge never
+            # claim them.
+            "category": "category",
+            "caption_languages": "caption_languages",
+            "is_unlisted": "is_unlisted",
+            "is_livestream": "is_livestream",
+            "creative_commons": "creative_commons",
+            "channel_subscribers": "channel_subscribers",
+            "channel_country": "channel_country",
+            "partial_metadata": "partial_metadata",
+            "filmot_observed_at": "filmot_observed_at",
         }
 
         with exclusive_file_guard(guard_path):
@@ -1181,13 +1210,35 @@ class TranscriptLibrary:
             source = dict(source) if isinstance(source, dict) else {}
             filled = []
             conflicts = []
+            defer_to_youtube = filmot_snapshot and _has_youtube_provenance(raw)
 
             for candidate_key, metadata_key in aliases.items():
+                if defer_to_youtube and metadata_key in _LEGACY_YOUTUBE_METADATA_KEYS:
+                    continue
                 incoming = observed_candidate.get(candidate_key)
                 if _metadata_value_missing(incoming):
                     continue
                 existing = metadata.get(metadata_key)
-                if _metadata_value_missing(existing):
+                if (
+                    metadata_key == "caption_languages"
+                    and isinstance(existing, dict)
+                    and isinstance(incoming, dict)
+                ):
+                    # Automatic and manual lists are separate observations; a
+                    # snapshot that knew only one must not hide the other.
+                    merged = dict(existing)
+                    for part, value in incoming.items():
+                        if _metadata_value_missing(merged.get(part)):
+                            merged[part] = value
+                            filled.append("caption_languages.{}".format(part))
+                        elif merged[part] != value:
+                            conflicts.append({
+                                "field": "caption_languages.{}".format(part),
+                                "existing": merged[part],
+                                "observed": value,
+                            })
+                    metadata[metadata_key] = merged
+                elif _metadata_value_missing(existing):
                     metadata[metadata_key] = incoming
                     filled.append(metadata_key)
                 elif existing != incoming:
@@ -1206,6 +1257,8 @@ class TranscriptLibrary:
                 "metadata_observed_at": "views_observed_at",
             }
             for candidate_key, source_key in source_aliases.items():
+                if defer_to_youtube and source_key in _LEGACY_YOUTUBE_SOURCE_KEYS:
+                    continue
                 incoming = observed_candidate.get(candidate_key)
                 if _metadata_value_missing(incoming):
                     continue
@@ -1224,6 +1277,19 @@ class TranscriptLibrary:
                             "observed": incoming,
                         })
 
+            # Views filled from a Filmot snapshot carry that snapshot's date.
+            snapshot_date = observed_candidate.get("filmot_observed_at")
+            if filmot_snapshot and not _metadata_value_missing(snapshot_date):
+                if "views" in filled and _metadata_value_missing(metadata.get("views_observed_at")):
+                    metadata["views_observed_at"] = snapshot_date
+                    filled.append("views_observed_at")
+                if "source.views" in filled and _metadata_value_missing(source.get("views_observed_at")):
+                    source["views_observed_at"] = snapshot_date
+                    filled.append("source.views_observed_at")
+
+            if defer_to_youtube:
+                # Every provider field on such a record is YouTube-owned.
+                provider_fields = {}
             existing_provider_fields = metadata.get("provider_fields")
             existing_provider_fields = (
                 dict(existing_provider_fields)
@@ -1253,6 +1319,7 @@ class TranscriptLibrary:
                     "path": str(file_path),
                     "filled_fields": [],
                     "conflicts": conflicts,
+                    "deferred_to_youtube": defer_to_youtube,
                 }
 
             raw["metadata"] = metadata
@@ -1270,7 +1337,7 @@ class TranscriptLibrary:
                     "expires_at", observed_candidate["metadata_expires_at"]
                 )
             observation["filled_fields"] = list(filled)
-            raw["metadata_enrichment"] = observation
+            raw["filmot_enrichment" if filmot_snapshot else "metadata_enrichment"] = observation
 
             temporary = _write_json_temporary(file_path, raw)
             try:
@@ -1287,7 +1354,72 @@ class TranscriptLibrary:
             "path": str(file_path),
             "filled_fields": filled,
             "conflicts": conflicts,
+            "deferred_to_youtube": defer_to_youtube,
         }
+
+    def _inventory_topic_dirs(self, topic: Optional[str]) -> List[Path]:
+        """Topic directories a maintenance inventory reads, sorted."""
+        if topic is not None:
+            return self._topic_dirs_for_read(topic)
+        if not self.transcripts_dir.exists():
+            return []
+        return [
+            path
+            for path in sorted(self.transcripts_dir.iterdir())
+            if path.is_dir() and not path.name.startswith("_")
+        ]
+
+    def filmot_enrichment_inventory(
+        self,
+        *,
+        topic: Optional[str] = None,
+        video_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List saved records with their Filmot enrichment marker, read-only.
+
+        ``enriched_at`` is ``None`` for a record no Filmot lookup has filled.
+        An unreadable record stays visible with ``error_type`` rather than
+        silently shrinking the selection.
+        """
+        if video_id is not None and (
+            not isinstance(video_id, str) or not video_id.strip()
+        ):
+            raise ValueError("video_id must be non-empty text")
+        safe_id = self._sanitize_video_id(video_id) if video_id else None
+        rows: List[Dict[str, Any]] = []
+        for topic_dir in self._inventory_topic_dirs(topic):
+            paths = (
+                [topic_dir / "{}.json".format(safe_id)]
+                if safe_id is not None
+                else sorted(topic_dir.glob("*.json"))
+            )
+            for file_path in paths:
+                if not file_path.exists():
+                    continue
+                row: Dict[str, Any] = {
+                    "topic": topic_dir.name,
+                    "video_id": video_id or file_path.stem,
+                    "path": str(file_path),
+                    "enriched_at": None,
+                }
+                try:
+                    with open(file_path, "r", encoding="utf-8") as handle:
+                        raw = json.load(handle, parse_constant=_reject_json_constant)
+                    if not isinstance(raw, dict):
+                        raise ValueError("saved transcript record must be an object")
+                    record_id = raw.get("video_id")
+                    if not isinstance(record_id, str) or not record_id.strip():
+                        raise ValueError("saved transcript video_id is missing")
+                    if video_id is not None and record_id != video_id:
+                        raise ValueError("saved transcript video_id does not match its path")
+                    row["video_id"] = record_id
+                    marker = raw.get("filmot_enrichment")
+                    if isinstance(marker, dict) and isinstance(marker.get("enriched_at"), str):
+                        row["enriched_at"] = marker["enriched_at"]
+                except (json.JSONDecodeError, OSError, UnicodeError, ValueError) as error:
+                    row["error_type"] = type(error).__name__
+                rows.append(row)
+        return rows
 
     def youtube_metadata_inventory(
         self,
@@ -1311,17 +1443,7 @@ class TranscriptLibrary:
         ):
             raise ValueError("video_id must be non-empty text")
 
-        if topic is not None:
-            topic_dirs = self._topic_dirs_for_read(topic)
-        elif self.transcripts_dir.exists():
-            topic_dirs = [
-                path
-                for path in sorted(self.transcripts_dir.iterdir())
-                if path.is_dir() and not path.name.startswith("_")
-            ]
-        else:
-            topic_dirs = []
-
+        topic_dirs = self._inventory_topic_dirs(topic)
         safe_id = self._sanitize_video_id(video_id) if video_id else None
         rows: List[Dict[str, Any]] = []
         for topic_dir in topic_dirs:

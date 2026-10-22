@@ -64,6 +64,9 @@ def _isolated_api_providers(monkeypatch):
     monkeypatch.setattr(app_config, "RAPIDAPI_BASE_URL", "https://rapidapi.filmot.invalid")
     monkeypatch.setattr(app_config, "API_PROVIDER", "auto")
     monkeypatch.delenv("FILMOT_API_PROVIDER", raising=False)
+    # Save paths look up Filmot metadata after saving; tests of that lookup
+    # opt back in with FILMOT_ENRICH_ON_SAVE=1 and a mocked client.
+    monkeypatch.setenv("FILMOT_ENRICH_ON_SAVE", "0")
 
     # Tests that mock a client's session never reach this guard; any request
     # that does is an unmocked Filmot API call and fails the test.

@@ -57,7 +57,8 @@ class Provider:
 
     name: str
     label: str
-    base_url: str
+    # A base-URL override may carry userinfo credentials.
+    base_url: str = field(repr=False)
     key_env: str
     _headers: Tuple[Tuple[str, str], ...] = field(repr=False, compare=False)
 

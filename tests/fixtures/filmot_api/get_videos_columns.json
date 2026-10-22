@@ -1,0 +1,23 @@
+[
+  {
+    "id": "recorded-video-001",
+    "uploaddate": "2026-01-01",
+    "duration": 214,
+    "title": "Recorded video title 001",
+    "channelid": "recorded-channel-001",
+    "channelname": "Recorded channel 001",
+    "description": "Recorded video description",
+    "autosubs": " en ",
+    "manualsubs": " de-DE en es-419 ja pt-BR ",
+    "category": "Music",
+    "viewcount": 1763636326,
+    "likecount": 18945568,
+    "isunlisted": 0,
+    "islivestream": 0,
+    "license": "",
+    "ispartialdata": 0,
+    "lastfetchdate": "2026-01-02",
+    "channelsubcount": 4550000,
+    "channelcountryname": "Recorded country"
+  }
+]

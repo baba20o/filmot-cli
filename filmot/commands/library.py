@@ -1370,6 +1370,212 @@ def library_stats():
     _render_library_stats(outcome)
 
 
+def _render_library_enrich(
+    outcome: CommandResult[LibraryResultData],
+) -> None:
+    """Render a Filmot metadata enrichment preview or outcome."""
+    from ..video_metadata import enrichment_summary_line
+
+    _render_library_failure(outcome, "Filmot metadata enrichment failed")
+    summary = outcome.data.get("summary") or {}
+    for warning in outcome.warnings:
+        console.print(Text(warning, style="yellow"))
+    if not summary.get("selected_records"):
+        console.print(
+            "[yellow]No saved records need Filmot metadata.[/yellow] "
+            "[dim]--all rechecks records Filmot already enriched.[/dim]"
+        )
+        return
+    if summary.get("dry_run"):
+        console.print(
+            "[cyan]Would look up {} record(s) across {} unique video(s) in {} "
+            "Filmot call(s); no API calls or writes were made.[/cyan]".format(
+                summary.get("selected_records", 0),
+                summary.get("selected_videos", 0),
+                summary.get("planned_calls", 0),
+            )
+        )
+        return
+    console.print(enrichment_summary_line(summary))
+    for row in outcome.data.get("rows") or []:
+        if row.get("status") == "failed":
+            console.print(Text.assemble(
+                ("  Fail ", "red"),
+                "{}/{}".format(row.get("topic"), row.get("video_id")),
+                (" - {}".format(row.get("error")), "dim"),
+            ))
+
+
+@library.command("enrich")
+@click.argument("topic", required=False)
+@click.option(
+    "--video", "videos", multiple=True,
+    help="Enrich exact saved video ID/URL (repeat or comma-separate)",
+)
+@click.option(
+    "--all", "include_all", is_flag=True,
+    help="Recheck records Filmot already enriched (default: never-enriched only)",
+)
+@click.option(
+    "--max-videos", default=1000, type=click.IntRange(1, 10000),
+    show_default=True, help="Unique-video budget (200 videos per Filmot call)",
+)
+@click.option("--dry-run", is_flag=True, help="Preview scope without API calls or writes")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result")
+def library_enrich(
+    topic: Optional[str],
+    videos: tuple[str, ...],
+    include_all: bool,
+    max_videos: int,
+    dry_run: bool,
+    raw: bool,
+) -> None:
+    """Fill missing metadata on saved transcripts from Filmot's index.
+
+    Looks up description, view and like counts (dated by Filmot's snapshot),
+    category, caption languages, license, and channel details in batches of
+    200 videos. Only missing fields are filled; known values are never
+    overwritten. On records with YouTube metadata, the fields YouTube owns are
+    left to `filmot yt-data refresh`.
+
+    With no selector, only records Filmot has never enriched are looked up.
+    --video targets exact IDs in every topic; --all rechecks the rest.
+
+    Examples:
+
+    \b
+        filmot library enrich --dry-run
+        filmot library enrich ufo-research
+        filmot library enrich --video dQw4w9WgXcQ --raw
+    """
+    import math
+
+    from ..api import VIDEO_BATCH_LIMIT, FilmotClient
+    from ..ledger import log_result
+    from ..library import get_library
+    from ..video_metadata import enrich_saved_transcripts, enrichment_counts
+
+    if include_all and videos:
+        raise click.UsageError("--all cannot be combined with --video")
+    video_ids = _youtube_metadata_video_ids(videos)
+
+    def finish(outcome: CommandResult[LibraryResultData]) -> None:
+        # A preview never calls the API or writes, so it leaves no event,
+        # whichever way it ends.
+        if not dry_run:
+            log_result(
+                "library-enrich", outcome, topic=topic,
+                data=outcome.data.get("summary"),
+            )
+        if raw:
+            _emit_library_raw(outcome)
+        else:
+            _render_library_enrich(outcome)
+
+    try:
+        lib = get_library()
+        if video_ids:
+            inventory = [
+                row
+                for video_id in video_ids
+                for row in lib.filmot_enrichment_inventory(topic=topic, video_id=video_id)
+            ]
+        else:
+            inventory = lib.filmot_enrichment_inventory(topic=topic)
+    except Exception as error:
+        finish(CommandResult.failed(
+            "library-enrich",
+            {"topic": topic, "rows": [], "summary": {"selected_records": 0}},
+            ErrorDetail.from_exception(error, stage="inventory"),
+        ))
+        return
+
+    unreadable = [row for row in inventory if row.get("error_type")]
+    eligible = [
+        row for row in inventory
+        if not row.get("error_type")
+        and (video_ids or include_all or row.get("enriched_at") is None)
+    ]
+    selected, selected_ids, truncated = _bounded_metadata_targets(
+        eligible, max_videos=max_videos,
+    )
+    summary = {
+        "scope": "explicit" if video_ids else "all" if include_all else "never-enriched",
+        "dry_run": dry_run,
+        "selected_records": len(selected),
+        "selected_videos": len(selected_ids),
+        "truncated_videos": truncated,
+        "unreadable_records": len(unreadable),
+        "planned_calls": math.ceil(len(selected_ids) / VIDEO_BATCH_LIMIT),
+    }
+    warnings = []
+    if truncated:
+        warnings.append("Selection exceeded --max-videos and was truncated.")
+    if unreadable:
+        warnings.append("{} unreadable record(s) were skipped.".format(len(unreadable)))
+
+    if dry_run or not selected:
+        finish(CommandResult(
+            command="library-enrich",
+            status=ResultStatus.COMPLETED if selected else ResultStatus.EMPTY,
+            data={"topic": topic, "rows": selected, "summary": summary},
+            warnings=warnings,
+        ))
+        return
+
+    try:
+        client = FilmotClient()
+    except Exception as error:
+        finish(CommandResult.failed(
+            "library-enrich",
+            {"topic": topic, "rows": [], "summary": summary},
+            ErrorDetail.from_exception(error, stage="configuration"),
+        ))
+        return
+
+    result = enrich_saved_transcripts(
+        lib, [(row["topic"], row["video_id"]) for row in selected], client,
+    )
+    counts = enrichment_counts(result)
+    summary.update(counts)
+    errors = [
+        ErrorDetail(
+            type=str(item.get("error_type") or "FilmotLookupError"),
+            message=item["error"],
+            stage="lookup",
+            details={"videos": len(item.get("video_ids") or ())},
+        )
+        for item in result["lookup_errors"]
+    ]
+    lost = {
+        video_id
+        for item in result["lookup_errors"]
+        for video_id in item.get("video_ids") or ()
+    }
+    errors.extend(
+        ErrorDetail(
+            type="LibraryWriteError",
+            message=row["error"],
+            stage="store-metadata",
+            details={"topic": row["topic"], "video_id": row["video_id"]},
+        )
+        for row in result["outcomes"]
+        if row["status"] == "failed" and row["video_id"] not in lost
+    )
+    status = (
+        ResultStatus.FAILED if counts["failed"] == counts["records"]
+        else ResultStatus.PARTIAL if counts["failed"] or truncated
+        else ResultStatus.COMPLETED
+    )
+    finish(CommandResult(
+        command="library-enrich",
+        status=status,
+        data={"topic": topic, "rows": result["outcomes"], "summary": summary},
+        errors=errors,
+        warnings=warnings,
+    ))
+
+
 def _render_library_delete(
     outcome: CommandResult[LibraryResultData],
 ) -> None:
