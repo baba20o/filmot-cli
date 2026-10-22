@@ -447,7 +447,7 @@ def watchlist_add(video_id: str, notes: str):
     added = wl.add_video(video, notes)
     data = {
         "video_id": video_id,
-        "title": video.get("title", video_id),
+        "title": video.get("title") or video_id,
         "added": added,
         "has_notes": bool(notes),
     }

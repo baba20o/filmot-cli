@@ -63,14 +63,15 @@ class Watchlist:
             if item.get("video_id") == video_id:
                 return False
         
+        # Partial Filmot index records carry null fields.
         entry = {
             "video_id": video_id,
-            "title": video.get("title", ""),
-            "channel_name": video.get("channelname", ""),
-            "channel_id": video.get("channelid", ""),
-            "views": video.get("viewcount", 0),
-            "duration": video.get("duration", 0),
-            "upload_date": video.get("uploaddate", ""),
+            "title": video.get("title") or "",
+            "channel_name": video.get("channelname") or "",
+            "channel_id": video.get("channelid") or "",
+            "views": video.get("viewcount") or 0,
+            "duration": video.get("duration") or 0,
+            "upload_date": video.get("uploaddate") or "",
             "added_at": datetime.now().isoformat(),
             "notes": notes,
             "tags": [],

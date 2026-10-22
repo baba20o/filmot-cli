@@ -370,7 +370,8 @@ category, caption languages, license, flags, and channel details. Counts filled
 this way get Filmot's snapshot date in `views_observed_at`. `caption_languages`
 holds `automatic` and `manual` lists. An empty list means the video has none of
 that kind. A missing part means Filmot's record did not say, and a later lookup
-can still fill it. Each enriched record
+can still fill it. Partial index records (`partial_metadata: true`) often lack a
+title, description, or like count, so they fill fewer fields. Each enriched record
 carries a `filmot_enrichment` block (`provider`, `enriched_at`, `observed_at`,
 `api_provider`, `filled_fields`). On records with YouTube Data API metadata,
 Filmot leaves the YouTube-owned fields to `yt-data`. On a record Filmot enriched

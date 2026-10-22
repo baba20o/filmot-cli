@@ -254,6 +254,12 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- A partial record in Filmot's index (`ispartialdata: 1`) can have a null title,
+  duration, upload date, or channel field. One such record made the whole
+  `/getvideos` response fail validation, which lost an entire 200-video
+  enrichment batch. Those fields may now be null, but they must still be
+  present, and other types are still rejected. `video` and `watchlist add`
+  show placeholders for the missing values.
 - Filling in an unknown title and channel during bulk download and research
   silently did nothing, because `/getvideos` returns a list and the lookup
   expected an object. Those saves recorded "Unknown". The lookup now takes the

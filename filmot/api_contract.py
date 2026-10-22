@@ -286,18 +286,20 @@ _OPTIONAL_VIDEO_FIELDS: dict[str, Tuple[ExpectedType, str]] = {
 def _validate_video_record(endpoint: str, value: Any, path: str) -> None:
     video = _expect_mapping(endpoint, path, value)
     _expect_field(endpoint, path, video, "id", str)
-    _expect_field(endpoint, path, video, "title", str)
+    # Partial index records (ispartialdata 1) carry these keys as null, and
+    # basic lookups return them without the ispartialdata flag. A missing key
+    # or another type is still drift.
+    _expect_field(endpoint, path, video, "title", (str, type(None)), "string or null")
     _expect_field(
         endpoint,
         path,
         video,
         "duration",
-        (int, float),
-        "number",
+        (int, float, type(None)),
+        "number or null",
     )
-    _expect_field(endpoint, path, video, "uploaddate", str)
-    _expect_field(endpoint, path, video, "channelid", str)
-    _expect_field(endpoint, path, video, "channelname", str)
+    for field in ("uploaddate", "channelid", "channelname"):
+        _expect_field(endpoint, path, video, field, (str, type(None)), "string or null")
     for field, (expected_type, label) in _OPTIONAL_VIDEO_FIELDS.items():
         if video.get(field) is not None:
             _expect_field(endpoint, path, video, field, expected_type, label)

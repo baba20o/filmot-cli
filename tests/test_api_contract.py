@@ -23,6 +23,7 @@ FIXTURE_ENDPOINTS = {
     "search_channels_direct.json": "/getsearchchannels",
     "get_videos.json": "/getvideos",
     "get_videos_columns.json": "/getvideos",
+    "get_videos_columns_partial.json": "/getvideos",
 }
 
 
@@ -102,6 +103,30 @@ def test_video_contract_flags_drift_in_consumed_optional_columns(field, value):
         validate_api_response("/getvideos", payload)
 
     assert caught.value.path == "$[0].{}".format(field)
+
+
+@pytest.mark.parametrize("field", ["title", "duration", "uploaddate", "channelid", "channelname"])
+def test_video_contract_accepts_null_core_fields_of_partial_records(field):
+    payload = _fixture("get_videos.json")
+    payload[0][field] = None
+
+    assert validate_api_response("/getvideos", payload) is payload
+
+
+@pytest.mark.parametrize("mutate,expected_path", [
+    (lambda video: video.pop("title"), "$[0].title"),
+    (lambda video: video.update(title=5), "$[0].title"),
+    (lambda video: video.update(duration=True), "$[0].duration"),
+    (lambda video: video.update(id=None), "$[0].id"),
+])
+def test_video_contract_still_flags_missing_or_mistyped_core_fields(mutate, expected_path):
+    payload = _fixture("get_videos.json")
+    mutate(payload[0])
+
+    with pytest.raises(FilmotAPIContractError) as caught:
+        validate_api_response("/getvideos", payload)
+
+    assert caught.value.path == expected_path
 
 
 def test_video_contract_accepts_absent_null_and_legacy_optional_columns():

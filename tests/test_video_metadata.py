@@ -121,6 +121,24 @@ def test_caption_languages_record_only_what_filmot_reports():
     assert "caption_languages" not in video_candidate(row(autosubs=None, manualsubs=None))
 
 
+def test_partial_index_records_yield_only_what_they_carry(tmp_path):
+    partial = dict(json.loads(
+        (FIXTURE.parent / "get_videos_columns_partial.json").read_text(encoding="utf-8")
+    )[0], id=VIDEO_ID)
+    library, path = saved(tmp_path)
+
+    candidate = video_candidate(partial)
+    enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient([partial]))
+
+    assert candidate["partial_metadata"] is True
+    assert not {"title", "description", "likes", "caption_languages"} & set(candidate)
+    metadata = read(path)["metadata"]
+    assert metadata["title"] == "Unknown"
+    assert metadata["category"] == "Science & Technology"
+    assert metadata["views"] == 104088
+    assert metadata["views_observed_at"] == "2026-01-02"
+
+
 def test_video_rows_accept_every_response_shape():
     assert video_rows([row(), "junk"]) == [row()]
     assert video_rows({"result": [row()]}) == [row()]
