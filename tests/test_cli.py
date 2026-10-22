@@ -53,17 +53,24 @@ class TestCLIEntryPoint:
         project = tmp_path / "project"
         project.mkdir()
         monkeypatch.chdir(project)
-        secret = "super-secret-api-key-1234"
-        monkeypatch.setattr(app_config, "API_KEY", secret)
+        direct_secret = "direct-secret-api-key-1234"
+        rapid_secret = "rapid-secret-api-key-5678"
+        monkeypatch.setattr(app_config, "DIRECT_API_KEY", direct_secret)
+        monkeypatch.setattr(app_config, "RAPIDAPI_KEY", rapid_secret)
 
         result = runner.invoke(cli, ["config"])
 
         assert result.exit_code == 0, result.output
-        assert "Filmot API Key: configured" in result.output
+        assert "API Provider: auto (default)" in result.output
+        assert "Filmot API Key (direct): configured" in result.output
+        assert "RapidAPI Key: configured" in result.output
+        assert "Legacy routes: rapidapi -> direct" in result.output
+        assert "Direct-only routes: direct" in result.output
         assert "YouTube API Key:" in result.output
-        assert secret not in result.output
-        assert secret[:8] not in result.output
-        assert secret[-4:] not in result.output
+        for secret in (direct_secret, rapid_secret):
+            assert secret not in result.output
+            assert secret[:8] not in result.output
+            assert secret[-4:] not in result.output
         for path in (
             project_data_dir(),
             user_config_dir(),
@@ -653,8 +660,11 @@ class TestTranscriptRawContract:
     @patch("filmot.ledger.log_event")
     @patch("filmot.library.get_library")
     @patch("filmot.transcript.get_transcript")
+    # The best-effort metadata lookup must not reach the live Filmot API.
+    @patch("filmot.commands.transcript.FilmotClient")
     def test_raw_library_save_failure_is_one_json_error(
         self,
+        mock_client,
         mock_get_transcript,
         mock_get_library,
         mock_log,
@@ -662,6 +672,7 @@ class TestTranscriptRawContract:
         mock_pool,
         runner,
     ):
+        mock_client.return_value.get_videos.return_value = []
         mock_get_transcript.return_value = {
             "video_id": "vid",
             "full_text": "hello",

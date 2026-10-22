@@ -475,6 +475,9 @@ class CommandResult(Generic[PayloadT]):
     errors: List[ErrorDetail] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     schema: str = RESULT_SCHEMA
+    # Filmot API provider usage (requests, credits, failovers) observed while
+    # producing this outcome; attached at the raw-output and ledger boundaries.
+    api: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         _status_value(self.status)
@@ -493,7 +496,7 @@ class CommandResult(Generic[PayloadT]):
         }
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "schema": self.schema,
             "command": self.command,
             "status": self.status_value,
@@ -501,6 +504,9 @@ class CommandResult(Generic[PayloadT]):
             "errors": [error.to_dict() for error in self.errors],
             "warnings": list(self.warnings),
         }
+        if self.api:
+            payload["api"] = _json_value(self.api)
+        return payload
 
     def to_raw_dict(self) -> Dict[str, Any]:
         """Project the outcome to the CLI's backward-compatible raw shape.
@@ -523,6 +529,8 @@ class CommandResult(Generic[PayloadT]):
             "errors": [error.to_dict() for error in self.errors],
             "warnings": list(self.warnings),
         }
+        if self.api:
+            payload["_filmot"]["api"] = _json_value(self.api)
         return payload
 
     def to_event(
@@ -549,6 +557,7 @@ class CommandResult(Generic[PayloadT]):
             warnings=list(self.warnings),
             topic=topic,
             ts=timestamp or datetime.now().isoformat(timespec="seconds"),
+            api=self.api,
         )
 
     @classmethod
@@ -597,6 +606,7 @@ class EventRecord:
     warnings: List[str] = field(default_factory=list)
     topic: Optional[str] = None
     schema: str = EVENT_SCHEMA
+    api: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         _status_value(self.status)
@@ -620,6 +630,8 @@ class EventRecord:
         }
         if self.topic:
             payload["topic"] = self.topic
+        if self.api:
+            payload["api"] = _json_value(self.api)
         return payload
 
 
@@ -661,12 +673,14 @@ def result_from_dict(payload: Mapping[str, Any]) -> CommandResult[Dict[str, Any]
                 ),
             )
         )
+    api = source.get("api")
     return CommandResult(
         command=str(source.get("command") or ""),
         status=str(source.get("status") or ResultStatus.FAILED.value),
         data=dict(data),
         errors=errors,
         warnings=[str(item) for item in source.get("warnings") or []],
+        api=dict(api) if isinstance(api, Mapping) else None,
     )
 
 

@@ -29,9 +29,7 @@ def test_leaves_grouped_or_proximity_query_unchanged():
     assert rewrite is None
 
 
-@patch("filmot.api.get_headers", return_value={})
-@patch("filmot.api.validate_config")
-def test_search_subtitles_uses_rewritten_query(mock_validate, mock_headers):
+def test_search_subtitles_uses_rewritten_query():
     with patch.object(FilmotClient, "get", return_value={"result": []}) as mock_get:
         client = FilmotClient(use_cache=False)
         client.search_subtitles(query='"Letta|Mem0" NEAR/15 "production"')
@@ -43,9 +41,7 @@ def test_search_subtitles_uses_rewritten_query(mock_validate, mock_headers):
     }
 
 
-@patch("filmot.api.get_headers", return_value={})
-@patch("filmot.api.validate_config")
-def test_search_subtitles_preserves_valid_grouped_query(mock_validate, mock_headers):
+def test_search_subtitles_preserves_valid_grouped_query():
     query = '("memory" | "context") NEAR/20 "production"'
 
     with patch.object(FilmotClient, "get", return_value={"result": []}) as mock_get:
@@ -56,9 +52,7 @@ def test_search_subtitles_preserves_valid_grouped_query(mock_validate, mock_head
     assert client.last_query_rewrite is None
 
 
-@patch("filmot.api.get_headers", return_value={})
-@patch("filmot.api.validate_config")
-def test_request_uses_bounded_connect_and_read_timeout(mock_validate, mock_headers):
+def test_request_uses_bounded_connect_and_read_timeout():
     client = FilmotClient(use_cache=False, request_timeout=(3, 9))
     response = client.session.request = MagicMock()
     response.return_value.raise_for_status.return_value = None
@@ -69,11 +63,7 @@ def test_request_uses_bounded_connect_and_read_timeout(mock_validate, mock_heade
     assert response.call_args.kwargs["timeout"] == (3, 9)
 
 
-@patch("filmot.api.get_headers", return_value={})
-@patch("filmot.api.validate_config")
-def test_paginated_search_marks_later_page_failure_as_partial(
-    mock_validate, mock_headers
-):
+def test_paginated_search_marks_later_page_failure_as_partial():
     client = FilmotClient(use_cache=False)
     page_one = {
         "result": [{"id": f"v{i}"} for i in range(50)],
@@ -91,11 +81,7 @@ def test_paginated_search_marks_later_page_failure_as_partial(
     assert result["page_error"] == "page two failed"
 
 
-@patch("filmot.api.get_headers", return_value={})
-@patch("filmot.api.validate_config")
-def test_paginated_search_deduplicates_video_ids_before_limit(
-    mock_validate, mock_headers
-):
+def test_paginated_search_deduplicates_video_ids_before_limit():
     client = FilmotClient(use_cache=False)
     pages = [
         {
@@ -122,11 +108,7 @@ def test_paginated_search_deduplicates_video_ids_before_limit(
     assert result["duplicates_skipped"] == 1
 
 
-@patch("filmot.api.get_headers", return_value={})
-@patch("filmot.api.validate_config")
-def test_empty_first_page_still_counts_as_fetched_scope(
-    mock_validate, mock_headers
-):
+def test_empty_first_page_still_counts_as_fetched_scope():
     client = FilmotClient(use_cache=False)
     with patch.object(
         client,

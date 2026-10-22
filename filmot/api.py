@@ -4,11 +4,18 @@ import re
 import time
 import logging
 import requests
-from typing import Optional, Dict, Any, List, Generator
+from typing import Optional, Dict, Any, List, Generator, Tuple
+from . import api_usage
 from .api_contract import FilmotAPIContractError, validate_api_response
-from .config import BASE_URL, get_headers, validate_config
+from .api_providers import (
+    Provider,
+    configured_providers,
+    configured_secrets,
+    providers_for,
+)
 from .cache import get_cache
 from .rate_limiter import get_rate_limiter
+from .redaction import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +23,15 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 4
 DEFAULT_RETRY_WAIT = 5  # seconds, if no Retry-After header
 DEFAULT_REQUEST_TIMEOUT = (10, 45)  # connect, read seconds
+
+# Canonical channel-suggestion fields follow the direct API; the RapidAPI
+# gateway returns the same values under legacy names.
+_CHANNEL_FIELD_ALIASES = (
+    ("channelid", ("channelid", "value", "id")),
+    ("name", ("name", "label", "title")),
+    ("handle", ("handle", "newshortname")),
+    ("totalviewcount", ("totalviewcount", "viewcount")),
+)
 
 
 def _rewrite_pipe_phrase_operand(operand: str) -> tuple[str, bool]:
@@ -53,43 +69,148 @@ def _rewrite_quoted_or_in_proximity_query(query: str) -> tuple[str, Optional[Dic
     return rewritten_query, {"from": query, "to": rewritten_query}
 
 
+def normalize_channel_suggestion(item: Any) -> Any:
+    """Add canonical direct-API channel fields while keeping provider fields.
+
+    Idempotent: records that already carry canonical fields are unchanged.
+    """
+    if not isinstance(item, dict):
+        return item
+    normalized = dict(item)
+    for canonical, aliases in _CHANNEL_FIELD_ALIASES:
+        if normalized.get(canonical) not in (None, ""):
+            continue
+        for alias in aliases:
+            if item.get(alias) not in (None, ""):
+                normalized[canonical] = item[alias]
+                break
+    return normalized
+
+
+def normalize_channel_suggestions(payload: Any) -> Any:
+    """Normalize a channel-search list or envelope; errors pass through."""
+    if isinstance(payload, list):
+        return [normalize_channel_suggestion(item) for item in payload]
+    if isinstance(payload, dict) and "error" not in payload:
+        for key in ("channels", "items", "result"):
+            if isinstance(payload.get(key), list):
+                envelope = dict(payload)
+                envelope[key] = [normalize_channel_suggestion(item) for item in payload[key]]
+                return envelope
+    return payload
+
+
+def _known_secrets() -> Tuple[str, ...]:
+    """Every configured credential, so no response or error can echo any key."""
+    return configured_secrets()
+
+
+def _scrub_secrets(value: Any, secrets: Tuple[str, ...]) -> Any:
+    """Replace configured credential values anywhere in response-shaped data.
+
+    Only literal key values are replaced. Field names are left alone because
+    API payloads legitimately use names such as ``token`` for matched phrases.
+    """
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        for secret in secrets:
+            if secret in value:
+                value = value.replace(secret, "***")
+        return value
+    if isinstance(value, dict):
+        return {
+            _scrub_secrets(key, secrets): _scrub_secrets(item, secrets)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_scrub_secrets(item, secrets) for item in value]
+    return value
+
+
+def _json_body(response) -> Optional[Dict[str, Any]]:
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _bounded_text(value: str, limit: int = 300) -> str:
+    """Redact the complete text before truncating, so no key is split unseen."""
+    return _scrub_secrets(value, _known_secrets())[:limit]
+
+
+def _response_message(response) -> str:
+    """Return a short API-supplied message; never an HTML page."""
+    body = _json_body(response) or {}
+    message = body.get("message") or body.get("error")
+    return _bounded_text(message) if isinstance(message, str) else ""
+
+
+def _quota_count(value: Any) -> Optional[int]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _quota_details(response) -> Optional[Dict[str, Any]]:
+    """Recognize credit or plan exhaustion, which retrying cannot fix."""
+    body = _json_body(response) or {}
+    if body.get("error") == "quota_exhausted":
+        details: Dict[str, Any] = {}
+        for key in ("cost", "used", "limit", "remaining"):
+            count = _quota_count(body.get(key))
+            if count is not None:
+                details[key] = count
+        reset_at = body.get("reset_at")
+        if isinstance(reset_at, str) and api_usage.valid_timestamp(reset_at.strip()):
+            details["reset_at"] = reset_at.strip()
+        return details
+    message = body.get("message")
+    if isinstance(message, str) and "quota" in message.casefold():
+        return {"message": _bounded_text(message)}
+    return None
+
+
 class FilmotClient:
-    """Client for interacting with the Filmot API."""
-    
+    """Client for interacting with the Filmot API through configured providers."""
+
     def __init__(self, use_cache: bool = True, cache_ttl: int = 3600,
                  rate_limit: float = 2.0, burst_size: int = 5,
                  request_timeout=DEFAULT_REQUEST_TIMEOUT):
         """
         Initialize the Filmot client.
-        
+
         Args:
             use_cache: Enable response caching
             cache_ttl: Cache time-to-live in seconds
             rate_limit: Requests per second limit
             burst_size: Maximum burst of requests
         """
-        validate_config()
-        self.base_url = BASE_URL
-        self.headers = get_headers()
+        # Fail before any work when no provider can serve the selected policy.
+        configured_providers(require=True)
         self.session = requests.Session()
-        self.session.headers.update(self.headers)
-        
+
         # Optional caching
         self.use_cache = use_cache
         self.cache = get_cache(ttl=cache_ttl) if use_cache else None
-        
+
         # Rate limiting
         self.rate_limiter = get_rate_limiter(rate_limit, burst_size)
         self.request_timeout = request_timeout
 
-        # Track cache hits for caller feedback
+        # Track cache hits and the serving provider for caller feedback
         self.last_cache_hit = False
+        self.last_provider = None
         self.last_query_rewrite = None
-    
+
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None,
                  data: Optional[Dict] = None, skip_cache: bool = False) -> Any:
-        """Make an API request with caching, rate limiting, and 429 retry."""
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        """Make an API request with caching, rate limiting, retries, and failover."""
+        providers = providers_for(endpoint)
 
         # Remove None values from params
         if params:
@@ -99,18 +220,49 @@ class FilmotClient:
 
         # Check cache first (only for GET requests)
         self.last_cache_hit = False
+        self.last_provider = None
         if method == "GET" and self.use_cache and self.cache and not skip_cache:
-            cached = self.cache.get(endpoint, params)
-            if cached is not None:
+            for provider in providers:
+                cached = self.cache.get(endpoint, params, namespace=provider.name)
+                if cached is None:
+                    continue
+                cached = _scrub_secrets(cached, _known_secrets())
                 try:
                     validate_api_response(endpoint, cached)
                 except FilmotAPIContractError as contract_error:
                     logger.error("%s", contract_error)
                     return contract_error.as_response()
                 self.last_cache_hit = True
+                self.last_provider = provider.name
+                api_usage.record_cache_hit(provider.name)
                 return cached
 
-        last_error = None
+        result: Any = None
+        for index, provider in enumerate(providers):
+            result, failover_reason = self._request_provider(
+                provider, method, endpoint, params, data,
+            )
+            self.last_provider = provider.name
+            if failover_reason is None or index + 1 == len(providers):
+                return result
+            following = providers[index + 1]
+            api_usage.record_failover(endpoint, provider.name, following.name, failover_reason)
+            logger.warning(
+                "%s failed on %s (%s); retrying with the %s",
+                provider.label, endpoint, failover_reason, following.label,
+            )
+        return result
+
+    def _request_provider(
+        self,
+        provider: Provider,
+        method: str,
+        endpoint: str,
+        params: Dict[str, Any],
+        data: Optional[Dict],
+    ) -> Tuple[Any, Optional[str]]:
+        """Return ``(result, failover_reason)``; the reason is None when final."""
+        url = provider.url(endpoint)
         for attempt in range(MAX_RETRIES + 1):
             # Apply rate limiting
             self.rate_limiter.acquire()
@@ -121,38 +273,39 @@ class FilmotClient:
                     url=url,
                     params=params,
                     json=data,
+                    headers=provider.headers(),
                     timeout=self.request_timeout,
+                    # requests strips only Authorization on cross-origin
+                    # redirects; custom key headers would follow a Location
+                    # to any host, so authenticated calls never redirect.
+                    allow_redirects=False,
                 )
+            except requests.exceptions.RequestException as e:
+                # Count the attempt even though no response (or credit) arrived.
+                api_usage.record_transport_error(provider.name)
+                message = redact_sensitive_text(e, _known_secrets())
+                return self._error(
+                    provider, "FilmotConnectionError",
+                    "Could not reach the {}: {}".format(provider.label, message),
+                ), "connection"
+
+            api_usage.record_response(provider.name, getattr(response, "headers", None))
+            status = getattr(response, "status_code", None)
+            if isinstance(status, int) and 300 <= status < 400:
+                return self._error(
+                    provider, "FilmotResponseError",
+                    "The {} answered with an unexpected redirect (HTTP {}); the "
+                    "request was not forwarded.".format(provider.label, status),
+                    status,
+                ), "invalid-response"
+            try:
                 response.raise_for_status()
-                result = response.json()
-                try:
-                    validate_api_response(endpoint, result)
-                except FilmotAPIContractError as contract_error:
-                    logger.error("%s", contract_error)
-                    return contract_error.as_response()
-
-                # Report success to adaptive rate limiter
-                if hasattr(self.rate_limiter, 'report_success'):
-                    self.rate_limiter.report_success()
-
-                # Cache successful responses
-                if (
-                    method == "GET"
-                    and self.use_cache
-                    and self.cache
-                    and not (
-                        isinstance(result, dict)
-                        and "error" in result
-                    )
-                ):
-                    self.cache.set(endpoint, params, result)
-
-                if attempt > 0:
-                    logger.info("Request succeeded after %d retries: %s", attempt, endpoint)
-
-                return result
-            except requests.exceptions.HTTPError as e:
-                if response.status_code == 429:
+            except requests.exceptions.HTTPError:
+                status = response.status_code
+                if status == 429:
+                    quota = _quota_details(response)
+                    if quota is not None:
+                        return self._quota_error(provider, quota), "quota"
                     if hasattr(self.rate_limiter, 'report_rate_limit'):
                         self.rate_limiter.report_rate_limit()
 
@@ -169,48 +322,153 @@ class FilmotClient:
                             wait = DEFAULT_RETRY_WAIT * (2 ** attempt)
 
                         logger.warning(
-                            "Rate limited (429) on %s — waiting %ds before retry %d/%d",
-                            endpoint, wait, attempt + 1, MAX_RETRIES,
+                            "Rate limited (429) on %s by the %s — waiting %ds before retry %d/%d",
+                            endpoint, provider.label, wait, attempt + 1, MAX_RETRIES,
                         )
                         time.sleep(wait)
                         continue
 
                     logger.error("Rate limited (429) on %s — exhausted %d retries", endpoint, MAX_RETRIES)
+                    return self._error(
+                        provider, "FilmotRateLimited",
+                        "The {} is still rate limiting {} after {} retries.".format(
+                            provider.label, endpoint, MAX_RETRIES,
+                        ),
+                        status,
+                    ), "rate-limited"
+                if status in (401, 403):
+                    return self._error(
+                        provider, "FilmotAuthenticationError",
+                        "The {} rejected its credentials (HTTP {}). Check {}.".format(
+                            provider.label, status, provider.key_env,
+                        ),
+                        status,
+                    ), "auth"
+                if status == 404:
+                    return self._error(
+                        provider, "FilmotEndpointUnavailable",
+                        "{} is not available from the {} (HTTP 404).".format(
+                            endpoint, provider.label,
+                        ),
+                        status,
+                    ), "unavailable"
+                detail = _response_message(response)
+                suffix = ": {}".format(detail) if detail else ""
+                if status >= 500:
+                    return self._error(
+                        provider, "FilmotServiceError",
+                        "The {} returned HTTP {}{}.".format(provider.label, status, suffix),
+                        status,
+                    ), "server-error"
+                return self._error(
+                    provider, "FilmotRequestError",
+                    "The {} rejected the request (HTTP {}){}.".format(
+                        provider.label, status, suffix,
+                    ),
+                    status,
+                ), None
 
-                last_error = e
-                return {"error": str(e), "status_code": response.status_code}
-            except requests.exceptions.RequestException as e:
-                last_error = e
-                return {"error": str(e)}
+            try:
+                result = response.json()
+            except ValueError:
+                return self._error(
+                    provider, "FilmotResponseError",
+                    "The {} returned a response that is not JSON.".format(provider.label),
+                ), "invalid-response"
+            # Response bodies reach raw output, the ledger, and the cache.
+            result = _scrub_secrets(result, _known_secrets())
+            try:
+                validate_api_response(endpoint, result)
+            except FilmotAPIContractError as contract_error:
+                logger.error("%s", contract_error)
+                return contract_error.as_response(), None
 
-        return {"error": str(last_error) if last_error else "max retries exceeded"}
-    
+            # Report success to adaptive rate limiter
+            if hasattr(self.rate_limiter, 'report_success'):
+                self.rate_limiter.report_success()
+
+            # Cache successful responses
+            if (
+                method == "GET"
+                and self.use_cache
+                and self.cache
+                and not (
+                    isinstance(result, dict)
+                    and "error" in result
+                )
+            ):
+                self.cache.set(endpoint, params, result, namespace=provider.name)
+
+            if attempt > 0:
+                logger.info("Request succeeded after %d retries: %s", attempt, endpoint)
+
+            return result, None
+
+        return self._error(
+            provider, "FilmotRateLimited", "max retries exceeded",
+        ), "rate-limited"
+
+    @staticmethod
+    def _error(
+        provider: Provider,
+        error_type: str,
+        message: str,
+        status_code: Optional[int] = None,
+        **details: Any,
+    ) -> Dict[str, Any]:
+        """Build a credential-free error response naming the provider."""
+        secrets = _known_secrets()
+        result: Dict[str, Any] = {
+            "error": redact_sensitive_text(message, secrets),
+            "error_type": error_type,
+            "provider": provider.name,
+        }
+        if isinstance(status_code, int) and not isinstance(status_code, bool):
+            result["status_code"] = status_code
+        result.update(_scrub_secrets(details, secrets))
+        return result
+
+    def _quota_error(self, provider: Provider, quota: Dict[str, Any]) -> Dict[str, Any]:
+        if "message" in quota:
+            message = "The {} quota is exhausted: {}".format(provider.label, quota["message"])
+        else:
+            message = "The {} has no credits left (used {} of {}; resets {}).".format(
+                provider.label,
+                quota.get("used", "?"),
+                quota.get("limit", "?"),
+                quota.get("reset_at", "unknown"),
+            )
+        return self._error(provider, "FilmotQuotaExhausted", message, 429, quota=quota)
+
     def get(self, endpoint: str, params: Optional[Dict] = None, skip_cache: bool = False) -> Any:
         """Make a GET request."""
         return self._request("GET", endpoint, params=params, skip_cache=skip_cache)
-    
+
     # ========== API ENDPOINTS ==========
-    
+
     def search_channels(self, term: str) -> Any:
         """
         Find YouTube Channels by name or handle.
-        
+
         Args:
             term: Channel name or handle to search for (e.g., "mrbeast")
-        
+
         Returns:
-            List of matching channels
+            List of matching channels carrying canonical ``channelid``, ``name``,
+            ``handle``, and ``totalviewcount`` fields from either provider
         """
-        return self.get("/getsearchchannels", params={"term": term})
-    
+        return normalize_channel_suggestions(
+            self.get("/getsearchchannels", params={"term": term})
+        )
+
     def get_videos(self, video_ids: str, flags: Optional[int] = None) -> Any:
         """
         Get basic metadata for a single video or list of videos.
-        
+
         Args:
             video_ids: Single video ID or comma-separated list (e.g., "dQw4w9WgXcQ")
             flags: Optional flags parameter
-        
+
         Returns:
             Video metadata
         """
@@ -218,7 +476,7 @@ class FilmotClient:
         if flags is not None:
             params["flags"] = flags
         return self.get("/getvideos", params=params)
-    
+
     def search_subtitles(
         self,
         query: str,
@@ -248,7 +506,7 @@ class FilmotClient:
     ) -> Dict[str, Any]:
         """
         Find YouTube Videos by content of subtitles and other parameters.
-        
+
         Args:
             query: Text to find in subtitles. Phrases can be enclosed in double quotes.
             lang: Two-letter language code (e.g., "en", "nl", "fr", "de")
@@ -274,7 +532,7 @@ class FilmotClient:
             hit_format: Format of hits array (0 or 1)
             channel: Find top N channels matching text, then search those
             channel_count: Limit top channels when using channel param (default 10)
-        
+
         Returns:
             Search results with matching videos and subtitle hits
         """
@@ -308,7 +566,7 @@ class FilmotClient:
             "channelCount": channel_count,
         }
         return self.get("/getsearchsubtitles", params=params)
-    
+
     def search_subtitles_paginated(
         self,
         query: str,
@@ -318,28 +576,28 @@ class FilmotClient:
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Search subtitles with automatic pagination.
-        
+
         Yields results page by page until max_pages or max_results is reached.
-        
+
         Args:
             query: Search query
             max_pages: Maximum number of pages to fetch (default 10)
             max_results: Maximum total results to return (optional)
             **kwargs: All other search_subtitles parameters
-        
+
         Yields:
             Each page of results as a dictionary
         """
         total_results = 0
         kwargs.pop("page", None)
-        
+
         for page_num in range(1, max_pages + 1):
             result = self.search_subtitles(query, page=page_num, **kwargs)
-            
+
             if "error" in result:
                 yield result
                 break
-            
+
             videos = result.get("result", result.get("videos", []))
             if not videos:
                 # The request still consumed a page and may carry an accurate
@@ -349,13 +607,13 @@ class FilmotClient:
                 break  # No more results
 
             yield result
-            
+
             total_results += len(videos)
-            
+
             # Check if we've reached max_results
             if max_results and total_results >= max_results:
                 break
-            
+
             # Check if we've fetched all available results. If the API omits
             # totalresultcount, fall back to stopping on a short page rather
             # than always stopping after page 1.
@@ -365,7 +623,7 @@ class FilmotClient:
                     break
             elif len(videos) < 50:
                 break
-    
+
     def search_subtitles_all(
         self,
         query: str,
@@ -375,13 +633,13 @@ class FilmotClient:
     ) -> Dict[str, Any]:
         """
         Search subtitles and aggregate all pages into a single result.
-        
+
         Args:
             query: Search query
             max_pages: Maximum number of pages to fetch (default 10)
             max_results: Maximum total results to return (optional)
             **kwargs: All other search_subtitles parameters
-        
+
         Returns:
             Aggregated results with all videos combined
         """
@@ -391,7 +649,7 @@ class FilmotClient:
         total_count = 0
         pages_fetched = 0
         page_error = None
-        
+
         # Enforce max_results on distinct IDs here. Passing it into the raw
         # paginator could stop early when a changing index repeats a video
         # across adjacent pages.
@@ -408,7 +666,7 @@ class FilmotClient:
                     page_error = page_result.get("error")
                     break
                 return page_result
-            
+
             videos = page_result.get("result", page_result.get("videos", []))
             for video in videos:
                 video_id = video.get("id") or video.get("videoid")
@@ -420,12 +678,12 @@ class FilmotClient:
                 all_videos.append(video)
             total_count = page_result.get("totalresultcount", len(all_videos))
             pages_fetched += 1
-            
+
             # Trim to max_results if specified
             if max_results and len(all_videos) >= max_results:
                 all_videos = all_videos[:max_results]
                 break
-        
+
         aggregated = {
             "result": all_videos,
             "totalresultcount": total_count,

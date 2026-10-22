@@ -16,6 +16,24 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Added
 
+- Direct Filmot API support (`FILMOT_API_KEY`, `X-API-Key`,
+  `https://apiv1.filmot.com/api/v1`) alongside the legacy RapidAPI gateway.
+  The default `auto` policy routes subtitle search, video metadata, and channel
+  lookup through RapidAPI when configured, fails over to the direct API on
+  credential, quota, availability, server, invalid-response, or network
+  failures, and sends direct-only routes to the direct API. `direct` and
+  `rapidapi` pin one provider without failover, via `FILMOT_API_PROVIDER` or
+  the new root `--api-provider` option; `FILMOT_API_BASE_URL` overrides the
+  direct host.
+- Per-invocation API usage: requests, cache hits, credits charged and
+  remaining, plan requests remaining, and failovers appear in a stderr
+  summary line, under `_filmot.api` in raw results, and on ledger events.
+  `filmot config` reports both providers and the resolved routes without
+  printing credentials.
+- Provider-neutral channel suggestions: either provider's
+  `/getsearchchannels` records gain the direct API's `channelid`, `name`,
+  `handle`, and `totalviewcount` fields while keeping their original fields.
+  `channels` shows a Country column when the provider supplies one.
 - `docs/YOUTUBE_ROADMAP.md`, a durable ranked queue for future public read surfaces,
   OAuth/policy gates, and the admission checklist for each new YouTube slice.
 - Named search-session routing through `--session` and `FILMOT_SESSION`, with
@@ -221,6 +239,20 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- An exhausted Filmot credit or plan quota (`429`) is reported immediately as
+  `FilmotQuotaExhausted`, with cost, usage, limit, and reset time. Previously
+  the client retried it like rate limiting for about 75 seconds before failing.
+- Rejected credentials report `FilmotAuthenticationError`, naming the provider
+  and its key variable, instead of an HTTP error that echoed a request URL.
+  Other failures carry a typed `error_type` and the provider name. Configured
+  keys are scrubbed from response bodies, error text, and error details
+  before output, caching, or logging, and transport failures still count in
+  the usage summary.
+- `channels` and channel CSV export no longer depend on RapidAPI-only field
+  names, which rendered direct-API results with blank names and IDs.
+- Tests can no longer reach a live Filmot API: every test runs with fake keys
+  on reserved `.invalid` hosts, and any unmocked request fails the test. One
+  transcript test that silently made a live metadata lookup now mocks it.
 - Comment/reply CLI timeouts now reject non-finite values before provider or
   ledger activity (F-023).
 - A later-page `commentsDisabled` response preserves earlier rows as partial

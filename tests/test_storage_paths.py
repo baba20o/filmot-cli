@@ -135,16 +135,22 @@ def test_configuration_precedence_and_no_parent_dotenv_search(
         encoding="utf-8",
     )
     (project / ".env").write_text(
-        "RAPIDAPI_KEY=project-value\nPROJECT_ONLY=loaded\n",
+        "RAPIDAPI_KEY=project-value\nFILMOT_API_KEY=project-direct\n"
+        "PROJECT_ONLY=loaded\n",
         encoding="utf-8",
     )
     user_config = tmp_path / "config.env"
     user_config.write_text(
-        "RAPIDAPI_KEY=user-value\nUSER_ONLY=loaded\n",
+        "RAPIDAPI_KEY=user-value\nFILMOT_API_KEY=user-direct\nUSER_ONLY=loaded\n",
         encoding="utf-8",
     )
     environment = os.environ.copy()
-    for name in ("PARENT_ONLY", "PROJECT_ONLY", "USER_ONLY"):
+    # The test process may have loaded a developer's real keys from .env;
+    # never pass them to the child or let them decide precedence.
+    for name in (
+        "PARENT_ONLY", "PROJECT_ONLY", "USER_ONLY",
+        "FILMOT_API_KEY", "FILMOT_API_BASE_URL", "FILMOT_API_PROVIDER",
+    ):
         environment.pop(name, None)
     environment.update(
         {
@@ -160,6 +166,7 @@ def test_configuration_precedence_and_no_parent_dotenv_search(
                 "import json, os; import filmot.config as config; "
                 "print(json.dumps({"
                 "'key': config.API_KEY, "
+                "'direct': config.DIRECT_API_KEY, "
                 "'user': os.getenv('USER_ONLY'), "
                 "'project': os.getenv('PROJECT_ONLY'), "
                 "'parent': os.getenv('PARENT_ONLY')"
@@ -175,6 +182,7 @@ def test_configuration_precedence_and_no_parent_dotenv_search(
 
     assert json.loads(result.stdout) == {
         "key": "process-value",
+        "direct": "user-direct",
         "user": "loaded",
         "project": "loaded",
         "parent": None,

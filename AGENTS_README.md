@@ -1439,6 +1439,36 @@ filmot transcript VIDEO_ID --fallback --full
 ```
 Requires: `yt-dlp`, `boto3`, `requests`, and AWS profile `APIBoss` configured.
 
+### Filmot API providers, credits, and failover
+
+Filmot can use the direct API (`FILMOT_API_KEY`) and the legacy RapidAPI
+gateway (`RAPIDAPI_KEY`) side by side. Under the default `auto` policy, subtitle
+search, video metadata, and channel lookup go to RapidAPI when it is configured
+and fail over to the direct API on credential, quota, availability, server, or
+network failures. Direct-only features always use the direct API. Pin one
+provider with `filmot --api-provider direct|rapidapi COMMAND ...` or
+`FILMOT_API_PROVIDER`.
+
+Budget direct credits deliberately. They come from a monthly allowance. An
+unscoped subtitle-search page costs 5 credits, but only 1 when `--channel-id`
+names one to five channels, so scope searches to known channels when the
+question allows it. Every command that used the API prints a `Filmot API:` line
+on stderr, and `--raw` results carry the same details under `_filmot.api`:
+credits charged and remaining, plan requests remaining, cache hits, and
+`failovers` showing which provider actually served each failed-over route.
+
+Error results name the provider and an `error_type`:
+
+- `FilmotQuotaExhausted`: credits or plan quota are gone. Stop issuing Filmot
+  requests until `quota.reset_at`; retrying cannot help.
+- `FilmotAuthenticationError`: the named key environment variable is missing,
+  wrong, or unsubscribed.
+- `FilmotRateLimited`: backoff was exhausted; slow down.
+- `FilmotServiceError`, `FilmotEndpointUnavailable`, `FilmotConnectionError`:
+  provider-side or network failures. Under `auto`, a legacy route that failed
+  this way was already retried on the other provider if both keys are
+  configured. Direct-only routes and pinned providers have no fallback.
+
 ### Direct YouTube API failures and credentials
 
 `yt-search`, `yt-video`, `yt-playlist`, `yt-playlists`, and `yt-data refresh`
@@ -1458,9 +1488,10 @@ key are not propagated. This boundary is defense in depth—never put secrets in
 queries, titles, notes, or committed artifacts, and rotate a key if exposure is
 suspected.
 
-Run `filmot config` for a credential-safe preflight. It reports the Filmot and
-YouTube API keys separately as `configured` or `not configured`; it never
-prints either value or a fragment.
+Run `filmot config` for a credential-safe preflight. It reports the direct
+Filmot, RapidAPI, and YouTube API keys separately as `configured` or
+`not configured`, plus the active provider policy and how legacy and
+direct-only routes resolve. It never prints a key or a fragment of one.
 
 ### IP Blocked
 YouTube may block your IP for transcript requests:

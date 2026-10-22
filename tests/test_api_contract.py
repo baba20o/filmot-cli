@@ -20,6 +20,7 @@ FIXTURE_ENDPOINTS = {
     "search_subtitles_context.json": "/getsearchsubtitles",
     "search_subtitles_lines.json": "/getsearchsubtitles",
     "search_channels.json": "/getsearchchannels",
+    "search_channels_direct.json": "/getsearchchannels",
     "get_videos.json": "/getvideos",
 }
 
@@ -96,12 +97,7 @@ def test_unknown_endpoint_is_not_constrained():
     assert validate_api_response("/future-endpoint", payload) is payload
 
 
-@patch("filmot.api.get_headers", return_value={})
-@patch("filmot.api.validate_config")
-def test_client_returns_machine_readable_contract_error(
-    mock_validate,
-    mock_headers,
-):
+def test_client_returns_machine_readable_contract_error():
     client = FilmotClient(use_cache=False)
     response = client.session.request = MagicMock()
     response.return_value.raise_for_status.return_value = None
@@ -118,14 +114,8 @@ def test_client_returns_machine_readable_contract_error(
     assert "not-an-array" not in result["error"]
 
 
-@patch("filmot.api.get_headers", return_value={})
-@patch("filmot.api.validate_config")
 @patch("filmot.api.get_cache")
-def test_cached_responses_are_validated_too(
-    mock_get_cache,
-    mock_validate,
-    mock_headers,
-):
+def test_cached_responses_are_validated_too(mock_get_cache):
     cache = mock_get_cache.return_value
     cache.get.return_value = {
         "result": "not-an-array",
@@ -179,3 +169,39 @@ def test_recorder_sanitizer_drops_credentials_but_keeps_hit_token_shape():
     assert sanitized["hits"][0]["token"] == "recorded phrase"
     assert "user" not in sanitized["hits"][0]["proxy"]
     assert "password" not in sanitized["hits"][0]["proxy"]
+
+
+def _recorder():
+    return runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts" / "record_filmot_api_fixtures.py")
+    )
+
+
+def test_recorder_sanitizer_drops_direct_api_key_fields():
+    sanitized = _recorder()["sanitize_response"](
+        {"X-API-Key": "never-write-me", "apikey": "nor-me", "name": "Some channel"}
+    )
+
+    assert sanitized == {"name": "Recorded channel 001"}
+
+
+def test_recorder_refuses_to_write_a_fixture_containing_a_configured_key(
+    monkeypatch, tmp_path,
+):
+    class EchoingClient:
+        def __init__(self, use_cache=False):
+            pass
+
+        def get(self, endpoint, params=None):
+            # An unknown field the sanitizer keeps verbatim.
+            return [{"channelid": "UCx", "name": "x", "note": "test-direct-key"}]
+
+    monkeypatch.setattr("filmot.api.FilmotClient", EchoingClient)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["record", "--only", "search_channels", "--output-dir", str(tmp_path)],
+    )
+
+    with pytest.raises(SystemExit, match="refusing to write a fixture containing a configured key"):
+        _recorder()["main"]()
+    assert not list(tmp_path.iterdir())

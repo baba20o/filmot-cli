@@ -7,6 +7,7 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from ._version import __version__
 from .api import FilmotClient
+from .api_providers import api_provider_option
 from .cli_support import (
     command_error as _command_error,
     console,
@@ -19,6 +20,7 @@ from .session_context import session_option
 @click.group()
 @click.version_option(version=__version__, prog_name="filmot")
 @session_option
+@api_provider_option
 def cli():
     """Filmot CLI - Search YouTube transcripts and metadata."""
     pass
@@ -29,7 +31,7 @@ def cli():
 @cli.command()
 def config():
     """Show resolved configuration and storage paths without writing state."""
-    from .config import API_KEY, API_HOST, BASE_URL
+    from .api_providers import describe_configuration
     from .paths import (
         config_file,
         project_data_dir,
@@ -41,17 +43,14 @@ def config():
     from .youtube_search import validate_youtube_api
 
     # Configuration inventory should never disclose credential fragments.
-    key_status = "configured" if API_KEY else "not configured"
     try:
         validate_youtube_api()
         youtube_key_status = "configured"
     except ValueError:
         youtube_key_status = "not configured"
     rows = (
-        ("API Host", API_HOST),
-        ("Filmot API Key", key_status),
+        *describe_configuration(),
         ("YouTube API Key", youtube_key_status),
-        ("Base URL", BASE_URL),
         ("Project Data", str(project_data_dir())),
         ("User Config", str(user_config_dir())),
         ("Config File", str(config_file())),
@@ -624,6 +623,15 @@ for command in (
     cli.add_command(command)
 
 
+def _print_api_usage() -> None:
+    """Report this invocation's Filmot API requests and credits on stderr."""
+    from .api_usage import summary_line
+
+    line = summary_line()
+    if line:
+        click.echo(line, err=True)
+
+
 def main():
     """Run Click with Unix-friendly broken-pipe handling, including flush."""
     try:
@@ -636,6 +644,8 @@ def main():
         except click.Abort:
             click.echo("Aborted!", err=True)
             exit_code = 1
+
+        _print_api_usage()
 
         # Buffered output may not observe a closed downstream reader until
         # interpreter shutdown, which CPython reports as exit 120. Flush while
