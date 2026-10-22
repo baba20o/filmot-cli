@@ -31,9 +31,9 @@ def cli():
 @cli.command()
 def config():
     """Show resolved configuration and storage paths without writing state."""
+    from . import config as loaded_config
     from .api_providers import describe_configuration
     from .paths import (
-        config_file,
         project_data_dir,
         proxy_health_db,
         user_cache_dir,
@@ -53,7 +53,8 @@ def config():
         ("YouTube API Key", youtube_key_status),
         ("Project Data", str(project_data_dir())),
         ("User Config", str(user_config_dir())),
-        ("Config File", str(config_file())),
+        # The file actually loaded at startup; resolving again could differ.
+        ("Config File", str(loaded_config.USER_CONFIG_FILE)),
         ("User State", str(user_state_dir())),
         ("Proxy Health", str(proxy_health_db())),
         ("User Cache", str(user_cache_dir())),

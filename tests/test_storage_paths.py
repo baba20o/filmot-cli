@@ -189,6 +189,399 @@ def test_configuration_precedence_and_no_parent_dotenv_search(
     }
 
 
+_CONFIG_PROBE = '''
+import importlib, json, os, subprocess, sys
+import filmot.config as config
+
+NAMES = ("FILMOT_API_BASE_URL", "RAPIDAPI_HOST", "FILMOT_CONFIG_FILE",
+         "REQUESTS_CA_BUNDLE", "HTTPS_PROXY")
+
+
+def report():
+    return {
+        "direct": config.DIRECT_BASE_URL,
+        "host": config.API_HOST,
+        "ignored": list(config.IGNORED_PROJECT_SETTINGS),
+        "env": {name: os.environ.get(name) for name in NAMES},
+        "odd_names": sorted(name for name in os.environ if ":" in name or "," in name),
+    }
+
+
+first = report()
+importlib.reload(config)
+reloaded = report()
+child = subprocess.run(
+    [sys.executable, "-c",
+     "import json, filmot.config as c; print(json.dumps([c.DIRECT_BASE_URL, c.API_HOST]))"],
+    capture_output=True, text=True, check=True,
+)
+print(json.dumps({"first": first, "reloaded": reloaded, "child": json.loads(child.stdout)}))
+'''
+
+DEFAULT_ENDPOINTS = ["https://apiv1.filmot.com/api/v1", "filmot-tube-metadata-archive.p.rapidapi.com"]
+
+
+def _probe_config(tmp_path, project_env, user_env="", process_env=None, user_file=True):
+    """Import, reload, and inherit filmot.config; report endpoints at each step.
+
+    ``user_file=True`` locates the trusted per-user config with FILMOT_CONFIG_FILE,
+    ``False`` with FILMOT_CONFIG_DIR only (a default install), and a string is
+    used verbatim as FILMOT_CONFIG_FILE.
+    """
+    project = tmp_path / "project"
+    user_dir = tmp_path / "user-config"
+    project.mkdir()
+    user_dir.mkdir()
+    (project / ".env").write_text(project_env, encoding="utf-8")
+    user_config = user_dir / "config.env"
+    user_config.write_text("FILMOT_API_KEY=user-direct\n" + user_env, encoding="utf-8")
+    probe = tmp_path / "probe.py"
+    probe.write_text(_CONFIG_PROBE, encoding="utf-8")
+    environment = os.environ.copy()
+    for name in (
+        "FILMOT_API_KEY", "FILMOT_API_BASE_URL", "RAPIDAPI_HOST", "RAPIDAPI_KEY",
+        "FILMOT_CONFIG_FILE", "FILMOT_CONFIG_DIR", "REQUESTS_CA_BUNDLE", "HTTPS_PROXY",
+    ):
+        environment.pop(name, None)
+    # Start like a fresh shell: no pin inherited from this test process.
+    for name in [name for name in environment if name.upper() == "FILMOT_TRUSTED_CONFIG"]:
+        environment.pop(name)
+    if isinstance(user_file, str):
+        environment["FILMOT_CONFIG_FILE"] = user_file
+    elif user_file:
+        environment["FILMOT_CONFIG_FILE"] = str(user_config)
+    else:
+        environment["FILMOT_CONFIG_DIR"] = str(user_dir)
+    environment.update(process_env or {})
+    result = subprocess.run(
+        [sys.executable, str(probe)],
+        cwd=project, env=environment, check=True, capture_output=True, text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def _endpoints(report):
+    return [report["direct"], report["host"]]
+
+
+def test_a_project_env_cannot_redirect_api_endpoints(tmp_path):
+    reported = _probe_config(
+        tmp_path,
+        "FILMOT_API_BASE_URL=https://evil.invalid/api/v1\nRAPIDAPI_HOST=evil.invalid\n",
+    )
+
+    for step in ("first", "reloaded"):
+        assert _endpoints(reported[step]) == DEFAULT_ENDPOINTS
+        assert sorted(reported[step]["ignored"]) == ["FILMOT_API_BASE_URL", "RAPIDAPI_HOST"]
+        assert reported[step]["env"]["FILMOT_API_BASE_URL"] is None
+    assert reported["child"] == DEFAULT_ENDPOINTS
+
+
+def test_a_project_env_cannot_choose_the_trusted_config_file(tmp_path):
+    # Without a trusted FILMOT_CONFIG_FILE, a project could name itself as the
+    # per-user config for a reload or a child process to trust.
+    reported = _probe_config(
+        tmp_path,
+        "FILMOT_CONFIG_FILE=.env\nFILMOT_API_BASE_URL=https://evil.invalid/api/v1\n",
+        user_file=False,
+    )
+
+    for step in ("first", "reloaded"):
+        assert _endpoints(reported[step]) == DEFAULT_ENDPOINTS
+        assert sorted(reported[step]["ignored"]) == ["FILMOT_API_BASE_URL", "FILMOT_CONFIG_FILE"]
+        assert reported[step]["env"]["FILMOT_CONFIG_FILE"] is None
+    assert reported["child"] == DEFAULT_ENDPOINTS
+
+
+def test_a_project_variable_cannot_complete_a_trusted_config_path(tmp_path):
+    # The trusted path refers to a variable only the project .env defines. A
+    # reload or child must resolve it exactly as the first import did.
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    (attacker / "config.env").write_text(
+        "FILMOT_API_BASE_URL=https://evil.invalid/api/v1\n", encoding="utf-8",
+    )
+    reported = _probe_config(
+        tmp_path,
+        "CONFIG_ANCHOR={}\n".format(attacker),
+        user_file="${CONFIG_ANCHOR}/config.env",
+    )
+
+    assert _endpoints(reported["first"]) == DEFAULT_ENDPOINTS
+    assert _endpoints(reported["reloaded"]) == DEFAULT_ENDPOINTS
+    assert reported["child"] == DEFAULT_ENDPOINTS
+
+
+def test_names_that_are_not_identifiers_cannot_steer_config_loading(tmp_path):
+    # python-dotenv accepts ':' and ',' in names. Such a name must neither be
+    # exported nor change how a trusted ${CONFIG_ANCHOR} path resolves later,
+    # even with a project directory literally named "${CONFIG_ANCHOR}".
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    # The trusted config leaves the endpoint unset, so a later load could fill it.
+    (safe / "config.env").write_text("FILMOT_API_KEY=user-direct\n", encoding="utf-8")
+    decoy = tmp_path / "project" / "${CONFIG_ANCHOR}"
+    decoy.mkdir(parents=True)
+    (decoy / "config.env").write_text(
+        "FILMOT_API_BASE_URL=https://evil.invalid/api/v1\n", encoding="utf-8",
+    )
+    (tmp_path / "project" / ".env").write_text(
+        "JUNK:ignored,CONFIG_ANCHOR={}\nCONFIG:ANCHOR=x\n".format(safe), encoding="utf-8",
+    )
+    probe = tmp_path / "probe.py"
+    probe.write_text(_CONFIG_PROBE, encoding="utf-8")
+    environment = {
+        key: value for key, value in os.environ.items()
+        if key.upper() not in {
+            "FILMOT_API_KEY", "FILMOT_API_BASE_URL", "RAPIDAPI_HOST", "FILMOT_CONFIG_FILE",
+            "FILMOT_CONFIG_DIR", "FILMOT_TRUSTED_CONFIG", "CONFIG_ANCHOR",
+        }
+    }
+    environment.update({
+        "FILMOT_CONFIG_FILE": "${CONFIG_ANCHOR}/config.env",
+        "CONFIG_ANCHOR": str(safe),
+    })
+    result = subprocess.run(
+        [sys.executable, str(probe)],
+        cwd=tmp_path / "project", env=environment, check=True, capture_output=True, text=True,
+    )
+    reported = json.loads(result.stdout)
+
+    assert _endpoints(reported["first"]) == DEFAULT_ENDPOINTS
+    assert _endpoints(reported["reloaded"]) == DEFAULT_ENDPOINTS
+    assert reported["child"] == DEFAULT_ENDPOINTS
+    assert reported["first"]["odd_names"] == []
+
+
+_PARENT_PROBE = '''
+import json, os, subprocess, sys
+import filmot.config as config  # writes the real pin for this environment
+
+child_environment = dict(os.environ)
+child_environment.update(json.loads(sys.argv[1]))
+child = subprocess.run(
+    [sys.executable, "-c",
+     "import json, os, filmot.config as c; "
+     "print(json.dumps([os.environ.get('YOUTUBE_API_KEY', ''), c.DIRECT_BASE_URL, "
+     "str(c.USER_CONFIG_FILE)]))"],
+    env=child_environment, capture_output=True, text=True, check=True,
+)
+print(json.dumps({"ignored": list(config.IGNORED_PROJECT_SETTINGS),
+                  "parent_config": str(config.USER_CONFIG_FILE),
+                  "child": json.loads(child.stdout)}))
+'''
+
+_LOCATION_NAMES = {
+    "FILMOT_API_KEY", "YOUTUBE_API_KEY", "FILMOT_API_BASE_URL", "FILMOT_CONFIG_FILE",
+    "FILMOT_CONFIG_DIR", "FILMOT_TRUSTED_CONFIG", "CONFIG_ANCHOR", "PREFIX",
+    "XDG_CONFIG_HOME",
+}
+
+
+def _parent_and_child(tmp_path, trusted, child_change, project_env=""):
+    """Import config in a parent with ``trusted`` settings, then in a child."""
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+    (project / ".env").write_text(project_env, encoding="utf-8")
+    probe = tmp_path / "parent_probe.py"
+    probe.write_text(_PARENT_PROBE, encoding="utf-8")
+    environment = {
+        key: value for key, value in os.environ.items() if key.upper() not in _LOCATION_NAMES
+    }
+    environment.update(trusted)
+    result = subprocess.run(
+        [sys.executable, str(probe), json.dumps(child_change)],
+        cwd=project, env=environment, check=True, capture_output=True, text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def _config_dir(root, name, content):
+    (root / name).mkdir(parents=True, exist_ok=True)
+    (root / name / "config.env").write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize("parent_change,expected", [
+    ({}, ""),
+    # Following this change would mean expanding ${CONFIG_ANCHOR} again in an
+    # environment that may hold project values, so the child keeps the pin.
+    ({"CONFIG_ANCHOR": "second"}, ""),
+    ({"FILMOT_CONFIG_FILE": "second/config.env"}, "from-second"),
+    ({"FILMOT_CONFIG_FILE": "", "FILMOT_CONFIG_DIR": "second"}, "from-second"),
+    # A changed FILMOT_CONFIG_FILE that would itself need expanding or
+    # resolving against the working directory keeps the pin too.
+    ({"FILMOT_CONFIG_FILE": "=${CONFIG_ANCHOR}/../second/config.env"}, ""),
+    ({"FILMOT_CONFIG_FILE": "=%CONFIG_ANCHOR%/../second/config.env"}, ""),
+    ({"FILMOT_CONFIG_FILE": "=~/second/config.env"}, ""),
+    ({"FILMOT_CONFIG_FILE": "=../second/config.env"}, ""),
+])
+def test_a_child_honors_only_literal_location_changes_from_its_parent(tmp_path, parent_change, expected):
+    _config_dir(tmp_path, "first", "FILMOT_API_KEY=first\n")
+    _config_dir(tmp_path, "second", "YOUTUBE_API_KEY=from-second\n")
+
+    def child_value(value):
+        # "=" marks a value passed verbatim; others are paths under tmp_path.
+        if value.startswith("="):
+            return value[1:]
+        return str(tmp_path / value) if value else ""
+
+    reported = _parent_and_child(
+        tmp_path,
+        {"FILMOT_CONFIG_FILE": "${CONFIG_ANCHOR}/config.env", "CONFIG_ANCHOR": str(tmp_path / "first")},
+        {name: child_value(value) for name, value in parent_change.items()},
+    )
+
+    assert reported["child"][0] == expected
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="macOS config dirs do not expand variables")
+@pytest.mark.parametrize("changed", ["XDG_CONFIG_HOME", "APPDATA", "HOME", "HOMEPATH", "USERNAME"])
+def test_a_child_never_reexpands_the_config_location(tmp_path, changed):
+    # paths expands the default base twice and can read home fallbacks and the
+    # working directory, so resolving again in a child could reach a project
+    # variable (here CONFIG_ANCHOR, through APPDATA or XDG_CONFIG_HOME). After
+    # any parent change to a platform input, the child keeps the pinned path.
+    _config_dir(tmp_path / "project" / "attacker", "filmot",
+                "FILMOT_API_BASE_URL=https://evil.invalid/api/v1\n")
+    reported = _parent_and_child(
+        tmp_path,
+        {"APPDATA": "${PREFIX}", "XDG_CONFIG_HOME": "${PREFIX}", "PREFIX": "${CONFIG_ANCHOR}"},
+        {changed: str(tmp_path / "elsewhere")},
+        project_env="CONFIG_ANCHOR=attacker\n",
+    )
+
+    assert reported["child"][2] == reported["parent_config"]
+    assert reported["child"][1] == "https://apiv1.filmot.com/api/v1"
+
+
+def test_a_location_named_inside_the_per_user_config_does_not_move_children(tmp_path):
+    # The per-user config sets a literal FILMOT_CONFIG_FILE; the first import
+    # never loaded that file, so a child must not either.
+    _config_dir(tmp_path, "located", "FILMOT_CONFIG_FILE={}\n".format(tmp_path / "other" / "config.env"))
+    _config_dir(tmp_path, "other", "YOUTUBE_API_KEY=from-other\n")
+    reported = _parent_and_child(tmp_path, {"FILMOT_CONFIG_DIR": str(tmp_path / "located")}, {})
+
+    assert reported["child"][2] == reported["parent_config"]
+    assert reported["child"][0] == ""
+
+
+_RECORDING_PROBE = '''
+import json, os
+from collections.abc import MutableMapping
+
+real, writes, deletes = os.environ, [], []
+
+
+class Recorder(MutableMapping):
+    def __getitem__(self, key):
+        return real[key]
+
+    def __setitem__(self, key, value):
+        writes.append([key, value])
+        real[key] = value
+
+    def __delitem__(self, key):
+        deletes.append(key)
+        del real[key]
+
+    def __iter__(self):
+        return iter(real)
+
+    def __len__(self):
+        return len(real)
+
+    def copy(self):
+        return dict(real)
+
+
+os.environ = Recorder()
+import filmot.config
+print(json.dumps({"writes": writes, "deletes": deletes}))
+'''
+
+
+def test_config_loading_never_publishes_protected_values_or_removes_variables(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text(
+        "FILMOT_API_BASE_URL=https://evil.invalid/api/v1\nfilmot_api_base_url=https://evil.invalid\n"
+        "REQUESTS_CA_BUNDLE=./attacker-ca.pem\nPROJECT_ONLY=kept\n",
+        encoding="utf-8",
+    )
+    user_config = tmp_path / "config.env"
+    user_config.write_text("FILMOT_API_KEY=user-direct\n", encoding="utf-8")
+    probe = tmp_path / "recording_probe.py"
+    probe.write_text(_RECORDING_PROBE, encoding="utf-8")
+    environment = {
+        key: value for key, value in os.environ.items()
+        if key.upper() not in {
+            "FILMOT_API_KEY", "FILMOT_API_BASE_URL", "REQUESTS_CA_BUNDLE",
+            "FILMOT_CONFIG_FILE", "FILMOT_TRUSTED_CONFIG", "PROJECT_ONLY",
+        }
+    }
+    environment["FILMOT_CONFIG_FILE"] = str(user_config)
+    result = subprocess.run(
+        [sys.executable, str(probe)],
+        cwd=project, env=environment, check=True, capture_output=True, text=True,
+    )
+    recorded = json.loads(result.stdout)
+
+    written = {key.upper(): value for key, value in recorded["writes"]}
+    assert recorded["deletes"] == []
+    assert written["PROJECT_ONLY"] == "kept"
+    assert "FILMOT_API_BASE_URL" not in written
+    assert "REQUESTS_CA_BUNDLE" not in written
+    assert all("evil.invalid" not in value for value in written.values())
+
+
+def test_project_env_values_cannot_embed_keys_or_set_tls_trust(tmp_path):
+    reported = _probe_config(
+        tmp_path,
+        "HTTPS_PROXY=http://relay:${FILMOT_API_KEY}@proxy.invalid:8080\n"
+        "REQUESTS_CA_BUNDLE=./attacker-ca.pem\n",
+    )
+
+    environment = reported["first"]["env"]
+    # Read literally: the key loaded from the per-user config is never embedded.
+    assert environment["HTTPS_PROXY"] == "http://relay:${FILMOT_API_KEY}@proxy.invalid:8080"
+    assert environment["REQUESTS_CA_BUNDLE"] is None
+    assert reported["first"]["ignored"] == ["REQUESTS_CA_BUNDLE"]
+
+
+def test_endpoint_overrides_still_come_from_the_environment_and_user_config(tmp_path):
+    reported = _probe_config(
+        tmp_path,
+        "FILMOT_API_BASE_URL=https://evil.invalid/api/v1\n"
+        "RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com\n",
+        user_env="FILMOT_API_BASE_URL=https://staging.filmot.invalid/api/v1/\n",
+        process_env={"RAPIDAPI_HOST": "gateway.filmot.invalid"},
+    )
+
+    expected = ["https://staging.filmot.invalid/api/v1", "gateway.filmot.invalid"]
+    assert _endpoints(reported["first"]) == expected
+    assert _endpoints(reported["reloaded"]) == expected
+    assert reported["child"] == expected
+    assert reported["first"]["ignored"] == []
+
+
+def test_a_project_env_default_endpoint_is_dropped_without_a_warning(tmp_path):
+    reported = _probe_config(
+        tmp_path, "RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com\n",
+    )
+
+    assert reported["first"]["ignored"] == []
+    assert reported["first"]["env"]["RAPIDAPI_HOST"] is None
+    assert _endpoints(reported["first"]) == DEFAULT_ENDPOINTS
+
+
+def test_whitespace_only_overrides_mean_the_defaults(tmp_path):
+    reported = _probe_config(
+        tmp_path, "", process_env={"FILMOT_API_BASE_URL": "   ", "RAPIDAPI_HOST": " "},
+    )
+
+    assert _endpoints(reported["first"]) == DEFAULT_ENDPOINTS
+
+
 def test_environment_loading_is_centralized_and_explicit():
     package = Path(__file__).resolve().parents[1] / "filmot"
     calls = []

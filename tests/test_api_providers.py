@@ -331,6 +331,20 @@ def test_rate_limiting_backs_off_then_fails_over(transport, monkeypatch):
     assert api_usage.snapshot()["failovers"][0]["reason"] == "rate-limited"
 
 
+@pytest.mark.parametrize("retry_after,expected", [("-1", 0), ("99999", 60), ("7", 7), ("soon", 5)])
+def test_retry_after_waits_are_clamped(transport, monkeypatch, retry_after, expected):
+    sleep = MagicMock()
+    monkeypatch.setattr("filmot.api.time.sleep", sleep)
+    transport.queues["rapidapi"].extend([
+        FakeResponse(429, {"message": "Too many requests"}, headers={"Retry-After": retry_after}),
+        FakeResponse(200, []),
+    ])
+    client = make_client(transport)
+
+    assert client.get_videos("dQw4w9WgXcQ") == []
+    sleep.assert_called_once_with(expected)
+
+
 def test_credentials_never_reach_error_results(transport):
     leak = "https://direct.filmot.invalid/x?key=test-direct-key X-API-Key: test-rapidapi-key"
     transport.queues["rapidapi"].append(requests.exceptions.ConnectionError(leak))
@@ -800,6 +814,68 @@ def test_config_never_prints_userinfo_from_a_base_url_override(monkeypatch):
     rows = dict(describe_configuration())
 
     assert rows["Direct API URL"] == "https://***:***@staging.filmot.invalid/api/v1"
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("DIRECT_BASE_URL", "http://direct.filmot.invalid/api/v1", "FILMOT_API_BASE_URL must be an https:// URL"),
+    ("DIRECT_BASE_URL", "direct.filmot.invalid/api/v1", "FILMOT_API_BASE_URL must be an https:// URL"),
+    ("API_HOST", "user:pw@rapidapi.filmot.invalid", "RAPIDAPI_HOST must be a host name"),
+    ("API_HOST", "rapidapi.filmot.invalid/path", "RAPIDAPI_HOST must be a host name"),
+])
+def test_unsafe_endpoints_never_receive_a_key(monkeypatch, field, value, message):
+    monkeypatch.setattr(app_config, field, value)
+    if field == "API_HOST":
+        monkeypatch.setattr(app_config, "RAPIDAPI_BASE_URL", "https://" + value)
+
+    with pytest.raises(ProviderConfigurationError, match=message):
+        FilmotClient()
+    rows = dict(describe_configuration())
+
+    rejected = "direct" if field == "DIRECT_BASE_URL" else "rapidapi"
+    assert rejected not in configured_providers()
+    label = "Direct API URL" if rejected == "direct" else "RapidAPI Host"
+    assert "(rejected: " in rows[label]
+    key_label = "Filmot API Key (direct)" if rejected == "direct" else "RapidAPI Key"
+    assert rows[key_label] == "set but unusable"
+
+
+def test_a_host_with_a_port_is_a_valid_rapidapi_endpoint(monkeypatch):
+    monkeypatch.setattr(app_config, "API_HOST", "rapidapi.filmot.invalid:8443")
+    monkeypatch.setattr(app_config, "RAPIDAPI_BASE_URL", "https://rapidapi.filmot.invalid:8443")
+
+    provider = configured_providers(require=True)["rapidapi"]
+
+    assert provider.url("/getvideos") == "https://rapidapi.filmot.invalid:8443/getvideos"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("DIRECT_BASE_URL", "https://direct.filmot.invalid:99999/api/v1"),
+    ("DIRECT_BASE_URL", "https://direct.filmot.invalid:abc/api/v1"),
+    ("DIRECT_BASE_URL", "https://direct.filmot.invalid:0/api/v1"),
+    ("API_HOST", "rapidapi.filmot.invalid:99999"),
+    ("API_HOST", "rapidapi.filmot.invalid:0"),
+])
+def test_endpoint_ports_must_be_valid(monkeypatch, field, value):
+    monkeypatch.setattr(app_config, field, value)
+
+    with pytest.raises(ProviderConfigurationError, match="no request was sent"):
+        configured_providers(require=True)
+
+
+def test_ignored_project_settings_are_reported_once(monkeypatch, caplog):
+    import filmot.api as api_module
+
+    monkeypatch.setattr(app_config, "IGNORED_PROJECT_SETTINGS", ("FILMOT_API_BASE_URL",))
+    monkeypatch.setattr(api_module, "_ignored_settings_reported", False)
+
+    with caplog.at_level("WARNING", logger="filmot.api"):
+        FilmotClient(use_cache=False)
+        FilmotClient(use_cache=False)
+
+    warnings = [record for record in caplog.records if "project .env" in record.getMessage()]
+    assert len(warnings) == 1
+    assert "FILMOT_API_BASE_URL" in warnings[0].getMessage()
+    assert "Ignored in project .env" in dict(describe_configuration())
 
 
 def test_root_option_selects_the_provider_for_one_invocation():

@@ -1484,7 +1484,16 @@ search, video metadata, and channel lookup go to RapidAPI when it is configured
 and fail over to the direct API on credential, quota, availability, server, or
 network failures. Direct-only features always use the direct API. Pin one
 provider with `filmot --api-provider direct|rapidapi COMMAND ...` or
-`FILMOT_API_PROVIDER`.
+`FILMOT_API_PROVIDER`. Endpoint overrides (`FILMOT_API_BASE_URL`,
+`RAPIDAPI_HOST`) are honored only from the process environment or the per-user
+`config.env`, never a project `.env`. For a provider whose key is set, a
+non-https base URL or a malformed host stops the command before any request,
+with a `ProviderConfigurationError`. A
+project `.env` also cannot set the per-user config location or TLS trust
+variables, and its `${VAR}` references are not expanded. These limits cover
+configuration loading only. Treat any other project `.env` setting, proxies
+included, as trusted configuration. The transcript helper process also starts
+Python from the current directory, so run Filmot only in directories you trust.
 
 Budget direct credits deliberately. They come from a monthly allowance. An
 unscoped subtitle-search page costs 5 credits, but only 1 when `--channel-id`

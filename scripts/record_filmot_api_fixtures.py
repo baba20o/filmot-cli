@@ -132,7 +132,10 @@ def _parser() -> argparse.ArgumentParser:
         "--env-file",
         type=Path,
         default=None,
-        help="Optional dotenv file loaded before importing the API client",
+        help=(
+            "Optional dotenv file loaded before importing the API client. It is "
+            "trusted like the process environment, so it may set endpoint overrides"
+        ),
     )
     parser.add_argument(
         "--output-dir",
