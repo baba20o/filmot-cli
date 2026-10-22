@@ -81,5 +81,3 @@ nul
 
 # Claude Code settings (local)
 .claude/
-# Local planning / context docs
-docs/

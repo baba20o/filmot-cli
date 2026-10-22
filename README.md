@@ -129,10 +129,10 @@ Get your API key from [Filmot API on RapidAPI](https://filmot.com/api).
 For credentials shared across projects, use Filmot's per-user `config.env`
 instead. See [Storage and configuration](#storage-and-configuration).
 Restrict `YOUTUBE_API_KEY` to the YouTube Data API and the hosts/IPs that run
-Filmot. See [YouTube Data API behavior](YOUTUBE_API.md) for quota, attribution,
+Filmot. See [YouTube Data API behavior](docs/YOUTUBE_API.md) for quota, attribution,
 and 30-day metadata refresh/deletion expectations. Future read-only API
 opportunities and their admission gates live in the
-[YouTube API enhancement roadmap](YOUTUBE_ROADMAP.md).
+[YouTube API enhancement roadmap](docs/YOUTUBE_ROADMAP.md).
 
 ### Storage and configuration
 
@@ -345,7 +345,7 @@ metadata observation has UTC `metadata_observed_at` and
 automatically. API-owned fields in saved transcript records can be inspected,
 refreshed, or purged explicitly with `yt-data`; see
 [Saved YouTube Metadata Lifecycle](#saved-youtube-metadata-lifecycle) and the
-[30-day storage guidance](YOUTUBE_API.md#storage-and-the-30-day-rule).
+[30-day storage guidance](docs/YOUTUBE_API.md#storage-and-the-30-day-rule).
 
 The request defaults to 5-second connect and 20-second read timeouts with two
 bounded retries for transient network, timeout, server, or rate-limit errors.
@@ -472,7 +472,7 @@ create derived engagement metrics. Human rendering neutralizes bidi/Unicode
 format and terminal controls, collapses metadata newlines, and pads public text
 so it cannot visually impersonate Filmot labels; raw output remains unchanged.
 See the [comment-specific API and policy
-notes](YOUTUBE_API.md#public-comment-and-reply-cursors).
+notes](docs/YOUTUBE_API.md#public-comment-and-reply-cursors).
 
 ### Follow a Curated YouTube Playlist
 
@@ -1302,7 +1302,7 @@ page/API/item counts, row-quality counters, approximate total, next token,
 stopping reason, and partial state. Both channel resolution and every completed
 enumeration observation use a 30-day window. There is no automatic
 manifest-refresh/purge scheduler; see [YouTube Data API
-behavior](YOUTUBE_API.md).
+behavior](docs/YOUTUBE_API.md).
 
 Python integrations should prefer the bounded, resumable control-plane API:
 
@@ -1405,8 +1405,13 @@ filmot-cli/
 ├── main.py                 # CLI entry point
 ├── README.md               # This file
 ├── AGENTS_README.md        # Agent-specific usage guide
-├── YOUTUBE_API.md          # Shipped YouTube API behavior and policy boundary
-├── YOUTUBE_ROADMAP.md      # Ranked future YouTube API opportunities
+├── docs/
+│   ├── AGENTS_RESEARCH_GUIDE.md # Source assessment and verification guide for agents
+│   ├── YOUTUBE_API.md      # Shipped YouTube API behavior and policy boundary
+│   ├── YOUTUBE_ROADMAP.md  # Ranked future YouTube API opportunities
+│   ├── NEXT-SLICE.md       # Current release checks and follow-up backlog
+│   ├── AGENT_FEATURES_PLAN.md # Historical agent-experience feature plan
+│   └── FIELD_TEST_LOG.md   # Field-test findings and their resolutions
 └── filmot/
     ├── __init__.py         # Package exports
     ├── _version.py         # Single source for package/CLI version

@@ -327,7 +327,7 @@ forms in the `--title` parameter.
 Deterministic provider/CLI implementation and a bounded live API-key thread,
 reply, and emitted-continuation drive are complete. See the exact nested raw
 schemas in
-[AGENTS_README.md](AGENTS_README.md#transient-public-comment-and-reply-inspection).
+[AGENTS_README.md](../AGENTS_README.md#transient-public-comment-and-reply-inspection).
 Future endpoint priorities, OAuth-only surfaces, and policy gates are maintained
 in [YOUTUBE_ROADMAP.md](YOUTUBE_ROADMAP.md), not duplicated here.
 
