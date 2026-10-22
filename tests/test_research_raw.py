@@ -55,12 +55,16 @@ def backend(monkeypatch, library):
     return client, library
 
 
-def invoke(*args, scout=False):
-    return CliRunner().invoke(
-        cli,
-        ["research", "alpha beta", "--depth", "2", "--raw",
-         *([] if scout else ["--no-scout"]), *args],
-    )
+@pytest.fixture
+def invoke(stream_runner):
+    def run(*args, scout=False):
+        return stream_runner.invoke(
+            cli,
+            ["research", "alpha beta", "--depth", "2", "--raw",
+             *([] if scout else ["--no-scout"]), *args],
+        )
+
+    return run
 
 
 def assert_result_matches_ledger(result, *, status, exit_code, session="alpha-beta"):
@@ -84,7 +88,7 @@ def assert_result_matches_ledger(result, *, status, exit_code, session="alpha-be
     return payload, metadata
 
 
-def test_raw_saved_research_keeps_diagnostics_off_stdout(backend):
+def test_raw_saved_research_keeps_diagnostics_off_stdout(backend, invoke):
     result = invoke()
     payload, metadata = assert_result_matches_ledger(result, status="completed", exit_code=0)
     assert payload["selected"] == payload["saved"] == 2
@@ -96,7 +100,7 @@ def test_raw_saved_research_keeps_diagnostics_off_stdout(backend):
 
 
 @pytest.mark.parametrize("partial,expected", [(False, "empty"), (True, "partial")])
-def test_raw_empty_search_distinguishes_incomplete_discovery(backend, partial, expected):
+def test_raw_empty_search_distinguishes_incomplete_discovery(backend, invoke, partial, expected):
     client, _ = backend
     client.search_subtitles_all.return_value = {
         "result": [], "totalresultcount": 0,
@@ -110,7 +114,7 @@ def test_raw_empty_search_distinguishes_incomplete_discovery(backend, partial, e
 
 
 @pytest.mark.parametrize("fail_all,expected,code", [(False, "partial", 0), (True, "failed", 1)])
-def test_raw_item_failures_preserve_accounting(backend, monkeypatch, fail_all, expected, code):
+def test_raw_item_failures_preserve_accounting(backend, invoke, monkeypatch, fail_all, expected, code):
     def transcript(video_id, **kwargs):
         if fail_all or video_id == "source00002":
             return {"error": "captions unavailable", "error_type": "NoTranscript"}
@@ -130,7 +134,7 @@ def test_raw_item_failures_preserve_accounting(backend, monkeypatch, fail_all, e
     (FilmotAPIContractError("search", "$.result", "array", "object"), "FilmotAPIContractError", "failed"),
     (KeyboardInterrupt(), "KeyboardInterrupt", "interrupted"),
 ])
-def test_raw_search_exception_is_one_typed_failure(backend, error, expected_type, status):
+def test_raw_search_exception_is_one_typed_failure(backend, invoke, error, expected_type, status):
     client, _ = backend
     client.search_subtitles_all.side_effect = error
     payload, metadata = assert_result_matches_ledger(invoke(), status=status, exit_code=1)
@@ -138,7 +142,7 @@ def test_raw_search_exception_is_one_typed_failure(backend, error, expected_type
     assert metadata["errors"][-1]["type"] == expected_type
 
 
-def test_raw_library_initialization_failure_is_recorded(monkeypatch, backend):
+def test_raw_library_initialization_failure_is_recorded(monkeypatch, backend, invoke):
     def unavailable():
         raise OSError("library unavailable")
 
@@ -149,7 +153,7 @@ def test_raw_library_initialization_failure_is_recorded(monkeypatch, backend):
     assert metadata["errors"][0]["type"] == "OSError"
 
 
-def test_raw_search_error_response_is_typed_failure(backend):
+def test_raw_search_error_response_is_typed_failure(backend, invoke):
     client, _ = backend
     client.search_subtitles_all.return_value = {"error": "search quota exceeded"}
     _, metadata = assert_result_matches_ledger(invoke(), status="failed", exit_code=1)
@@ -158,7 +162,7 @@ def test_raw_search_error_response_is_typed_failure(backend):
 
 
 @pytest.mark.parametrize("session", [None, "named investigation"])
-def test_raw_serialization_failure_is_failed_in_ledger_too(backend, monkeypatch, session):
+def test_raw_serialization_failure_is_failed_in_ledger_too(backend, invoke, monkeypatch, session):
     _, library = backend
     monkeypatch.setattr(library, "list_transcripts", lambda topic: [{"duration": float("nan")}])
     _, metadata = assert_result_matches_ledger(
@@ -169,7 +173,7 @@ def test_raw_serialization_failure_is_failed_in_ledger_too(backend, monkeypatch,
     assert metadata["errors"][0]["type"] == "InvalidJSONValue"
 
 
-def test_raw_scout_failure_marks_research_partial(backend, monkeypatch):
+def test_raw_scout_failure_marks_research_partial(backend, invoke, monkeypatch):
     monkeypatch.setattr("filmot.youtube_search.validate_youtube_api", lambda: None)
     monkeypatch.setattr(
         "filmot.youtube_search.search_recent",
@@ -181,7 +185,7 @@ def test_raw_scout_failure_marks_research_partial(backend, monkeypatch):
 
 
 @pytest.mark.parametrize("session", ["named investigation", "!!!"])
-def test_raw_research_session_routes_results_and_saves_without_changing_topic(backend, session):
+def test_raw_research_session_routes_results_and_saves_without_changing_topic(backend, invoke, session):
     normalized = normalize_topic_name(session, fallback="session")
     result = invoke("--session", session)
     payload, _ = assert_result_matches_ledger(
