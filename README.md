@@ -874,7 +874,45 @@ filmot transcript VIDEO_ID --save-to my-topic --discovery discovery.json
 
 # Use AWS Transcribe fallback when YouTube captions unavailable
 filmot transcript VIDEO_ID --fallback --full
+
+# Take the transcript from Filmot's subtitle index, without contacting YouTube
+filmot transcript VIDEO_ID --source filmot
 ```
+
+#### Transcripts from Filmot's index
+
+Filmot keeps the caption tracks it indexed, including tracks for videos that
+YouTube has since made unavailable. When YouTube can't deliver a transcript,
+Filmot falls back to that index, before any AWS fallback. That covers a blocked
+IP or proxy, captions that are now disabled, and a video that has been removed.
+This applies to `transcript`, `download`, `search --bulk-download`,
+`research`, and `channel-download`. Each fallback is one `/getvideos` lookup:
+it goes through RapidAPI under `auto` routing, or costs 2 credits on the direct
+API. It is skipped when no Filmot key is configured.
+
+| `--source` | Behavior |
+| --- | --- |
+| `auto` (default) | YouTube first, then Filmot's index |
+| `youtube` | YouTube only, as before |
+| `filmot` | Filmot's index only; YouTube is never contacted |
+
+Set the default with `FILMOT_TRANSCRIPT_SOURCE`. `channel-download` follows
+that variable. `--fallback` downloads audio from YouTube, so it is refused in
+index-only mode. Filmot waits at most `FILMOT_TRANSCRIPT_ROUTE_TIMEOUT` (30
+seconds by default) for an index lookup, the same deadline as a YouTube route,
+and reports a slower lookup as `IndexTimeout`. An abandoned lookup starts no
+new requests, though one already sent may still be charged.
+
+Index transcripts are marked `source: filmot_index` and record a
+`transcript_index` block: the track's language, whether it was automatic,
+Filmot's snapshot date, the API provider, and, after a fallback, the YouTube
+error type. That block is also stored with library saves, including
+`channel-download` saves, whose manifest records each video's `source`. Filmot
+prefers a manual track over an automatic one in the first requested language it
+has. It cannot translate, so `--lang` must match a language Filmot indexed.
+Index lines carry start times only, so each segment ends where the next begins,
+and the last ends within 10 seconds. The captions are Filmot's snapshot and can
+be older than the video's current captions.
 
 Library saves retain the complete text plus any source caption segments and
 their timestamps. Filmot also normalizes citation-ready source metadata such
@@ -1830,7 +1868,8 @@ retires sessions that get rate-limited / blocked / fail to connect.
 | `FILMOT_PROXY_LEASE_SECONDS` | `120`         | Cross-process lease lifetime for a selected proxy session.          |
 | `FILMOT_TRANSCRIPT_CONNECT_TIMEOUT` | `8`    | Per-request connection deadline in seconds.                        |
 | `FILMOT_TRANSCRIPT_READ_TIMEOUT` | `15`       | Per-request read deadline in seconds.                              |
-| `FILMOT_TRANSCRIPT_ROUTE_TIMEOUT` | `30`      | Overall deadline for one transcript route in seconds.              |
+| `FILMOT_TRANSCRIPT_ROUTE_TIMEOUT` | `30`      | Overall deadline for one transcript route in seconds, Filmot index lookups included. |
+| `FILMOT_TRANSCRIPT_SOURCE`   | `auto`        | `auto` \| `youtube` \| `filmot`; see [Transcripts from Filmot's index](#transcripts-from-filmots-index). |
 
 On AWS hosts, `proxy-only` mode is the right default — direct requests will
 typically be blocked. `proxy-only` tries only eligible pool sessions.

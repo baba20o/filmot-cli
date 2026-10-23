@@ -1193,6 +1193,7 @@ class ChannelDownloader:
         Returns:
             dict with summary statistics
         """
+        from .index_transcript import index_provenance
         from .transcript import get_transcript
         
         if lang is None:
@@ -1331,6 +1332,10 @@ class ChannelDownloader:
                         'word_count': len(result.get('full_text', '').split()),
                         'full_text': result.get('full_text', ''),
                         'segments': result.get('segments', []),
+                        'source': result.get('source', 'youtube'),
+                        'route': result.get('route'),
+                        'routes_tried': result.get('routes_tried'),
+                        **index_provenance(result),
                         'downloaded_at': datetime.now().isoformat(),
                     }
                     self._save_transcript(channel_dir, vid_id, transcript_data)
@@ -1341,6 +1346,7 @@ class ChannelDownloader:
                         'is_generated': result.get('is_generated', True),
                         'duration_seconds': result.get('duration_seconds', 0),
                         'word_count': len(result.get('full_text', '').split()),
+                        'source': result.get('source', 'youtube'),
                         'downloaded_at': datetime.now().isoformat(),
                     })
                     session_downloaded += 1

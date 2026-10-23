@@ -1,0 +1,31 @@
+[
+  {
+    "id": "recorded-video-001",
+    "uploaddate": "2026-01-01",
+    "duration": 19,
+    "title": "Recorded video title 001",
+    "channelid": "recorded-channel-001",
+    "channelname": "Recorded channel 001",
+    "lastfetchdate": "2026-01-02",
+    "subtitles": [
+      {
+        "lang": "en",
+        "isauto": 0,
+        "transcript": [
+          {
+            "t": "recorded caption line",
+            "s": 1.2
+          },
+          {
+            "t": "recorded caption line",
+            "s": 5.318
+          },
+          {
+            "t": "recorded caption line",
+            "s": 7.974
+          }
+        ]
+      }
+    ]
+  }
+]

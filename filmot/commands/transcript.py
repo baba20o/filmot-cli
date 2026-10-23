@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import click
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
@@ -23,8 +24,11 @@ from ..cli_support import (
     redact_diagnostic as _redact_diagnostic,
     status_context as _search_status,
     stderr_console,
+    reject_index_only_aws_fallback,
+    transcript_source_option,
     whole_word_summary as _whole_word_summary,
 )
+from ..index_transcript import index_provenance
 from ..schemas import CommandResult, ErrorDetail, ResultStatus
 from ..video_metadata import enrich_after_save, enrichment_summary_line
 from .search import (
@@ -320,6 +324,7 @@ def _validated_saved_grep_candidate(
         "source": source,
         "route": "library",
         "routes_tried": ["library"],
+        **index_provenance(metadata),
     }
     try:
         validated = _validate_transcript_response(
@@ -1042,11 +1047,12 @@ def _render_download(outcome: CommandResult[dict]) -> None:
 )
 @click.option("--fallback/--no-fallback", default=False, help="Use AWS Transcribe if YouTube captions unavailable")
 @click.option("--grep", default=None, help="Search within the transcript using proximity operators (NEAR/N, ~N) — prints timestamped matches")
+@transcript_source_option
 @click.pass_context
 def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                raw: bool, output: str, full: bool, proxy: str, no_proxy: bool,
                save_to: str, discovery: Optional[Path], fallback: bool,
-               grep: str):
+               grep: str, transcript_source: Optional[str]):
     """Download full YouTube transcript for deep analysis.
 
     This command fetches the complete transcript of a YouTube video,
@@ -1124,6 +1130,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         raise click.UsageError("--chunk and --fallback cannot be combined")
     if discovery is not None and not save_to:
         raise click.UsageError("--discovery requires --save-to")
+    reject_index_only_aws_fallback(transcript_source, fallback)
     if grep is not None and any(
         (save_to, output, full, timestamps, chunk is not None, fallback)
     ):
@@ -1249,7 +1256,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                 _command_error(f"Proxy error: {e}", raw=raw)
 
         try:
-            route_plan = routing_plan()
+            route_plan = routing_plan(transcript_source)
         except Exception as error:
             _command_error(f"Could not prepare transcript routes: {error}", raw=raw)
         if not raw:
@@ -1279,6 +1286,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                         languages,
                         chunk_minutes=chunk,
                         progress_callback=route_progress,
+                        source=transcript_source,
                     )
                 elif fallback:
                     # Use fallback-enabled fetch
@@ -1288,12 +1296,14 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                         use_aws_fallback=True,
                         aws_progress_callback=aws_progress,
                         progress_callback=route_progress,
+                        source=transcript_source,
                     )
                 else:
                     result = get_transcript(
                         video_id,
                         languages,
                         progress_callback=route_progress,
+                        source=transcript_source,
                     )
         except Exception as error:
             from ..ledger import log_event
@@ -1403,6 +1413,22 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                 "showing transcript text instead.[/yellow]"
             )
             timestamps = False
+    elif source == 'filmot_index':
+        index = transcript_data.get("transcript_index") or {}
+        generated = index.get("is_generated", transcript_data.get("is_generated"))
+        kind = ""
+        if isinstance(generated, bool):
+            kind = " automatic" if generated else " manual"
+        reason = transcript_data.get("youtube_error_type")
+        deferred_diagnostics.append(
+            "[cyan]From Filmot's subtitle index ({}{} captions{}{}).[/cyan]".format(
+                escape(str(index.get("language") or transcript_data.get("language") or "unknown")),
+                kind,
+                "; snapshot {}".format(escape(str(index["observed_at"])))
+                if index.get("observed_at") else "",
+                "; YouTube failed: {}".format(escape(str(reason))) if reason else "",
+            )
+        )
 
     from ..ledger import log_event, log_result
     ledger_data = {
@@ -1622,6 +1648,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                     "segment_count": transcript_data.get("segment_count"),
                     "route": transcript_data.get("route"),
                     "routes_tried": transcript_data.get("routes_tried"),
+                    **index_provenance(transcript_data),
                 }
                 saved_path = library.save(
                     video_id=transcript_data['video_id'],
@@ -2298,7 +2325,10 @@ def channel_download(
                         'word_count': len(result.get('full_text', '').split()),
                         'full_text': result.get('full_text', ''),
                         'segments': result.get('segments', []),
+                        'source': result.get('source', 'youtube'),
                         'route': result.get('route'),
+                        'routes_tried': result.get('routes_tried'),
+                        **index_provenance(result),
                         'downloaded_at': _dt.now().isoformat(),
                     }
                     downloader._save_transcript(channel_dir, vid_id, transcript_data)
@@ -2311,6 +2341,7 @@ def channel_download(
                         'is_generated': result.get('is_generated', True),
                         'duration_seconds': result.get('duration_seconds', 0),
                         'word_count': wc,
+                        'source': result.get('source', 'youtube'),
                         'route': result.get('route'),
                         'downloaded_at': _dt.now().isoformat(),
                     })
@@ -2705,6 +2736,7 @@ def channel_search(channel_slug: str, query: str, limit: int):
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy, connect directly with your IP")
+@transcript_source_option
 def download(
     topic: str,
     count: int,
@@ -2712,6 +2744,7 @@ def download(
     fallback: bool,
     dedupe: bool,
     no_proxy: bool,
+    transcript_source: Optional[str],
 ):
     """Download transcripts from piped discovery results.
 
@@ -2729,6 +2762,7 @@ def download(
     import sys
     from ..ledger import log_result
 
+    reject_index_only_aws_fallback(transcript_source, fallback)
     try:
         raw_input = sys.stdin.read()
         results = json_mod.loads(raw_input)
@@ -2783,6 +2817,7 @@ def download(
             dedupe=dedupe,
             lang=lang,
             discovery_ref=discovery_ref,
+            source=transcript_source,
         )
     except click.ClickException as error:
         outcome = CommandResult.failed(

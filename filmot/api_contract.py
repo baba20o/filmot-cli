@@ -280,6 +280,8 @@ _OPTIONAL_VIDEO_FIELDS: dict[str, Tuple[ExpectedType, str]] = {
     "isunlisted": ((int, bool), "int or bool"),
     "islivestream": ((int, bool), "int or bool"),
     "ispartialdata": ((int, bool), "int or bool"),
+    # Raw caption tracks; index_transcript reads each track and line defensively.
+    "subtitles": (list, "array"),
 }
 
 

@@ -293,3 +293,35 @@ def transcript_route_progress(
 def route_progress_for(context: Optional[str] = None):
     """Create a route-event renderer carrying a video/title label."""
     return lambda event: transcript_route_progress(event, context=context)
+
+
+def reject_index_only_aws_fallback(transcript_source: Optional[str], fallback: bool) -> None:
+    """Refuse ``--fallback`` in index-only mode: AWS transcribes YouTube audio."""
+    if not fallback:
+        return
+    from .index_transcript import transcript_source as resolve_source
+
+    try:
+        resolved = resolve_source(transcript_source)
+    except ValueError as error:
+        raise click.UsageError(str(error))
+    if resolved == "filmot":
+        raise click.UsageError(
+            "--fallback downloads audio from YouTube, so it cannot be combined "
+            "with --source filmot (or FILMOT_TRANSCRIPT_SOURCE=filmot)"
+        )
+
+
+def transcript_source_option(function):
+    """``--source`` (as ``transcript_source``) for commands that fetch transcripts."""
+    return click.option(
+        "--source",
+        "transcript_source",
+        type=click.Choice(("auto", "youtube", "filmot"), case_sensitive=False),
+        default=None,
+        help=(
+            "Transcript source: auto (YouTube, then Filmot's subtitle index), "
+            "youtube, or filmot (the index only). Defaults to "
+            "FILMOT_TRANSCRIPT_SOURCE, then auto."
+        ),
+    )(function)

@@ -319,6 +319,29 @@ filmot transcript VIDEO_ID --full
 
 The `--full` flag outputs continuous text optimized for AI processing.
 
+When YouTube can't deliver a transcript (blocked routes, disabled captions, a
+removed video), every transcript command falls back to Filmot's subtitle index
+before any AWS fallback. `--source youtube` turns that off, and
+`--source filmot` uses only the index, without contacting YouTube. The default
+comes from `FILMOT_TRANSCRIPT_SOURCE`, then `auto`. In index-only mode,
+`--fallback` exits with a usage error (code 2), because AWS transcribes YouTube
+audio. An index lookup has the same wall-clock deadline as a YouTube route,
+`FILMOT_TRANSCRIPT_ROUTE_TIMEOUT`: a slower lookup is abandoned, emits a
+`route_timeout` event, and fails with `error_type: IndexTimeout`. An abandoned
+lookup, including one interrupted with Ctrl+C, starts no further requests.
+
+An index result has `source: filmot_index` and `route: filmot-index`.
+`routes_tried` ends with `filmot-index`. A `transcript_index` block carries the
+track `language`, `is_generated`, the snapshot `observed_at`, the
+`api_provider`, and, after a fallback, `youtube_error_type`. Library saves keep
+the same block in `metadata.transcript_index`; `channel-download` saves do too,
+and its manifest records each video's `source`. A failed index attempt leaves the
+YouTube error in place and adds a `route_errors` entry with `kind: index`.
+
+The index cannot translate, and its segments are derived: each line ends where
+the next begins, and the last ends within 10 seconds. Treat index text as a
+Filmot snapshot that may predate the video's current captions.
+
 ### Search Inside a Transcript (`--grep`)
 
 You don't have to download the whole transcript and eyeball it — `--grep` runs the **same proximity operators** (NEAR/N, OR-groups, `~N` tilde, plain substring) against a single fetched transcript and prints only the matching moments, each with a timestamped deep link:

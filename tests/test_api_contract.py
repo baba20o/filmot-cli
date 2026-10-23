@@ -24,6 +24,7 @@ FIXTURE_ENDPOINTS = {
     "get_videos.json": "/getvideos",
     "get_videos_columns.json": "/getvideos",
     "get_videos_columns_partial.json": "/getvideos",
+    "get_videos_subtitles.json": "/getvideos",
 }
 
 
@@ -88,6 +89,7 @@ def test_search_contract_flags_container_type_drift():
 
 
 @pytest.mark.parametrize("field,value", [
+    ("subtitles", {"lang": "en"}),
     ("viewcount", "many"),
     ("likecount", True),
     ("description", 5),

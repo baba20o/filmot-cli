@@ -45,6 +45,16 @@ python scripts/record_filmot_api_fixtures.py --only get_videos_columns \
   --video-id EXB8HokGVMI --suffix _partial --force
 ```
 
+`get_videos_subtitles.json` is a `/getvideos` request for the `subtitles` and
+`lastfetchdate` columns with `lang=en`, recorded on 2026-10-22 through the
+RapidAPI gateway. Caption text is replaced, and the fixture keeps at most two
+tracks and three lines per track. Refresh it with:
+
+```bash
+python scripts/record_filmot_api_fixtures.py --only get_videos_subtitles \
+  --video-id jNQXAC9IVRw --force
+```
+
 The recorder validates both the live body and its sanitized form. Runtime
 validation accepts additive fields but returns a machine-readable error when a
 required container or consumed field changes incompatibly.
