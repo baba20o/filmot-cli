@@ -561,6 +561,7 @@ def watchlist_clear():
 # impossible.
 from .commands.channel import channel, channel_videos
 from .commands.claims import claims
+from .commands.discovery import find_channels, subtitle_export, titles
 from .commands.library import library, sessions, yt_data
 from .commands.proxy import proxy
 from .commands.research import (
@@ -603,6 +604,9 @@ for command in (
     channels,
     channel,
     channel_videos,
+    titles,
+    find_channels,
+    subtitle_export,
     export,
     search_all,
     transcript,

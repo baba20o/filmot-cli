@@ -1,0 +1,203 @@
+{
+  "result": [
+    {
+      "category": "Education",
+      "channelid": "recorded-channel-001",
+      "channelname": "Recorded channel 001",
+      "id": "recorded-video-001",
+      "title": "Recorded video title 001",
+      "uploaddate": "2026-01-01",
+      "autosubs": "en",
+      "manualsubs": "en",
+      "duration": 1659,
+      "viewcount": 2800686,
+      "likecount": 121498,
+      "isunlisted": 0,
+      "license": "",
+      "channelsubcount": 21400000,
+      "channelcountryname": "Recorded country",
+      "lang": "en",
+      "hits": [
+        {
+          "start": 18,
+          "end": 37.2,
+          "context": "recorded caption context",
+          "matches": [
+            {
+              "text": "recorded transcript line",
+              "start": 24.9
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 29.6
+            }
+          ]
+        },
+        {
+          "start": 72.6,
+          "end": 85.3,
+          "context": "recorded caption context",
+          "matches": [
+            {
+              "text": "recorded transcript line",
+              "start": 77.4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "category": "Education",
+      "channelid": "recorded-channel-002",
+      "channelname": "Recorded channel 002",
+      "id": "recorded-video-002",
+      "title": "Recorded video title 002",
+      "uploaddate": "2026-01-01",
+      "autosubs": "en",
+      "manualsubs": "en",
+      "duration": 2122,
+      "viewcount": 2303537,
+      "likecount": 97950,
+      "isunlisted": 0,
+      "license": "",
+      "channelsubcount": 21400000,
+      "channelcountryname": "Recorded country",
+      "lang": "en",
+      "hits": [
+        {
+          "start": 62.2,
+          "end": 80.6,
+          "context": "recorded caption context",
+          "matches": [
+            {
+              "text": "recorded transcript line",
+              "start": 70.2
+            }
+          ]
+        },
+        {
+          "start": 111,
+          "end": 125.6,
+          "context": "recorded caption context",
+          "matches": [
+            {
+              "text": "recorded transcript line",
+              "start": 119.3
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "category": "Education",
+      "channelid": "recorded-channel-003",
+      "channelname": "Recorded channel 003",
+      "id": "recorded-video-003",
+      "title": "Recorded video title 003",
+      "uploaddate": "2026-01-01",
+      "autosubs": "en",
+      "manualsubs": "en es fr it pt sv",
+      "duration": 360,
+      "viewcount": 1704263,
+      "likecount": 24367,
+      "isunlisted": 0,
+      "license": "",
+      "channelsubcount": 21400000,
+      "channelcountryname": "Recorded country",
+      "lang": "en",
+      "hits": [
+        {
+          "start": 0.7,
+          "end": 361.8,
+          "context": "recorded caption context",
+          "matches": [
+            {
+              "text": "recorded transcript line",
+              "start": 12.2
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 17.1
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 157.2
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 159.4
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 161.5
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 163.4
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 163.4
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 165.8
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 174.6
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 184.9
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 197.1
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 201.9
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 255
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 257.3
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 260.7
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 265.8
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 274.3
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 278.8
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 289.9
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 318
+            },
+            {
+              "text": "recorded transcript line",
+              "start": 339.9
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

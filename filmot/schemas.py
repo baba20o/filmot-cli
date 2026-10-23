@@ -280,6 +280,51 @@ class ChannelProfileResultData(TypedDict, total=False):
     include_archive: bool
 
 
+class TitleSearchResultData(TypedDict, total=False):
+    """Title and metadata matches emitted by ``titles``; pipes into ``download``."""
+
+    query: Optional[str]
+    filters: Dict[str, Any]
+    first_page: int
+    per_page: int
+    pages_fetched: int
+    exhausted: bool
+    next_page: Optional[int]
+    last_page_reached: bool
+    videos: List[Dict[str, Any]]
+
+
+class ChannelFinderResultData(TypedDict, total=False):
+    """Notable channels emitted by ``find-channels``."""
+
+    filters: Dict[str, Any]
+    first_page: int
+    per_page: int
+    pages_fetched: int
+    exhausted: bool
+    next_page: Optional[int]
+    last_page_reached: bool
+    max_results: Optional[int]
+    channels: List[Dict[str, Any]]
+
+
+class SubtitleExportResultData(TypedDict, total=False):
+    """The file ``subtitle-export`` wrote and how its pages were fetched."""
+
+    query: str
+    output: str
+    written: bool
+    format: str
+    filters: Dict[str, Any]
+    first_page: int
+    per_page: int
+    pages_fetched: int
+    rows: int
+    bytes: int
+    exhausted: bool
+    next_page: Optional[int]
+
+
 class ChannelVideosResultData(TypedDict, total=False):
     """Indexed channel videos emitted by ``channel-videos``; pipes into ``download``."""
 

@@ -612,39 +612,47 @@ def channel_videos(
     _display_channel_videos(data, error)
 
 
-def _display_channel_videos(data: ChannelVideosResultData, error: Optional[Dict[str, Any]]) -> None:
+def _video_table(videos: Sequence[Dict[str, Any]], *, title: str, show_channel: bool) -> Table:
+    """Filmot video records as a table; shared by channel-videos and titles."""
     from ..video_metadata import caption_languages
 
+    table = Table(title=title)
+    table.add_column("Uploaded", no_wrap=True)
+    table.add_column("Title")
+    if show_channel:
+        table.add_column("Channel")
+    table.add_column("Length", justify="right")
+    table.add_column("Views", justify="right")
+    table.add_column("Captions")
+    table.add_column("Video ID", no_wrap=True)
+    for video in videos:
+        manual = caption_languages(video.get("manualsubs"))
+        automatic = [lang for lang in caption_languages(video.get("autosubs")) if lang not in manual]
+        captions = ", ".join(["{} (manual)".format(lang) for lang in manual] + automatic)
+        name = _text(video.get("title"), "Unknown Title")
+        if video.get("ispartialdata") in (True, 1):
+            name += " [dim](partial record)[/dim]"
+        row = [_text(video.get("uploaddate")), name]
+        if show_channel:
+            row.append(_text(video.get("channelname"), "Unknown"))
+        row += [
+            _seconds(video.get("duration")),
+            _number(video.get("viewcount")),
+            escape(captions) or "none listed",
+            _text(video.get("id"), ""),
+        ]
+        table.add_row(*row)
+    return table
+
+
+def _display_channel_videos(data: ChannelVideosResultData, error: Optional[Dict[str, Any]]) -> None:
     videos = data.get("videos") or []
-    several = len(data.get("channels") or []) > 1
     if videos:
-        table = Table(title="Indexed videos, newest first")
-        table.add_column("Uploaded", no_wrap=True)
-        table.add_column("Title")
-        if several:
-            table.add_column("Channel")
-        table.add_column("Length", justify="right")
-        table.add_column("Views", justify="right")
-        table.add_column("Captions")
-        table.add_column("Video ID", no_wrap=True)
-        for video in videos:
-            manual = caption_languages(video.get("manualsubs"))
-            automatic = [lang for lang in caption_languages(video.get("autosubs")) if lang not in manual]
-            captions = ", ".join(["{} (manual)".format(lang) for lang in manual] + automatic)
-            title = _text(video.get("title"), "Unknown Title")
-            if video.get("ispartialdata") in (True, 1):
-                title += " [dim](partial record)[/dim]"
-            row = [_text(video.get("uploaddate")), title]
-            if several:
-                row.append(_text(video.get("channelname"), "Unknown"))
-            row += [
-                _seconds(video.get("duration")),
-                _number(video.get("viewcount")),
-                escape(captions) or "none listed",
-                _text(video.get("id"), ""),
-            ]
-            table.add_row(*row)
-        console.print(table)
+        console.print(_video_table(
+            videos,
+            title="Indexed videos, newest first",
+            show_channel=len(data.get("channels") or []) > 1,
+        ))
     else:
         console.print("[yellow]No videos found in Filmot's index.[/yellow]")
     if error:

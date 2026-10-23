@@ -82,6 +82,30 @@ recorded in `docs/FIELD_TEST_LOG.md`.
   costs one channel search and resolves only on an exact handle match.
 - `FilmotClient.get_channels()` and `get_channel_videos()`, with runtime
   response contracts and sanitized recorded fixtures for both endpoints.
+- `titles` searches video titles and metadata (`/getmetadatasearch`) with
+  `search`'s view, like, duration, date, category, and license filters, plus
+  country, caption and detected languages, listed or unlisted, live, and
+  partial-record filters and eight sort fields. It costs 3 credits per page,
+  or 1 when `--channel-id` scopes one to five channels, and its raw `videos`
+  pipe into `download`.
+- `find-channels` filters Filmot's index of about 63 million notable channels
+  (`/getadvancedchannelsearch`, 1 credit per page) by subscribers, views,
+  videos, average length, creation and first-video dates, normalized growth,
+  country, automatic-caption languages, and description or topic words.
+- `subtitle-export` writes subtitle-search matches (`/getsubtitlesearch`) to
+  CSV, JSON, JSON Lines, or ZIP. It merges up to 20 server-built pages of up
+  to 500 matches into one atomically written file. `--subtitles` adds each
+  video's full subtitles (one `.srt` per video in a ZIP). It costs 5 credits
+  per page, or 1 when scoped to one to five channels. Each page must have its
+  format's shape before anything is written, and an export with no matches
+  writes nothing.
+- Channel filters on `titles` and `subtitle-export` take UC IDs, `@handles`,
+  or channel URLs, to include (`--channel-id`) or exclude
+  (`--exclude-channels`).
+- `FilmotClient.search_metadata()`, `search_advanced_channels()`, and
+  `export_subtitle_search()`. The export returns an `ExportBody` of raw bytes
+  that is never cached and is discarded if it echoes a configured key, even
+  inside a compressed ZIP entry, or if a ZIP entry cannot be read to check. Runtime contracts cover both JSON searches.
 - `docs/YOUTUBE_ROADMAP.md`, a durable ranked queue for future public read surfaces,
   OAuth/policy gates, and the admission checklist for each new YouTube slice.
 - Named search-session routing through `--session` and `FILMOT_SESSION`, with

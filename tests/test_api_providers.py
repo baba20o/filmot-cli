@@ -1,7 +1,9 @@
 """Dual Filmot API providers: routing, failover, quotas, credits, and channel shapes."""
 
+import io
 import json
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -14,6 +16,7 @@ import filmot.config as app_config
 from filmot import api_usage
 from filmot.api import (
     Deadline,
+    ExportBody,
     FilmotClient,
     normalize_channel_suggestion,
     normalize_channel_suggestions,
@@ -58,10 +61,11 @@ RAPID_CHANNEL = {
 
 
 class FakeResponse:
-    def __init__(self, status=200, body=None, text=None, headers=None):
+    def __init__(self, status=200, body=None, text=None, headers=None, content=None):
         self.status_code = status
         self._body = body
         self.text = text if text is not None else json.dumps(body)
+        self.content = content if content is not None else self.text.encode("utf-8")
         self.headers = requests.structures.CaseInsensitiveDict(headers or {})
 
     def json(self):
@@ -379,6 +383,127 @@ def test_channel_endpoints_send_documented_parameters(transport):
         "onlyWithSubtitles": "true", "columns": "viewcount,manualsubs",
     }
     assert defaults["params"] == {"channelID": "UCdirect000000000000000a"}
+
+
+def test_discovery_searches_ask_the_direct_api_for_json(transport):
+    transport.queues["direct"] += [
+        FakeResponse(200, {"result": []}, headers=CREDITS),
+        FakeResponse(200, {"result": [], "page": 1, "perpagecount": 25, "maxresults": 10000}, headers=CREDITS),
+    ]
+    client = make_client(transport)
+
+    client.search_metadata({"titleQuery": "gpu", "channelID": "UCdirect000000000000000a"})
+    client.search_advanced_channels({"topics": "sqlite"})
+
+    metadata, channels = transport.calls
+    assert metadata["url"] == "https://direct.filmot.invalid/api/v1/getmetadatasearch"
+    assert metadata["params"] == {
+        "titleQuery": "gpu", "channelID": "UCdirect000000000000000a", "format": "json",
+    }
+    assert channels["url"] == "https://direct.filmot.invalid/api/v1/getadvancedchannelsearch"
+    assert channels["params"] == {"topics": "sqlite", "format": "json"}
+
+
+def test_exports_return_bytes_and_are_never_served_from_the_cache(transport):
+    page = b"\xef\xbb\xbfid,title\r\nabc,One\r\n"
+    transport.queues["direct"] += [
+        FakeResponse(200, content=page, headers=dict(CREDITS, **{"Content-Type": "text/csv"})),
+        FakeResponse(200, content=page, headers=CREDITS),
+    ]
+    client = make_client(transport, use_cache=True)
+
+    first = client.export_subtitle_search({"query": "gpu", "format": "csv"})
+    second = client.export_subtitle_search({"query": "gpu", "format": "csv"})
+
+    assert first == ExportBody(page, "text/csv")
+    assert second.content == page
+    assert [call["url"] for call in transport.calls] == [
+        "https://direct.filmot.invalid/api/v1/getsubtitlesearch",
+    ] * 2
+
+
+def _zip_holding(text):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("metadata.jsonl", '{"id": "abc"}\n')
+        archive.writestr("subs/abc.a.en.srt", text)
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("content", [
+    b"id,note\r\nabc,test-direct-key\r\n",
+    # Compressed inside an archive entry, the key never appears in the raw bytes.
+    _zip_holding("1\n00:00:01,000 --> 00:00:02,000\nkey test-rapidapi-key\n" * 20),
+], ids=["plain-body", "compressed-zip-entry"])
+def test_an_export_echoing_a_configured_key_is_discarded(transport, content):
+    if content.startswith(b"PK"):
+        assert b"test-rapidapi-key" not in content  # only decompression reveals it
+    transport.queues["direct"].append(FakeResponse(200, content=content, headers=CREDITS))
+
+    result = make_client(transport).export_subtitle_search({"query": "gpu"})
+
+    assert result["error_type"] == "FilmotResponseError"
+    assert "test-direct-key" not in json.dumps(result)
+
+
+def _zip_with_a_corrupt_entry_before(text):
+    """Valid metadata, a stored entry whose CRC no longer matches, then ``text`` deflated."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("metadata.jsonl", '{"id": "abc"}\n')
+        archive.writestr("subs/abc.a.en.srt", "STORED-PAYLOAD-" * 8, compress_type=zipfile.ZIP_STORED)
+        archive.writestr("subs/abd.a.en.srt", text, compress_type=zipfile.ZIP_DEFLATED)
+    return buffer.getvalue().replace(b"STORED-PAYLOAD-", b"STORED-PAYLOAD!", 1)
+
+
+@pytest.mark.parametrize("text", [
+    "key test-rapidapi-key\n" * 20,
+    "ordinary words\n",
+], ids=["key-after-corrupt-entry", "corrupt-entry-only"])
+def test_a_zip_that_cannot_be_fully_checked_is_discarded(transport, text):
+    content = _zip_with_a_corrupt_entry_before(text)
+    assert b"test-rapidapi-key" not in content
+    transport.queues["direct"].append(FakeResponse(200, content=content, headers=CREDITS))
+
+    result = make_client(transport).export_subtitle_search({"query": "gpu", "format": "zip"})
+
+    assert result["error_type"] == "FilmotResponseError"
+    assert "could not be checked" in result["error"]
+
+
+@pytest.mark.parametrize("prefix", [b"\xef\xbb\xbf", b"leading preamble\n"], ids=["bom", "preamble"])
+def test_a_zip_with_leading_bytes_is_still_checked(transport, prefix):
+    content = prefix + _zip_holding("key test-rapidapi-key\n" * 20)
+    assert b"test-rapidapi-key" not in content
+    assert zipfile.ZipFile(io.BytesIO(content)).namelist()  # readers accept the prefix
+    transport.queues["direct"].append(FakeResponse(200, content=content, headers=CREDITS))
+
+    result = make_client(transport).export_subtitle_search({"query": "gpu", "format": "zip"})
+
+    assert result["error_type"] == "FilmotResponseError"
+    assert "configured credential" in result["error"]
+
+
+def test_a_key_in_a_nested_archive_is_found(transport):
+    outer = io.BytesIO()
+    with zipfile.ZipFile(outer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("metadata.jsonl", '{"id": "abc"}\n')
+        archive.writestr("subs/inner.zip", _zip_holding("key test-rapidapi-key\n" * 20))
+    content = outer.getvalue()
+    assert b"test-rapidapi-key" not in content
+    transport.queues["direct"].append(FakeResponse(200, content=content, headers=CREDITS))
+
+    result = make_client(transport).export_subtitle_search({"query": "gpu", "format": "zip"})
+
+    assert result["error_type"] == "FilmotResponseError"
+    assert "configured credential" in result["error"]
+
+
+def test_a_clean_zip_export_passes_the_key_check(transport):
+    content = _zip_holding("1\n00:00:01,000 --> 00:00:02,000\nordinary words\n")
+    transport.queues["direct"].append(FakeResponse(200, content=content, headers=CREDITS))
+
+    assert make_client(transport).export_subtitle_search({"query": "gpu"}).content == content
 
 
 def test_a_deadline_caps_socket_timeouts(transport):

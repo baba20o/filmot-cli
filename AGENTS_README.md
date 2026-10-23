@@ -1508,6 +1508,58 @@ in the listing, and `download` takes their transcripts from Filmot's subtitle
 index. `download` stops at its own `--count` (50 by default), so give both
 sides of the pipe the same count.
 
+### Pattern 3d: Discovery Searches
+
+Three direct-API searches complement subtitle search. Their channel filters,
+`--channel-id` and `--exclude-channels` (mutually exclusive), take UC IDs,
+`@handles`, or channel URLs, comma-separated. Each handle costs one channel
+search.
+
+```bash
+# Titles and metadata: 3 credits per page, 1 when scoped to 1-5 channels
+filmot titles '"sqlite" wal' --min-views 10000 --sort viewcount --raw
+filmot titles --channel-id @exact_handle --start-date 2026-01-01 --raw \
+  | filmot download -t TOPIC
+
+# Notable channels (~63M indexed): 1 credit per page
+filmot find-channels --topics "database internals" --min-subscribers 10000 --raw
+
+# Server-side export of subtitle matches: 5 credits per page, 1 when scoped
+filmot subtitle-export '"exact phrase"' --channel-id UC... -o matches.jsonl --raw
+filmot subtitle-export "topic" --channel-id @exact_handle -o corpus.zip --subtitles
+```
+
+`titles` raw data holds `query`, the `filters` sent (API parameter names),
+`first_page`, `per_page`, `pages_fetched`, `exhausted`, `next_page`,
+`last_page_reached`, and `videos` in `/getvideos` shape, which `download`
+accepts. It needs a query or at least one filter. `find-channels` raw data
+holds `filters`, the same paging fields, `max_results` (the 10,000-match
+window), and `channels` in `/getchannels` record shape. They also carry
+`videocount`, `avgvideoviewcount`, `avgdurationseconds`, `autolanguages`, and,
+for text matches, `description`, `topiccloud`, and `matchscore`. Both stop at
+the first empty page, because a short page is not a reliable end. Paging also
+stops at the last page Filmot serves (500 for titles, the 10,000-match window
+for channels), which sets `last_page_reached`. A first page beyond those limits
+fails with `BadParameter`.
+
+`subtitle-export` writes the file and its raw summary holds `output`,
+`written`, `format`, `filters`, `rows`, `bytes`, `pages_fetched`, `exhausted`,
+and `next_page`. Here a page with fewer matches than `--per-page` ends the
+export, as Filmot documents. Each page must have its format's shape: a CSV
+header row of column names that includes known export columns, JSON Lines rows
+that are not error objects, a ZIP with `metadata.jsonl`. With no matches, nothing is written (`written: false`,
+status `empty`). A later-page failure still writes the earlier pages with
+status `partial`, and `next_page` is the failed page. A first-page failure, a
+page of the wrong shape (`ExportFormatError`, stage `invalid-response`), or an
+unwritable file (stage `write-output`) writes nothing. A body that holds a
+configured key, including inside a ZIP entry, is discarded, and so is a ZIP
+with an entry that cannot be read and checked. Explicit
+`--channel-id` or `--exclude-channels` values that name no channel, and
+`--order` with `--sort bm25match` or `channelvariety`, fail with
+`BadParameter`. `--subtitles` (ZIP: one
+`.srt` per video; refused for CSV) turns an export into a bulk caption
+download.
+
 ### Pattern 4: Technical Deep Dive
 ```bash
 filmot search '"CONCEPT" explained|"CONCEPT" tutorial' --full --lang en --sort density
@@ -1564,7 +1616,9 @@ Budget direct credits deliberately. They come from a monthly allowance. An
 unscoped subtitle-search page costs 5 credits, but only 1 when `--channel-id`
 names one to five channels, so scope searches to known channels when the
 question allows it. `channel` costs 1 credit, or 3 with history or video
-statistics, and `channel-videos` costs 3 per page. Every command that used the
+statistics, and `channel-videos` costs 3 per page. `titles` costs 3 per page
+and `subtitle-export` 5, each 1 when scoped to one to five channels;
+`find-channels` costs 1 per page. Every command that used the
 API prints a `Filmot API:` line on stderr, and `--raw` results carry the same
 details under `_filmot.api`:
 credits charged and remaining, plan requests remaining, cache hits, and
@@ -1732,6 +1786,9 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Channel profile and growth** | `filmot channel @handle --growth --words --raw` (1 direct credit) |
 | **Channel video statistics** | `filmot channel UC... --stats --monthly --raw` (3 direct credits) |
 | **Channel's indexed videos to library** | `filmot channel-videos @handle --count 100 --raw \| filmot download -t TOPIC --count 100` |
+| **Search titles and metadata** | `filmot titles '"phrase"' --min-views 10000 --raw` (1 credit when `--channel-id` scopes 1-5 channels) |
+| **Find notable channels** | `filmot find-channels --topics "TOPIC" --min-subscribers 10000 --raw` |
+| **Export subtitle matches to a file** | `filmot subtitle-export "QUERY" -o matches.csv` (add `--subtitles` with `.zip` for `.srt` files) |
 | **Named follow-up search** | `filmot search "query" --session TOPIC` |
 | **Locate a phrase across sources** | `filmot library compare "claim phrase" --sort density` |
 | **Raw local citations** | `filmot library compare "claim phrase" --topic TOPIC --raw` |

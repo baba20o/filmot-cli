@@ -70,6 +70,10 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
   growth, caption word cloud, profile history, and video statistics;
   `filmot channel-videos` lists a channel's indexed videos, including removed
   ones, and pipes into `download`
+- **Discovery Searches** — `filmot titles` searches video titles and metadata,
+  `filmot find-channels` filters about 63 million notable channels, and
+  `filmot subtitle-export` writes subtitle-search matches to CSV, JSON Lines,
+  JSON, or a ZIP with `.srt` subtitles
 
 ### Advanced Features
 - **Smart Caching** — File-based response caching with configurable TTL to reduce API calls
@@ -1463,6 +1467,102 @@ subtitles. If a later page fails, the earlier pages are kept and the result is
 into `download`; transcripts for removed videos then come from
 [Filmot's subtitle index](#transcripts-from-filmots-index).
 
+### Discovery Searches
+
+Three more searches use the direct Filmot API, so they need `FILMOT_API_KEY`.
+Their channel filters, `--channel-id` and `--exclude-channels`, take
+comma-separated UC IDs, `@handles`, or channel URLs; each handle costs one
+channel search. Scoping a title search or export to one to five channels
+lowers its price to 1 credit per page.
+
+#### Search Titles and Metadata
+
+`titles` searches video titles and metadata in Filmot's index. The query uses
+Filmot's search syntax (implicit AND, `|`, `"exact phrases"`, grouping, and
+`-exclusion`) or lists video IDs separated by spaces. Filters alone also work.
+Each page costs 3 credits, or 1 when scoped to one to five channels.
+
+```bash
+filmot titles '"sqlite" wal' --min-views 10000 --sort viewcount --order desc
+filmot titles --channel-id @LinusTechTips --start-date 2026-01-01 --pages 2
+filmot titles "fusion" --caption-lang en --only-caption-langs --complete
+filmot titles "fusion reactor" --raw | filmot download -t fusion
+```
+
+The filters match `search`: `--min-views`, `--max-views`, `--min-likes`,
+`--max-likes`, `--min-duration`, `--max-duration`, `--start-date`, `--end-date`,
+`--category`, `--exclude`, and `--license`. `titles` adds `--country` (Filmot
+country IDs), `--caption-lang` with `--only-caption-langs`, `--detected-lang`
+with `--detected-in-captions`, `--unlisted`/`--listed`, `--live`/`--not-live`,
+and `--partial`/`--complete` for index records. `--sort` accepts `id` (when
+Filmot indexed the video), `viewcount`, `likecount`, `dislikecount`,
+`uploaddate`, `duration`, `avg_ratio` (vocabulary ease), and
+`videofetcheddate`. A page holds up to 200 videos (`--per-page`, 50 by default),
+and Filmot serves pages up to 500. Paging stops at the first empty page. Raw
+output keeps a `videos` array that pipes into `download`.
+
+#### Find Notable Channels
+
+`find-channels` filters Filmot's index of about 63 million notable channels by
+size, growth, age, country, caption languages, and the words in their names,
+descriptions, or topics. Each page costs 1 credit; only the first 10,000
+matches of a search can be paged to.
+
+```bash
+filmot find-channels --topics "database internals" --min-subscribers 10000
+filmot find-channels --country Canada --sort gainedsubcount --subs-window 90
+filmot find-channels --description sqlite --auto-lang en --min-avg-duration 600 --raw
+```
+
+Filters: `--description`, `--topics`, `--min-`/`--max-subscribers`, `--min-`/`--max-views`
+(total channel views), `--min-`/`--max-videos`, `--min-`/`--max-avg-duration`
+(seconds), `--created-after`/`--created-before`,
+`--first-video-after`/`--first-video-before`, gained views or subscribers
+(`--min-`/`--max-gained-views` with `--views-window`, `--min-`/`--max-gained-subs`
+with `--subs-window`; windows are 28, 90, 180, or 365 days), `--country`
+(repeatable country names), and `--auto-lang` (repeatable automatic-caption
+codes, all required). A window option or `--order` without a filter or sort it
+affects is refused. Pass the channel IDs it finds to `channel` or
+`channel-videos`.
+
+#### Export Subtitle-Search Matches
+
+`subtitle-export` has Filmot build a CSV, JSON, JSON Lines, or ZIP export of
+subtitle-search matches, up to 500 per page. The format comes from `--format`,
+else the output file's extension, else JSON Lines. Pages are merged into one
+file: CSV keeps one header, JSON merges the `result` arrays, and ZIP merges
+`metadata.jsonl` and the subtitle files. The file is written only after every
+page has been fetched. Each page costs 5 credits, or 1 when scoped to one to
+five channels.
+
+```bash
+filmot subtitle-export '"sqlite wal"' -o matches.csv
+filmot subtitle-export "fusion" --channel-id @Veritasium -o fusion.zip --subtitles
+filmot subtitle-export "gpu" --lang en --pages 3 --per-page 500 -o gpu.jsonl
+```
+
+`--subtitles` adds each matching video's full subtitles: one `.srt` file per
+video in a ZIP, or a `subtitles` field in JSON and JSON Lines. It is refused for
+CSV. `--no-snippets` leaves out the matched-text `hits`, and `--columns` picks
+fields from `category`, `channelid`, `channelname`, `id`, `title`, `uploaddate`,
+`autosubs`, `manualsubs`, `duration`, `viewcount`, `likecount`, `isunlisted`,
+`license`, `channelsubcount`, `channelcountryname`, `lang`, `hits`,
+`subtitles`, and `description`. The filters match `search` (`--lang`, `--title`,
+`--manual-subs`, `--country`, `--detected-lang`, the view, like, duration, and
+date ranges, `--category`, `--exclude`, and `--license`), with `--sort`
+including `bm25match` (text relevance) and `channelvariety`. Those two use their
+own order, so `--order` is refused with them. A page with fewer matches than
+`--per-page` ends the export. Every page is checked against its format before
+anything is written. A CSV must start with a header row of column names that
+includes known export columns. JSON Lines rows must not be error objects. A ZIP
+must hold `metadata.jsonl`, with every entry readable. A page that fails these
+checks, such as an HTML error page, fails the export and leaves the output file
+untouched. An export with no matches writes nothing
+and reports `written: false`. If a later page fails, the pages before it are
+still written and the result is `partial`. Its `next_page` says where to
+continue, which should go to a different file. Filmot's compact CSV format is
+not offered, because its rows inherit values from earlier rows.
+
 ### Channel Corpus: Download & Mine Channel Uploads
 
 Enumerate a channel's uploads playlist and download the available transcripts
@@ -2088,7 +2188,11 @@ filtering/ranking, `--limit`, and `--max-hits`, with explicit scope metadata; it
 untouched copy of the upstream API payload. `video` uses `videos`, `channels`
 uses `channels`, `channel` uses `requested`, `channels`, and `missing`,
 `channel-videos` uses `channels`, paging fields, and a `videos` array that
-`download` accepts, and `yt-search` uses `videos` plus effective `request`,
+`download` accepts, `titles` uses `query`, `filters`, paging fields, and a
+`videos` array that `download` accepts, `find-channels` uses `filters`, paging
+fields, `max_results`, and `channels`, `subtitle-export` summarizes the written
+file (`output`, `format`, `rows`, `bytes`, and paging fields), and `yt-search`
+uses `videos` plus effective `request`,
 `coverage`, and `enrichment` objects. `yt-playlists` uses `channel`,
 `playlists`, `request`, `coverage`, `api_calls`, and `continuation`;
 `yt-playlist` adds ordered `playlist_items`, current `videos`, and per-ID
