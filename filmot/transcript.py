@@ -408,7 +408,7 @@ def reset_api() -> None:
     _init_api()
 
 
-def routing_plan() -> dict:
+def routing_plan(source: Optional[str] = None) -> dict:
     """Return the actual transcript route plan without consuming a pool route.
 
     This initializes the primary client before reading its label, fixing the
@@ -416,7 +416,43 @@ def routing_plan() -> dict:
     environment proxy configuration had not yet been inspected. Pool
     construction only reads local configuration/state; no session is picked
     and no transcript or Webshare management request is made.
+
+    ``transcript_source`` and ``index`` describe Filmot's subtitle index:
+    ``fallback`` after the YouTube routes, ``only`` instead of them, or ``off``.
     """
+    from .index_transcript import index_available, transcript_source
+
+    source = transcript_source(source)
+    index = (
+        "off" if source == "youtube" or not index_available()
+        else "only" if source == "filmot"
+        else "fallback"
+    )
+    timeouts = {
+        "connect_timeout_s": _env_timeout(
+            "FILMOT_TRANSCRIPT_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT
+        ),
+        "read_timeout_s": _env_timeout(
+            "FILMOT_TRANSCRIPT_READ_TIMEOUT", DEFAULT_READ_TIMEOUT
+        ),
+        "route_timeout_s": _env_timeout(
+            "FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT
+        ),
+    }
+    if source == "filmot":
+        # Index only: YouTube routing is neither prepared nor reported.
+        return {
+            "mode": "index-only",
+            "routes": [],
+            "transcript_source": source,
+            "index": index,
+            "pool_configured": False,
+            "pool_source": None,
+            "primary": None,
+            "primary_is_proxy": False,
+            "has_direct_route": False,
+            **timeouts,
+        }
     _init_api()
     mode = _resolve_proxy_mode()
     pool = None if mode in {"direct-only", "primary-only"} else get_pool()
@@ -460,28 +496,28 @@ def routing_plan() -> dict:
     return {
         "mode": mode,
         "routes": routes,
+        "transcript_source": source,
+        "index": index,
         "pool_configured": pool is not None,
         "pool_source": pool.source if pool is not None else None,
         "primary": primary_label,
         "primary_is_proxy": primary_is_proxy,
         "has_direct_route": any(r["source"] == "direct" for r in routes),
-        "connect_timeout_s": _env_timeout(
-            "FILMOT_TRANSCRIPT_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT
-        ),
-        "read_timeout_s": _env_timeout(
-            "FILMOT_TRANSCRIPT_READ_TIMEOUT", DEFAULT_READ_TIMEOUT
-        ),
-        "route_timeout_s": _env_timeout(
-            "FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT
-        ),
+        **timeouts,
     }
 
 
 def describe_routing_plan(plan: Optional[dict] = None) -> str:
     """Render :func:`routing_plan` as a concise CLI-friendly description."""
     plan = plan or routing_plan()
+    index = plan.get("index", "off")
+    if index == "only":
+        return "Filmot subtitle index only"
+    if plan.get("transcript_source") == "filmot":
+        return "no usable routes (the Filmot subtitle index needs a Filmot API key)"
     if not plan["routes"]:
-        return f"no usable routes ({plan['mode']} mode)"
+        description = f"no usable routes ({plan['mode']} mode)"
+        return description + ("; Filmot subtitle index fallback" if index == "fallback" else "")
     labels = []
     for route in plan["routes"]:
         if route["kind"] == "pool":
@@ -491,6 +527,8 @@ def describe_routing_plan(plan: Optional[dict] = None) -> str:
             )
         else:
             labels.append(route["label"])
+    if index == "fallback":
+        labels.append("Filmot subtitle index")
     return " -> ".join(labels)
 
 
@@ -532,10 +570,11 @@ def get_transcript(
     route_timeout: Optional[float] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
     fresh_primary: bool = False,
+    source: Optional[str] = None,
 ) -> dict:
     """
     Fetch the full transcript for a YouTube video.
-    
+
     Args:
         video_id: YouTube video ID or URL
         languages: Preferred languages in order (e.g., ['en', 'en-US'])
@@ -544,7 +583,10 @@ def get_transcript(
         route_timeout: Maximum wall-clock seconds for each route attempt.
                       Defaults to ``FILMOT_TRANSCRIPT_ROUTE_TIMEOUT`` or 30.
         progress_callback: Optional callable receiving structured route events.
-        
+        source: ``auto`` (YouTube, then Filmot's subtitle index), ``youtube``,
+                or ``filmot`` (the index only). Defaults to
+                ``FILMOT_TRANSCRIPT_SOURCE``, then ``auto``.
+
     Returns:
         dict with:
             - video_id: The video ID
@@ -553,12 +595,105 @@ def get_transcript(
             - segments: List of {text, start, duration} dicts
             - full_text: Complete transcript as single string
             - duration_seconds: Total video duration
+        An index transcript adds ``source: filmot_index`` and a
+        ``transcript_index`` provenance block.
     """
+    from .index_transcript import (
+        ROUTE,
+        TIMEOUT_ERROR,
+        fetch_index_transcript,
+        index_available,
+        transcript_source,
+    )
+
     video_id = extract_video_id(video_id)
-    
+    source = transcript_source(source)
     if languages is None:
         languages = ['en', 'en-US', 'en-GB']
-    
+    attempt_timeout = (
+        route_timeout
+        if route_timeout is not None and route_timeout > 0
+        else _env_timeout("FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT)
+    )
+
+    def index_attempt(attempt: int) -> dict:
+        started = time.monotonic()
+        _emit_progress(
+            progress_callback, event="route_start", route=ROUTE,
+            attempt=attempt, timeout_s=attempt_timeout,
+        )
+        index = fetch_index_transcript(
+            video_id, languages, preserve_formatting=preserve_formatting,
+            timeout=attempt_timeout,
+        )
+        elapsed = time.monotonic() - started
+        if "error" in index:
+            _emit_progress(
+                progress_callback,
+                event="route_timeout" if index["error_type"] == TIMEOUT_ERROR else "route_failed",
+                route=ROUTE, attempt=attempt, elapsed_s=elapsed, kind="index",
+                error_type=index["error_type"], error=index["error"],
+            )
+        else:
+            index["route_elapsed_seconds"] = elapsed
+            _emit_progress(
+                progress_callback, event="route_success", route=ROUTE,
+                attempt=attempt, elapsed_s=elapsed,
+            )
+        return index
+
+    if source == "filmot":
+        index = index_attempt(1)
+        index["routes_tried"] = [ROUTE]
+        index["route_errors"] = [] if "error" not in index else [{
+            "route": ROUTE, "kind": "index",
+            "error_type": index["error_type"], "error": index["error"],
+        }]
+        return index
+
+    result = _youtube_transcript(
+        video_id,
+        languages,
+        preserve_formatting,
+        route_timeout=route_timeout,
+        progress_callback=progress_callback,
+        fresh_primary=fresh_primary,
+    )
+    if "error" not in result or source == "youtube" or not index_available():
+        # Without a usable Filmot key the YouTube outcome stands untouched.
+        return result
+    youtube_routes = list(result.get("routes_tried") or [])
+    index = index_attempt(len(youtube_routes) + 1)
+    routes_tried = [*youtube_routes, ROUTE]
+    route_errors = list(result.get("route_errors") or [])
+    if "error" in index:
+        result["routes_tried"] = routes_tried
+        result["route_errors"] = [*route_errors, {
+            "route": ROUTE, "kind": "index",
+            "error_type": index["error_type"], "error": index["error"],
+        }]
+        return result
+    index["transcript_index"]["youtube_error_type"] = result.get("error_type")
+    index.update(
+        youtube_error=result.get("error"),
+        youtube_error_type=result.get("error_type"),
+        youtube_routes_tried=youtube_routes,
+        routes_tried=routes_tried,
+        route_errors=route_errors,
+    )
+    return index
+
+
+def _youtube_transcript(
+    video_id: str,
+    languages: list[str],
+    preserve_formatting: bool = False,
+    *,
+    route_timeout: Optional[float] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+    fresh_primary: bool = False,
+) -> dict:
+    """Fetch a transcript through the YouTube route ladder only."""
     attempts: list[str] = []
     route_errors: list[dict] = []
     last_error_message: Optional[str] = None
@@ -1297,6 +1432,7 @@ def get_transcript_with_timestamps(
     route_timeout: Optional[float] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
     fresh_primary: bool = False,
+    source: Optional[str] = None,
 ) -> dict:
     """
     Fetch transcript with timestamps, optionally chunked into time segments.
@@ -1321,11 +1457,12 @@ def get_transcript_with_timestamps(
         route_timeout=route_timeout,
         progress_callback=progress_callback,
         fresh_primary=fresh_primary,
+        source=source,
     )
-    
+
     if 'error' in result:
         return result
-    
+
     segments = result['segments']
     chunk_seconds = chunk_minutes * 60
     
@@ -1445,6 +1582,7 @@ def get_transcript_with_fallback(
     route_timeout: Optional[float] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
     fresh_primary: bool = False,
+    source: Optional[str] = None,
 ) -> dict:
     """
     Fetch transcript with AWS Transcribe fallback.
@@ -1485,8 +1623,8 @@ def get_transcript_with_fallback(
             - error: Error message if both methods fail
     """
     video_id = extract_video_id(video_id)
-    
-    # Try YouTube transcript API first
+
+    # YouTube first (then Filmot's subtitle index, per ``source``).
     result = get_transcript(
         video_id,
         languages,
@@ -1494,16 +1632,19 @@ def get_transcript_with_fallback(
         route_timeout=route_timeout,
         progress_callback=progress_callback,
         fresh_primary=fresh_primary,
+        source=source,
     )
-    
+
     if 'error' not in result:
-        result['source'] = 'youtube'
+        result.setdefault('source', 'youtube')
         return result
     
     youtube_error = result.get('error', 'Unknown error')
-    
-    # If fallback disabled, return the error
-    if not use_aws_fallback:
+
+    # AWS transcribes audio downloaded from YouTube, so index-only mode skips it.
+    from .index_transcript import transcript_source
+
+    if not use_aws_fallback or transcript_source(source) == "filmot":
         return result
 
     youtube_routes_tried = list(result.get("routes_tried") or [])

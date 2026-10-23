@@ -13,6 +13,7 @@ from click.testing import CliRunner
 import filmot.config as app_config
 from filmot import api_usage
 from filmot.api import (
+    Deadline,
     FilmotClient,
     normalize_channel_suggestion,
     normalize_channel_suggestions,
@@ -86,6 +87,7 @@ def transport():
         calls.append({
             "provider": provider, "url": url, "allow_redirects": allow_redirects,
             "params": dict(params or {}), "headers": dict(headers or {}),
+            "timeout": timeout,
         })
         item = queues[provider].pop(0)
         if isinstance(item, BaseException):
@@ -343,6 +345,98 @@ def test_retry_after_waits_are_clamped(transport, monkeypatch, retry_after, expe
 
     assert client.get_videos("dQw4w9WgXcQ") == []
     sleep.assert_called_once_with(expected)
+
+
+def test_a_deadline_caps_socket_timeouts(transport):
+    transport.queues["rapidapi"].append(FakeResponse(200, []))
+    client = make_client(transport)
+    client.deadline = Deadline(3.0)
+
+    client.get_videos("dQw4w9WgXcQ")
+
+    assert all(0 < part <= 3.0 for part in transport.calls[0]["timeout"])
+
+
+def test_a_deadline_skips_a_rate_limit_wait_it_cannot_afford(transport, monkeypatch):
+    sleep = MagicMock()
+    monkeypatch.setattr("filmot.api.time.sleep", sleep)
+    transport.queues["rapidapi"].append(
+        FakeResponse(429, {"message": "Too many requests"}, headers={"Retry-After": "30"})
+    )
+    transport.queues["direct"].append(FakeResponse(200, [], headers=CREDITS))
+    client = make_client(transport)
+    client.deadline = Deadline(5.0)
+
+    assert client.get_videos("dQw4w9WgXcQ") == []
+    sleep.assert_not_called()
+    assert [call["provider"] for call in transport.calls] == ["rapidapi", "direct"]
+
+
+def test_an_expired_deadline_sends_nothing(transport):
+    client = make_client(transport)
+    client.deadline = Deadline(0)
+
+    result = client.get_videos("dQw4w9WgXcQ")
+
+    assert result["error_type"] == "FilmotTimeout"
+    assert transport.calls == []
+
+
+def test_no_failover_once_a_slow_provider_used_up_the_deadline(transport, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("filmot.api.time.monotonic", lambda: now[0])
+
+    def slow_request(*args, **kwargs):
+        now[0] += 10.0
+        return transport.request(*args, **kwargs)
+
+    transport.queues["rapidapi"].append(requests.exceptions.ReadTimeout("read timed out"))
+    client = make_client(transport)
+    client.session.request = slow_request
+    client.deadline = Deadline(5.0)
+
+    result = client.get_videos("dQw4w9WgXcQ")
+
+    # The first provider's own error, not a synthetic timeout from the second.
+    assert result["error_type"] == "FilmotConnectionError"
+    assert client.last_provider == "rapidapi"
+    assert [call["provider"] for call in transport.calls] == ["rapidapi"]
+
+
+def test_time_before_the_request_counts_against_the_deadline(transport, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("filmot.api.time.monotonic", lambda: now[0])
+
+    class SlowCache:
+        def get(self, *args, **kwargs):
+            now[0] += 10.0  # the cache lookup outlives the deadline
+            return None
+
+    client = make_client(transport)
+    client.use_cache, client.cache = True, SlowCache()
+    client.deadline = Deadline(5.0)
+
+    result = client.get_videos("dQw4w9WgXcQ")
+
+    assert result["error_type"] == "FilmotTimeout"
+    assert transport.calls == []
+    client.rate_limiter.acquire.assert_not_called()
+
+
+def test_cancelling_the_deadline_stops_a_pending_retry(transport, monkeypatch):
+    deadline = Deadline(30.0)
+    monkeypatch.setattr("filmot.api.time.sleep", lambda seconds: deadline.cancel())
+    transport.queues["rapidapi"].append(
+        FakeResponse(429, {"message": "Too many requests"}, headers={"Retry-After": "1"})
+    )
+    client = make_client(transport)
+    client.deadline = deadline
+
+    result = client.get_videos("dQw4w9WgXcQ")
+
+    assert result["error_type"] == "FilmotTimeout"
+    assert [call["provider"] for call in transport.calls] == ["rapidapi"]
+    assert client.rate_limiter.acquire.call_count == 1
 
 
 def test_credentials_never_reach_error_results(transport):

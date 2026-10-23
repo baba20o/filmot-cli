@@ -847,7 +847,10 @@ class TranscriptLibrary:
         source = str(value or "").strip().casefold().replace("-", "_")
         if not source:
             route_name = str(route or "").strip().casefold().replace("_", "-")
-            source = "aws_transcribe" if route_name == "aws-transcribe" else "youtube"
+            source = {
+                "aws-transcribe": "aws_transcribe",
+                "filmot-index": "filmot_index",
+            }.get(route_name, "youtube")
         if source in {"aws", "aws_transcribe"}:
             return "aws_transcribe"
         if source in {"youtube", "youtube_transcript_api"}:

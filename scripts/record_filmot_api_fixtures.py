@@ -43,6 +43,7 @@ _FIXTURE_NAMES = (
     "search_channels",
     "get_videos",
     "get_videos_columns",
+    "get_videos_subtitles",
 )
 
 
@@ -82,6 +83,9 @@ def _sanitize_string(key: str, value: str, ordinal: int) -> str:
         return re.sub(r"\d{2}:\d{2}:\d{2}", "03:04:05", value)
     if lowered == "description":
         return "Recorded video description"
+    if lowered == "t":
+        # Indexed caption text (subtitles column).
+        return "recorded caption line"
     if lowered in {"channelcountryname", "countryname", "country"}:
         return "Recorded country"
     if re.search(r"(?i)https?://[^/\s@]+@", value):
@@ -123,6 +127,16 @@ def compact_response(name: str, payload: Any) -> Any:
         ]
     elif isinstance(payload, list):
         payload = payload[:3]
+        if name == "get_videos_subtitles":
+            payload = [
+                dict(video, subtitles=[
+                    dict(track, transcript=list(track.get("transcript") or [])[:3])
+                    for track in video["subtitles"][:2]
+                ])
+                if isinstance(video, dict) and isinstance(video.get("subtitles"), list)
+                else video
+                for video in payload
+            ]
     return payload
 
 
@@ -206,6 +220,9 @@ def main() -> int:
         "get_videos_columns": lambda: client.get_videos(
             args.video_id, columns=VIDEO_METADATA_COLUMNS,
         ),
+        "get_videos_subtitles": lambda: client.get_videos(
+            args.video_id, columns=("subtitles", "lastfetchdate"), lang="en",
+        ),
     }
     endpoints = {
         "search_subtitles_context": "/getsearchsubtitles",
@@ -213,6 +230,7 @@ def main() -> int:
         "search_channels": "/getsearchchannels",
         "get_videos": "/getvideos",
         "get_videos_columns": "/getvideos",
+        "get_videos_subtitles": "/getvideos",
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

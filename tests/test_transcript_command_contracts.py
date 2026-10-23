@@ -1195,3 +1195,53 @@ def test_download_defers_aggregate_messages_to_shared_outcome(runner):
         "\n[bold]Complete:[/bold] 1 saved, 0 skipped, 0 failed",
         "[dim]View with: filmot library list topic[/dim]",
     ]
+
+
+def test_channel_download_keeps_index_transcript_provenance(runner, tmp_path):
+    downloader = MagicMock()
+    downloader._resolve_channel_dir.return_value = ("example", Path(tmp_path) / "example")
+    downloader._load_manifest.return_value = {"videos": {}}
+    info = {
+        "channel_id": "UC1234567890123456789012",
+        "name": "Example",
+        "video_count": 1,
+        "subscriber_count": 12,
+        "uploads_playlist_id": "uploads",
+    }
+    videos = [{"video_id": "abc12345678", "title": "Video", "published_at": "2026-01-01T00:00:00Z"}]
+    index_provenance = {
+        "provider": "filmot", "language": "en", "is_generated": False,
+        "observed_at": "2026-01-02", "api_provider": "rapidapi",
+        "youtube_error_type": "TranscriptsDisabled",
+    }
+    transcript = {
+        "language": "en",
+        "is_generated": False,
+        "duration_seconds": 5.0,
+        "segment_count": 1,
+        "full_text": "two words",
+        "segments": [{"start": 0.0, "duration": 5.0, "text": "two words"}],
+        "source": "filmot_index",
+        "route": "filmot-index",
+        "routes_tried": ["direct", "filmot-index"],
+        "transcript_index": index_provenance,
+    }
+    with (
+        patch("filmot.channel_dl.ChannelDownloader", return_value=downloader),
+        patch("filmot.channel_dl.get_channel_info", return_value=info),
+        patch("filmot.channel_dl.enumerate_uploads_detailed", return_value=_upload_enumeration(videos)),
+        patch("filmot.transcript.get_transcript", return_value=transcript),
+        patch("filmot.transcript.routing_plan", return_value=_route_plan()),
+        patch("filmot.transcript.describe_routing_plan", return_value="direct"),
+        patch("filmot.ledger.log_event"),
+        patch("filmot.ledger.log_result"),
+        patch("filmot.commands.transcript._render_channel_download"),
+    ):
+        result = runner.invoke(cli, ["channel-download", "UC1234567890123456789012", "--delay", "0"])
+
+    assert result.exit_code == 0, result.output
+    saved = downloader._save_transcript.call_args.args[2]
+    assert saved["source"] == "filmot_index"
+    assert saved["routes_tried"] == ["direct", "filmot-index"]
+    assert saved["transcript_index"] == index_provenance
+    assert downloader._save_manifest.call_args.args[1]["videos"]["abc12345678"]["source"] == "filmot_index"

@@ -200,12 +200,32 @@ def _quota_details(response) -> Optional[Dict[str, Any]]:
     return None
 
 
+class Deadline:
+    """A point on the monotonic clock after which no request work starts.
+
+    It is fixed when created, so time spent before a request (client setup, a
+    cache lookup) counts against it. ``cancel()`` moves it to now, letting a
+    caller that stops waiting also stop work it left running in a thread.
+    """
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self._at = time.monotonic() + seconds
+
+    def remaining(self) -> float:
+        return self._at - time.monotonic()
+
+    def cancel(self) -> None:
+        self._at = float("-inf")
+
+
 class FilmotClient:
     """Client for interacting with the Filmot API through configured providers."""
 
     def __init__(self, use_cache: bool = True, cache_ttl: int = 3600,
                  rate_limit: float = 2.0, burst_size: int = 5,
-                 request_timeout=DEFAULT_REQUEST_TIMEOUT):
+                 request_timeout=DEFAULT_REQUEST_TIMEOUT,
+                 deadline: Optional[Deadline] = None):
         """
         Initialize the Filmot client.
 
@@ -214,7 +234,13 @@ class FilmotClient:
             cache_ttl: Cache time-to-live in seconds
             rate_limit: Requests per second limit
             burst_size: Maximum burst of requests
+            deadline: Optional Deadline for every request call: socket
+                timeouts are capped to what remains, and no request,
+                Retry-After wait, or failover starts past it. A read timeout
+                limits silence, not total time, so a caller needing a hard
+                bound must also stop waiting at the deadline
         """
+        self.deadline = deadline
         # Fail before any work when no provider can serve the selected policy.
         configured_providers(require=True)
         _report_ignored_project_settings()
@@ -269,7 +295,11 @@ class FilmotClient:
                 provider, method, endpoint, params, data,
             )
             self.last_provider = provider.name
-            if failover_reason is None or index + 1 == len(providers):
+            if (
+                failover_reason is None
+                or index + 1 == len(providers)
+                or (self.deadline is not None and self.deadline.remaining() <= 0)
+            ):
                 return result
             following = providers[index + 1]
             api_usage.record_failover(endpoint, provider.name, following.name, failover_reason)
@@ -289,9 +319,23 @@ class FilmotClient:
     ) -> Tuple[Any, Optional[str]]:
         """Return ``(result, failover_reason)``; the reason is None when final."""
         url = provider.url(endpoint)
+        deadline = self.deadline
         for attempt in range(MAX_RETRIES + 1):
+            if deadline is not None and deadline.remaining() <= 0:
+                return self._past_deadline(provider), "connection"
             # Apply rate limiting
             self.rate_limiter.acquire()
+
+            timeout = self.request_timeout
+            if deadline is not None:
+                # The rate limiter may have waited past the deadline.
+                remaining = deadline.remaining()
+                if remaining <= 0:
+                    return self._past_deadline(provider), "connection"
+                timeout = (
+                    tuple(min(part, remaining) for part in timeout)
+                    if isinstance(timeout, tuple) else min(timeout, remaining)
+                )
 
             try:
                 response = self.session.request(
@@ -300,7 +344,7 @@ class FilmotClient:
                     params=params,
                     json=data,
                     headers=provider.headers(),
-                    timeout=self.request_timeout,
+                    timeout=timeout,
                     # requests strips only Authorization on cross-origin
                     # redirects; custom key headers would follow a Location
                     # to any host, so authenticated calls never redirect.
@@ -349,6 +393,16 @@ class FilmotClient:
                         else:
                             # Exponential backoff: 5, 10, 20, 40
                             wait = DEFAULT_RETRY_WAIT * (2 ** attempt)
+                        if deadline is not None and wait >= deadline.remaining():
+                            # Waiting would overrun the deadline; give up now.
+                            return self._error(
+                                provider, "FilmotRateLimited",
+                                "The {} is rate limiting {}, and waiting would pass "
+                                "the {:g}s deadline.".format(
+                                    provider.label, endpoint, deadline.seconds,
+                                ),
+                                status,
+                            ), "rate-limited"
 
                         logger.warning(
                             "Rate limited (429) on %s by the %s — waiting %ds before retry %d/%d",
@@ -456,6 +510,12 @@ class FilmotClient:
             result["status_code"] = status_code
         result.update(_scrub_secrets(details, secrets))
         return result
+
+    def _past_deadline(self, provider: Provider) -> Dict[str, Any]:
+        return self._error(
+            provider, "FilmotTimeout",
+            "The {} did not answer within {:g}s.".format(provider.label, self.deadline.seconds),
+        )
 
     def _quota_error(self, provider: Provider, quota: Dict[str, Any]) -> Dict[str, Any]:
         if "message" in quota:

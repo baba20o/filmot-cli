@@ -22,9 +22,12 @@ from ..cli_support import (
     prepare_raw_result,
     route_progress_for as _route_progress_for,
     transcript_failure_detail as _transcript_failure_detail,
+    reject_index_only_aws_fallback,
+    transcript_source_option,
     whole_word_summary as _whole_word_summary,
 )
 from ..session_context import current_session, session_option
+from ..index_transcript import index_provenance
 from ..schemas import (
     CommandResult,
     ErrorDetail,
@@ -888,6 +891,7 @@ def _research_output(callback):
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy for transcript downloads")
 @click.option("--verbose", is_flag=True, help="Show full transcript failure details")
 @click.option("--raw", is_flag=True, help="Emit one typed JSON result; progress goes to stderr")
+@transcript_source_option
 @_research_output
 def research(
     topic: str,
@@ -911,6 +915,7 @@ def research(
     no_proxy: bool,
     verbose: bool,
     raw: bool,
+    transcript_source: Optional[str] = None,
 ):
     """Research TOPIC with staged search, visible selection, and checkpoints.
 
@@ -932,6 +937,8 @@ def research(
     """
     import hashlib
     import uuid
+
+    reject_index_only_aws_fallback(transcript_source, fallback)
 
     from ..ledger import log_event, log_result
     from ..library import get_library, normalize_topic_name
@@ -1120,12 +1127,14 @@ def research(
                 ),
                 progress_callback=route_progress,
                 fresh_primary=True,
+                source=transcript_source,
             )
         return get_transcript(
             video_id,
             languages=languages,
             progress_callback=route_progress,
             fresh_primary=True,
+            source=transcript_source,
         )
 
     try:
@@ -1133,7 +1142,7 @@ def research(
         normalized_topic = library._normalize_topic(topic)
         if no_proxy:
             disable_proxy()
-        route_plan = routing_plan()
+        route_plan = routing_plan(transcript_source)
         click.echo(
             f"Transcript routes ({route_plan['mode']}): "
             f"{describe_routing_plan(route_plan)}; "
@@ -1897,6 +1906,7 @@ def research(
                     "selection_signals": selection,
                     "route": transcript_result.get("route"),
                     "routes_tried": transcript_result.get("routes_tried"),
+                    **index_provenance(transcript_result),
                 }
                 library.save(
                     video_id=video_id,
@@ -2442,6 +2452,7 @@ def research(
                                 "selection_signals": video.get("_selection"),
                                 "route": transcript_result.get("route"),
                                 "routes_tried": transcript_result.get("routes_tried"),
+                                **index_provenance(transcript_result),
                             },
                             segments=transcript_result.get("segments", []),
                         )

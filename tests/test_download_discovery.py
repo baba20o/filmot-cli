@@ -80,6 +80,7 @@ def test_unchanged_yt_search_raw_payload_pipes_into_download():
         languages=None,
         progress_callback=get_transcript.call_args.kwargs["progress_callback"],
         fresh_primary=True,
+        source=None,
     )
     saved = library.save.call_args.kwargs
     assert saved["video_id"] == video["video_id"]

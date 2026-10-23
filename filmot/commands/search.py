@@ -28,7 +28,9 @@ from ..cli_support import (
     prepare_raw_result as _prepare_raw_result,
     route_progress_for as _route_progress_for,
     silence_broken_pipe_streams as _silence_broken_pipe_streams,
+    reject_index_only_aws_fallback,
     status_context as _search_status,
+    transcript_source_option,
     transcript_failure_detail as _transcript_failure_detail,
     whole_word_summary as _whole_word_summary,
 )
@@ -287,6 +289,7 @@ def _resolve_search_session(
 @click.option("--fallback", is_flag=True, help="Use AWS Transcribe fallback during bulk download when captions unavailable")
 @click.option("--dedupe", is_flag=True, help="Skip duplicate transcripts during bulk download")
 @click.option("--no-proxy", is_flag=True, help="Bypass proxy during bulk download, connect directly")
+@transcript_source_option
 def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
            category: str, exclude: str,
            channel_id: str, channel: str, channel_count: int, title: str,
@@ -295,7 +298,8 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
            country: int, license_type: str, sort: str, order: str, manual_subs: bool,
            max_query_time: int, hit_format: str, full: bool, raw: bool, min_matches: int,
            limit: int, max_hits: int, context_chars: int, bulk_download: str,
-           fallback: bool, dedupe: bool, no_proxy: bool):
+           fallback: bool, dedupe: bool, no_proxy: bool,
+           transcript_source: Optional[str]):
     """Search for videos by subtitle/transcript content.
 
     Unquoted words use loose transcript-wide implicit AND: each word may occur
@@ -320,6 +324,8 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
     """
     from ..ledger import log_event
 
+    if bulk_download:
+        reject_index_only_aws_fallback(transcript_source, fallback)
     resolved_session = _resolve_search_session(current_session(), bulk_download)
     search_event_logged = False
 
@@ -687,6 +693,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
                 fallback=fallback,
                 dedupe=dedupe,
                 lang=lang,
+                source=transcript_source,
             )
             return
 
@@ -1159,6 +1166,7 @@ def _bulk_download_transcripts(
     dedupe: bool = False,
     lang: str = None,
     discovery_ref: Optional[str] = None,
+    source: Optional[str] = None,
 ):
     """Download transcripts from search results to library.
 
@@ -1170,6 +1178,7 @@ def _bulk_download_transcripts(
         dedupe: If True, skip matching first-500-character fingerprints
         lang: Optional preferred transcript language
         discovery_ref: Optional content-addressed source artifact reference
+        source: Transcript source (auto, youtube, or filmot); see get_transcript
     """
     import hashlib
     from ..library import get_library
@@ -1181,6 +1190,7 @@ def _bulk_download_transcripts(
         get_transcript_with_fallback,
         routing_plan,
     )
+    from ..index_transcript import index_provenance
     from ..video_metadata import (
         enrich_after_save,
         enrichment_counts,
@@ -1215,7 +1225,7 @@ def _bulk_download_transcripts(
 
     # Limit to max_count
     videos_to_download = videos[:max_count]
-    route_plan = routing_plan()
+    route_plan = routing_plan(source)
     click.echo(
         f"Transcript routes ({route_plan['mode']}): "
         f"{describe_routing_plan(route_plan)}; "
@@ -1290,6 +1300,7 @@ def _bulk_download_transcripts(
                     ),
                     progress_callback=route_progress,
                     fresh_primary=True,
+                    source=source,
                 )
             else:
                 result = get_transcript(
@@ -1297,6 +1308,7 @@ def _bulk_download_transcripts(
                     languages=[lang] if lang else None,
                     progress_callback=route_progress,
                     fresh_primary=True,
+                    source=source,
                 )
 
             if any(
@@ -1377,6 +1389,7 @@ def _bulk_download_transcripts(
                 ),
                 "route": result.get("route"),
                 "routes_tried": result.get("routes_tried"),
+                **index_provenance(result),
             }
             library.save(
                 video_id=video_id,

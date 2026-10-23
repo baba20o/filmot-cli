@@ -49,6 +49,22 @@ recorded in `docs/FIELD_TEST_LOG.md`.
   YouTube field. `FILMOT_ENRICH_ON_SAVE=0` turns the lookup off.
 - `library enrich [TOPIC]`, with `--video`, `--all`, `--max-videos`,
   `--dry-run`, and `--raw`, repairs existing records in batches.
+- Transcripts from Filmot's subtitle index. When YouTube can't deliver a
+  transcript (blocked routes, disabled captions, a removed video), `transcript`,
+  `download`, `search --bulk-download`, `research`, and `channel-download` fall
+  back to the index before any AWS fallback. `--source filmot` uses only the
+  index, `--source youtube` turns the fallback off, and
+  `FILMOT_TRANSCRIPT_SOURCE` sets the default. Index results are marked
+  `source: filmot_index`, with a `transcript_index` provenance block (track
+  language, automatic or manual, snapshot date, API provider, YouTube error
+  type) that library saves keep, `channel-download` included. `--fallback` is
+  refused in index-only mode, and an index lookup slower than
+  `FILMOT_TRANSCRIPT_ROUTE_TIMEOUT` is abandoned and reported as `IndexTimeout`.
+- `FilmotClient(deadline=Deadline(seconds))` limits the work request calls
+  start: socket timeouts are capped to the remaining time, and no request,
+  Retry-After wait, or provider failover starts past the deadline. The
+  deadline is fixed when created, so setup and cache lookups count against it,
+  and `Deadline.cancel()` ends it early.
 - `docs/YOUTUBE_ROADMAP.md`, a durable ranked queue for future public read surfaces,
   OAuth/policy gates, and the admission checklist for each new YouTube slice.
 - Named search-session routing through `--session` and `FILMOT_SESSION`, with
