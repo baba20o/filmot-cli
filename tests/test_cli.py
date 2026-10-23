@@ -42,7 +42,6 @@ class TestCLIEntryPoint:
     ):
         import filmot.config as app_config
         from filmot.paths import (
-            config_file,
             project_data_dir,
             proxy_health_db,
             user_cache_dir,
@@ -74,7 +73,7 @@ class TestCLIEntryPoint:
         for path in (
             project_data_dir(),
             user_config_dir(),
-            config_file(),
+            app_config.USER_CONFIG_FILE,
             user_state_dir(),
             proxy_health_db(),
             user_cache_dir(),

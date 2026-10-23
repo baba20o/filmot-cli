@@ -125,7 +125,6 @@ FILMOT_API_KEY=your_filmot_api_key_here
 
 # Legacy RapidAPI gateway (optional; existing subscriptions keep working)
 RAPIDAPI_KEY=your_rapidapi_key_here
-RAPIDAPI_HOST=filmot-tube-metadata-archive.p.rapidapi.com
 
 # Optional: direct search, video/playlist/comment reads, refresh, and channel enumeration
 YOUTUBE_API_KEY=your_restricted_youtube_data_api_key_here
@@ -176,6 +175,48 @@ hits per provider, credits charged and remaining, plan requests remaining, and
 any failovers. The session ledger records them with the command's event.
 `filmot config` shows which keys are configured and how routes resolve,
 without printing credentials. Responses are cached separately per provider.
+
+`FILMOT_API_BASE_URL` and `RAPIDAPI_HOST` change where requests, and your
+keys, are sent. You can set them only in the process environment or the
+per-user `config.env`. For a provider whose key is set, the base URL must use
+`https://` and the host must be a bare host name with an optional port.
+Otherwise the command stops before sending any request.
+
+When Filmot loads its configuration, it reads a project `.env` with these
+limits:
+
+- It cannot set the endpoint overrides.
+- It cannot set the variables that locate the per-user config
+  (`FILMOT_CONFIG_FILE`, `FILMOT_CONFIG_DIR`, `XDG_CONFIG_HOME`, `APPDATA`,
+  `HOME`, `USERPROFILE`, and the Windows fallbacks `HOMEDRIVE`, `HOMEPATH`,
+  `USERNAME`).
+- It cannot set TLS trust or key logging (`REQUESTS_CA_BUNDLE`,
+  `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `SSLKEYLOGFILE`).
+- Its values are read literally, without `${VAR}` expansion.
+- Names that are not plain identifiers are skipped.
+
+Filmot locates the per-user config once, when it starts and before it reads
+the project `.env`. Reloads and child processes reuse that location rather
+than resolving it again. A parent process can point a child at a different
+per-user config only by changing `FILMOT_CONFIG_FILE` or `FILMOT_CONFIG_DIR` to
+a literal absolute path.
+
+So the configuration Filmot loads, after a reload or in Filmot's own child
+processes as well, sends your keys only to the endpoints your environment or
+per-user config chose, over TLS verified the normal way. A protected value is
+dropped when the project `.env` sets it and neither your environment nor your
+per-user config does. If it would have changed anything (for an endpoint,
+anything but the default), `filmot config` lists it, and Filmot warns once when
+a command first sets up its Filmot API client.
+
+These limits cover configuration loading only. A project `.env` still applies
+to everything else, including proxies and Filmot's data and cache locations.
+The transcript helper process also starts Python from the current directory.
+Run Filmot only in directories you trust.
+
+When a provider asks Filmot to wait (`Retry-After`), a wait in whole seconds
+is capped at 60 seconds. Any other value, such as an HTTP date, waits 5
+seconds.
 
 ### Storage and configuration
 

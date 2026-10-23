@@ -254,6 +254,32 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- A project `.env` could send your Filmot keys elsewhere, for example when
+  Filmot ran inside a cloned repository.
+  - It could set `FILMOT_API_BASE_URL` or `RAPIDAPI_HOST`.
+  - It could name itself as the per-user config, which a reload or a child
+    process would then trust.
+  - It could embed a key loaded from your per-user config in a proxy URL through
+    `${VAR}` expansion.
+  - It could point TLS trust or key logging at its own files.
+
+  When Filmot loads its configuration, a project `.env` can no longer set those
+  variables. Its values are read literally, without `${VAR}` expansion, and
+  only allowed, identifier-named values are exported, so a protected value is
+  never written to the process environment, even briefly. The per-user config
+  is located once at startup, before the project `.env` is read, and reloads
+  and child processes reuse that location. A parent can point a child at
+  another per-user config only with a literal absolute `FILMOT_CONFIG_FILE` or
+  `FILMOT_CONFIG_DIR`. A dropped value that would have changed anything is
+  listed by `filmot config`, and Filmot reports it once on stderr when a command
+  first sets up its API client. For a provider whose key is set, the direct base
+  URL must use `https://` and the RapidAPI host must be a bare host name with a
+  valid optional port, or the command stops before any request. An empty or
+  whitespace-only endpoint override now means the default.
+- A `Retry-After` header on a Filmot 429 was used unchecked. A negative value
+  crashed the request, reported as a configuration error, and a huge one
+  stalled the command. Waits in whole seconds are now capped between 0 and 60
+  seconds.
 - A partial record in Filmot's index (`ispartialdata: 1`) can have a null title,
   duration, upload date, or channel field. One such record made the whole
   `/getvideos` response fail validation, which lost an entire 200-video

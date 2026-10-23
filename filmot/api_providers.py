@@ -17,10 +17,12 @@ Policies:
 from __future__ import annotations
 
 import os
+import re
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import click
 
@@ -107,28 +109,63 @@ def configured_secrets() -> Tuple[str, ...]:
     return tuple(sorted(values, key=len, reverse=True))
 
 
+_HOST_PORT = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::([0-9]{1,5}))?")
+
+
+def endpoint_problem(name: str) -> Optional[str]:
+    """Why a provider's configured endpoint must not receive its key, if so."""
+    if name == DIRECT:
+        try:
+            parsed = urlsplit(config.DIRECT_BASE_URL)
+            # Reading .port validates it (numeric, 0-65535) or raises ValueError.
+            valid = parsed.scheme == "https" and bool(parsed.hostname) and (
+                parsed.port is None or parsed.port > 0
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            return "FILMOT_API_BASE_URL must be an https:// URL; no request was sent."
+        return None
+    match = _HOST_PORT.fullmatch(config.API_HOST or "")
+    if not match or (match.group(1) is not None and not 0 < int(match.group(1)) <= 65535):
+        return "RAPIDAPI_HOST must be a host name with an optional port; no request was sent."
+    return None
+
+
 def configured_providers(require: bool = False) -> Dict[str, Provider]:
-    """Return configured providers; with ``require``, enforce the selected policy."""
+    """Return configured providers; with ``require``, enforce the selected policy.
+
+    A provider whose endpoint fails ``endpoint_problem`` is left out, and
+    ``require`` raises that problem, so its key is never sent anywhere.
+    """
     providers: Dict[str, Provider] = {}
     direct_key = (config.DIRECT_API_KEY or "").strip()
     if direct_key:
-        providers[DIRECT] = Provider(
-            name=DIRECT,
-            label="direct Filmot API",
-            base_url=config.DIRECT_BASE_URL.rstrip("/"),
-            key_env="FILMOT_API_KEY",
-            _headers=(("X-API-Key", direct_key),),
-        )
+        problem = endpoint_problem(DIRECT)
+        if problem is None:
+            providers[DIRECT] = Provider(
+                name=DIRECT,
+                label="direct Filmot API",
+                base_url=config.DIRECT_BASE_URL.rstrip("/"),
+                key_env="FILMOT_API_KEY",
+                _headers=(("X-API-Key", direct_key),),
+            )
+        elif require:
+            raise ProviderConfigurationError(problem)
     rapid_key = (config.RAPIDAPI_KEY or "").strip()
     host = (config.API_HOST or "").strip()
     if rapid_key and host:
-        providers[RAPIDAPI] = Provider(
-            name=RAPIDAPI,
-            label="RapidAPI gateway",
-            base_url=config.RAPIDAPI_BASE_URL.rstrip("/"),
-            key_env="RAPIDAPI_KEY",
-            _headers=(("x-rapidapi-key", rapid_key), ("x-rapidapi-host", host)),
-        )
+        problem = endpoint_problem(RAPIDAPI)
+        if problem is None:
+            providers[RAPIDAPI] = Provider(
+                name=RAPIDAPI,
+                label="RapidAPI gateway",
+                base_url=config.RAPIDAPI_BASE_URL.rstrip("/"),
+                key_env="RAPIDAPI_KEY",
+                _headers=(("x-rapidapi-key", rapid_key), ("x-rapidapi-host", host)),
+            )
+        elif require:
+            raise ProviderConfigurationError(problem)
     if require:
         policy = selected_policy()
         if not providers:
@@ -175,13 +212,30 @@ def describe_configuration() -> List[Tuple[str, str]]:
 
     providers = configured_providers()
     secrets = configured_secrets()
-    rows = [
-        ("Filmot API Key (direct)", "configured" if DIRECT in providers else "not configured"),
+
+    def key_state(name: str, key: str) -> str:
+        if name in providers:
+            return "configured"
+        return "set but unusable" if (key or "").strip() else "not configured"
+
+    def endpoint(value: str, name: str) -> str:
         # A base-URL override may carry userinfo; never print it.
-        ("Direct API URL", redact_sensitive_text(config.DIRECT_BASE_URL, secrets)),
-        ("RapidAPI Key", "configured" if RAPIDAPI in providers else "not configured"),
-        ("RapidAPI Host", redact_sensitive_text(config.API_HOST, secrets)),
+        shown = redact_sensitive_text(value, secrets)
+        problem = endpoint_problem(name)
+        return "{} (rejected: {})".format(shown, problem) if problem else shown
+
+    rows = [
+        ("Filmot API Key (direct)", key_state(DIRECT, config.DIRECT_API_KEY)),
+        ("Direct API URL", endpoint(config.DIRECT_BASE_URL, DIRECT)),
+        ("RapidAPI Key", key_state(RAPIDAPI, config.RAPIDAPI_KEY)),
+        ("RapidAPI Host", endpoint(config.API_HOST, RAPIDAPI)),
     ]
+    if config.IGNORED_PROJECT_SETTINGS:
+        rows.append((
+            "Ignored in project .env",
+            "{} (these come only from the environment or the per-user "
+            "config)".format(", ".join(config.IGNORED_PROJECT_SETTINGS)),
+        ))
     try:
         policy = selected_policy()
     except ProviderConfigurationError as error:

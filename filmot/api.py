@@ -5,7 +5,7 @@ import time
 import logging
 import requests
 from typing import Optional, Dict, Any, List, Generator, Tuple
-from . import api_usage
+from . import api_usage, config
 from .api_contract import FilmotAPIContractError, validate_api_response
 from .api_providers import (
     Provider,
@@ -22,7 +22,23 @@ logger = logging.getLogger(__name__)
 # Retry config for 429 responses
 MAX_RETRIES = 4
 DEFAULT_RETRY_WAIT = 5  # seconds, if no Retry-After header
+MAX_RETRY_AFTER = 60  # seconds; a provider's Retry-After never waits longer
 DEFAULT_REQUEST_TIMEOUT = (10, 45)  # connect, read seconds
+
+_ignored_settings_reported = False
+
+
+def _report_ignored_project_settings() -> None:
+    """Say once per process that a project .env tried to set protected settings."""
+    global _ignored_settings_reported
+    if config.IGNORED_PROJECT_SETTINGS and not _ignored_settings_reported:
+        _ignored_settings_reported = True
+        logger.warning(
+            "Ignored %s from the project .env: API endpoints, the per-user "
+            "config location, and TLS settings come only from the environment "
+            "or the per-user config.",
+            ", ".join(config.IGNORED_PROJECT_SETTINGS),
+        )
 
 # Every non-subtitle /getvideos column. Raw subtitles are requested separately
 # because selecting them caps a batch at 10 IDs instead of 200.
@@ -201,6 +217,7 @@ class FilmotClient:
         """
         # Fail before any work when no provider can serve the selected policy.
         configured_providers(require=True)
+        _report_ignored_project_settings()
         self.session = requests.Session()
 
         # Optional caching
@@ -319,11 +336,14 @@ class FilmotClient:
                         self.rate_limiter.report_rate_limit()
 
                     if attempt < MAX_RETRIES:
-                        # Check Retry-After header (seconds or HTTP-date)
+                        # Retry-After in whole seconds; anything else, such as
+                        # an HTTP date, waits DEFAULT_RETRY_WAIT.
                         retry_after = response.headers.get("Retry-After")
                         if retry_after:
                             try:
-                                wait = int(retry_after)
+                                # A negative value would crash sleep(); a huge
+                                # one would hang the command.
+                                wait = min(max(int(retry_after), 0), MAX_RETRY_AFTER)
                             except ValueError:
                                 wait = DEFAULT_RETRY_WAIT
                         else:
