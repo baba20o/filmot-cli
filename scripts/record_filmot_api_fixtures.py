@@ -47,6 +47,9 @@ _FIXTURE_NAMES = (
     "get_channels",
     "get_channels_all",
     "get_channel_videos",
+    "metadata_search",
+    "advanced_channel_search",
+    "subtitle_export",
 )
 
 
@@ -90,6 +93,11 @@ def _sanitize_string(key: str, value: str, ordinal: int) -> str:
         return "Recorded channel biography"
     if lowered == "username":
         return "recorded-username-{:03d}".format(ordinal)
+    if lowered == "context":
+        # Subtitle-export hit text around the matched phrase.
+        return "recorded caption context"
+    if lowered == "topiccloud":
+        return "recorded topic words"
     if lowered == "val":
         # A previous channel profile value (channelchanges).
         return "Recorded previous value {:03d}".format(ordinal)
@@ -129,7 +137,13 @@ def sanitize_response(value: Any, *, ordinal: int = 1) -> Any:
 
 def compact_response(name: str, payload: Any) -> Any:
     """Keep fixtures reviewable while retaining every nested contract shape."""
-    if name.startswith("search_subtitles") and isinstance(payload, dict):
+    if name in ("metadata_search", "advanced_channel_search", "subtitle_export") and isinstance(payload, dict):
+        payload = dict(payload)
+        payload["result"] = [
+            dict(row, hits=list(row["hits"])[:2]) if isinstance(row, dict) and isinstance(row.get("hits"), list) else row
+            for row in list(payload.get("result", []))[:3]
+        ]
+    elif name.startswith("search_subtitles") and isinstance(payload, dict):
         payload = dict(payload)
         payload["result"] = [
             dict(video, hits=list(video.get("hits", []))[:2])
@@ -150,6 +164,13 @@ def compact_response(name: str, payload: Any) -> Any:
                 for video in payload
             ]
     return payload
+
+
+def _export_json(body: Any) -> Any:
+    """The parsed JSON of a ``format=json`` export page, or the client's error."""
+    if isinstance(body, dict):
+        return body
+    return json.loads(body.content.decode("utf-8-sig"))
 
 
 def _compact_channel(channel: Any) -> Any:
@@ -195,6 +216,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel-term", default="SQLite")
     parser.add_argument("--video-id", default="dQw4w9WgXcQ")
     parser.add_argument("--channel-id", default="UCHnyfMqiRRG1u-2MsSQLbXA")
+    parser.add_argument(
+        "--export-query",
+        default="energy",
+        help="Subtitle query for the channel-scoped (1-credit) export fixture",
+    )
     parser.add_argument(
         "--stats-start",
         default="2026-04-01",
@@ -271,6 +297,17 @@ def main() -> int:
         "get_channel_videos": lambda: client.get_channel_videos(
             args.channel_id, count_per_channel=3, columns=VIDEO_METADATA_COLUMNS,
         ),
+        # Channel-scoped, so each costs 1 direct credit.
+        "metadata_search": lambda: client.search_metadata(
+            {"channelID": args.channel_id, "perPageCount": 3},
+        ),
+        "advanced_channel_search": lambda: client.search_advanced_channels(
+            {"topics": args.channel_term, "perPageCount": 3},
+        ),
+        "subtitle_export": lambda: _export_json(client.export_subtitle_search({
+            "query": args.export_query, "channelID": args.channel_id,
+            "perPageCount": 3, "format": "json",
+        })),
     }
     endpoints = {
         "search_subtitles_context": "/getsearchsubtitles",
@@ -282,6 +319,9 @@ def main() -> int:
         "get_channels": "/getchannels",
         "get_channels_all": "/getchannels",
         "get_channel_videos": "/getchannelvideos",
+        "metadata_search": "/getmetadatasearch",
+        "advanced_channel_search": "/getadvancedchannelsearch",
+        "subtitle_export": "/getsubtitlesearch",
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

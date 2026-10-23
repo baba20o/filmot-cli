@@ -1,0 +1,295 @@
+{
+  "result": [
+    {
+      "channelid": "recorded-channel-001",
+      "name": "Recorded channel 001",
+      "handle": "@recorded-channel-001",
+      "thumbnailurl": "https://example.invalid/resource",
+      "country": "Recorded country",
+      "subcount": 1900,
+      "totalviewcount": 539738,
+      "joindate": "2019-04-21",
+      "firstvideodate": "2019-04-21",
+      "videocount": 178,
+      "avgdurationseconds": 550.61,
+      "avgvideoviewcount": 5110.9,
+      "autolanguages": "en hi",
+      "description": "Recorded video description",
+      "topiccloud": "recorded topic words",
+      "growth": {
+        "totalviewcount": {
+          "28d": {
+            "startdate": "2026-09-21",
+            "enddate": "2026-10-21",
+            "actualdays": 30,
+            "startcount": 532650,
+            "endcount": 539738,
+            "delta": 7088,
+            "normalizeddelta": 6615
+          },
+          "90d": {
+            "startdate": "2026-07-21",
+            "enddate": "2026-10-21",
+            "actualdays": 92,
+            "startcount": 525198,
+            "endcount": 539738,
+            "delta": 14540,
+            "normalizeddelta": 14224
+          },
+          "180d": {
+            "startdate": "2026-04-21",
+            "enddate": "2026-10-21",
+            "actualdays": 183,
+            "startcount": 524926,
+            "endcount": 539738,
+            "delta": 14812,
+            "normalizeddelta": 14569
+          },
+          "365d": {
+            "startdate": "2025-11-21",
+            "enddate": "2026-10-21",
+            "actualdays": 334,
+            "startcount": 523652,
+            "endcount": 539738,
+            "delta": 16086,
+            "normalizeddelta": 17579
+          }
+        },
+        "subcount": {
+          "28d": {
+            "startdate": "2026-09-21",
+            "enddate": "2026-10-21",
+            "actualdays": 30,
+            "startcount": 1880,
+            "endcount": 1900,
+            "delta": 20,
+            "normalizeddelta": 19
+          },
+          "90d": {
+            "startdate": "2026-07-21",
+            "enddate": "2026-10-21",
+            "actualdays": 92,
+            "startcount": 1850,
+            "endcount": 1900,
+            "delta": 50,
+            "normalizeddelta": 49
+          },
+          "180d": {
+            "startdate": "2026-04-21",
+            "enddate": "2026-10-21",
+            "actualdays": 183,
+            "startcount": 1860,
+            "endcount": 1900,
+            "delta": 40,
+            "normalizeddelta": 39
+          },
+          "365d": {
+            "startdate": "2025-11-21",
+            "enddate": "2026-10-21",
+            "actualdays": 334,
+            "startcount": 1860,
+            "endcount": 1900,
+            "delta": 40,
+            "normalizeddelta": 44
+          }
+        }
+      },
+      "matchscore": 1
+    },
+    {
+      "channelid": "recorded-channel-002",
+      "name": "Recorded channel 002",
+      "handle": "@recorded-channel-002",
+      "thumbnailurl": "https://example.invalid/resource",
+      "country": "Recorded country",
+      "subcount": 36500,
+      "totalviewcount": 1688873,
+      "joindate": "2008-12-21",
+      "firstvideodate": "2010-09-24",
+      "videocount": 237,
+      "avgdurationseconds": 1257.45,
+      "avgvideoviewcount": 8815.53,
+      "autolanguages": "en",
+      "description": "Recorded video description",
+      "topiccloud": "recorded topic words",
+      "growth": {
+        "totalviewcount": {
+          "28d": {
+            "startdate": "2026-09-21",
+            "enddate": "2026-10-16",
+            "actualdays": 25,
+            "startcount": 1683996,
+            "endcount": 1688873,
+            "delta": 4877,
+            "normalizeddelta": 5363
+          },
+          "90d": {
+            "startdate": "2026-07-24",
+            "enddate": "2026-10-16",
+            "actualdays": 85,
+            "startcount": 1674059,
+            "endcount": 1688873,
+            "delta": 14814,
+            "normalizeddelta": 15764
+          },
+          "180d": {
+            "startdate": "2026-04-16",
+            "enddate": "2026-10-16",
+            "actualdays": 184,
+            "startcount": 1655669,
+            "endcount": 1688873,
+            "delta": 33204,
+            "normalizeddelta": 32570
+          },
+          "365d": {
+            "startdate": "2025-10-24",
+            "enddate": "2026-10-16",
+            "actualdays": 358,
+            "startcount": 1606748,
+            "endcount": 1688873,
+            "delta": 82125,
+            "normalizeddelta": 83830
+          }
+        },
+        "subcount": {
+          "28d": {
+            "startdate": "2026-09-21",
+            "enddate": "2026-10-16",
+            "actualdays": 25,
+            "startcount": 36600,
+            "endcount": 36500,
+            "delta": -100,
+            "normalizeddelta": -110
+          },
+          "90d": {
+            "startdate": "2026-07-24",
+            "enddate": "2026-10-16",
+            "actualdays": 85,
+            "startcount": 36700,
+            "endcount": 36500,
+            "delta": -200,
+            "normalizeddelta": -213
+          },
+          "180d": {
+            "startdate": "2026-04-24",
+            "enddate": "2026-10-16",
+            "actualdays": 176,
+            "startcount": 36800,
+            "endcount": 36500,
+            "delta": -300,
+            "normalizeddelta": -308
+          },
+          "365d": {
+            "startdate": "2025-10-24",
+            "enddate": "2026-10-16",
+            "actualdays": 358,
+            "startcount": 36900,
+            "endcount": 36500,
+            "delta": -400,
+            "normalizeddelta": -408
+          }
+        }
+      },
+      "matchscore": 0.967704
+    },
+    {
+      "channelid": "recorded-channel-003",
+      "name": "Recorded channel 003",
+      "handle": "@recorded-channel-003",
+      "thumbnailurl": "https://example.invalid/resource",
+      "country": "Recorded country",
+      "subcount": 1570,
+      "totalviewcount": 451142,
+      "joindate": "2014-06-29",
+      "firstvideodate": "2014-06-29",
+      "videocount": 38,
+      "avgdurationseconds": 689.57,
+      "avgvideoviewcount": 14548.14,
+      "autolanguages": "en",
+      "description": "Recorded video description",
+      "topiccloud": "recorded topic words",
+      "growth": {
+        "totalviewcount": {
+          "28d": {
+            "startdate": "2026-08-29",
+            "enddate": "2026-09-29",
+            "actualdays": 31,
+            "startcount": 451022,
+            "endcount": 451142,
+            "delta": 120,
+            "normalizeddelta": 108
+          },
+          "90d": {
+            "startdate": "2026-06-29",
+            "enddate": "2026-09-29",
+            "actualdays": 92,
+            "startcount": 450850,
+            "endcount": 451142,
+            "delta": 292,
+            "normalizeddelta": 286
+          },
+          "180d": {
+            "startdate": "2026-03-29",
+            "enddate": "2026-09-29",
+            "actualdays": 184,
+            "startcount": 450482,
+            "endcount": 451142,
+            "delta": 660,
+            "normalizeddelta": 646
+          },
+          "365d": {
+            "startdate": "2025-10-29",
+            "enddate": "2026-09-29",
+            "actualdays": 335,
+            "startcount": 449590,
+            "endcount": 451142,
+            "delta": 1552,
+            "normalizeddelta": 1691
+          }
+        },
+        "subcount": {
+          "28d": {
+            "startdate": "2026-08-29",
+            "enddate": "2026-09-29",
+            "actualdays": 31,
+            "startcount": 1570,
+            "endcount": 1570,
+            "delta": 0,
+            "normalizeddelta": 0
+          },
+          "90d": {
+            "startdate": "2026-06-29",
+            "enddate": "2026-09-29",
+            "actualdays": 92,
+            "startcount": 1570,
+            "endcount": 1570,
+            "delta": 0,
+            "normalizeddelta": 0
+          },
+          "180d": {
+            "startdate": "2026-03-29",
+            "enddate": "2026-09-29",
+            "actualdays": 184,
+            "startcount": 1580,
+            "endcount": 1570,
+            "delta": -10,
+            "normalizeddelta": -10
+          },
+          "365d": {
+            "startdate": "2025-10-29",
+            "enddate": "2026-09-29",
+            "actualdays": 335,
+            "startcount": 1580,
+            "endcount": 1570,
+            "delta": -10,
+            "normalizeddelta": -11
+          }
+        }
+      },
+      "matchscore": 0.967704
+    }
+  ],
+  "page": 1,
+  "perpagecount": 3,
+  "maxresults": 10000
+}

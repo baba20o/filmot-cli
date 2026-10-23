@@ -1,9 +1,12 @@
 """Filmot API client - Core API interactions."""
 
+import io
 import re
 import time
 import logging
+import zipfile
 import requests
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Generator, Tuple
 from . import api_usage, config
 from .api_contract import FilmotAPIContractError, validate_api_response
@@ -130,6 +133,40 @@ def _known_secrets() -> Tuple[str, ...]:
     return configured_secrets()
 
 
+_NESTED_ARCHIVE_DEPTH = 3
+
+
+def _raw_body_problem(content: bytes, *, depth: int = 0) -> Optional[str]:
+    """Why a raw body must be discarded, or None when it may be kept.
+
+    The check catches a server echoing a key back by accident: it looks for
+    the literal key bytes. ZIP entries are compressed, so a key inside one
+    never appears in the archive's own bytes; every entry, including those of
+    nested archives, is decompressed and checked. An archive with an entry
+    that cannot be read is discarded too, because what that entry holds
+    cannot be checked. Other encodings are not decoded; a server able to
+    re-encode the key already holds it.
+    """
+    needles = [secret.encode("utf-8") for secret in _known_secrets() if secret]
+    if any(needle in content for needle in needles):
+        return "a configured credential"
+    # ZIP readers locate an archive by its end record and accept leading
+    # bytes (a BOM, a preamble), so detect archives the same way.
+    if not zipfile.is_zipfile(io.BytesIO(content)):
+        return None
+    if depth >= _NESTED_ARCHIVE_DEPTH:
+        return "archives nested too deeply to check"
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            for entry in archive.infolist():
+                problem = _raw_body_problem(archive.read(entry), depth=depth + 1)
+                if problem:
+                    return problem
+    except Exception:  # bad CRC, corrupt stream, encryption, unknown method...
+        return "an archive entry that could not be checked"
+    return None
+
+
 def _scrub_secrets(value: Any, secrets: Tuple[str, ...]) -> Any:
     """Replace configured credential values anywhere in response-shaped data.
 
@@ -200,6 +237,14 @@ def _quota_details(response) -> Optional[Dict[str, Any]]:
     return None
 
 
+@dataclass(frozen=True)
+class ExportBody:
+    """An export response kept as bytes: CSV, JSON, JSON Lines, or ZIP."""
+
+    content: bytes
+    content_type: str
+
+
 class Deadline:
     """A point on the monotonic clock after which no request work starts.
 
@@ -260,8 +305,13 @@ class FilmotClient:
         self.last_query_rewrite = None
 
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None,
-                 data: Optional[Dict] = None, skip_cache: bool = False) -> Any:
-        """Make an API request with caching, rate limiting, retries, and failover."""
+                 data: Optional[Dict] = None, skip_cache: bool = False,
+                 raw_body: bool = False) -> Any:
+        """Make an API request with caching, rate limiting, retries, and failover.
+
+        ``raw_body`` returns an :class:`ExportBody` instead of parsed JSON and
+        bypasses the cache and response contracts.
+        """
         providers = providers_for(endpoint)
 
         # Remove None values from params
@@ -273,7 +323,7 @@ class FilmotClient:
         # Check cache first (only for GET requests)
         self.last_cache_hit = False
         self.last_provider = None
-        if method == "GET" and self.use_cache and self.cache and not skip_cache:
+        if method == "GET" and self.use_cache and self.cache and not skip_cache and not raw_body:
             for provider in providers:
                 cached = self.cache.get(endpoint, params, namespace=provider.name)
                 if cached is None:
@@ -292,7 +342,7 @@ class FilmotClient:
         result: Any = None
         for index, provider in enumerate(providers):
             result, failover_reason = self._request_provider(
-                provider, method, endpoint, params, data,
+                provider, method, endpoint, params, data, raw_body,
             )
             self.last_provider = provider.name
             if (
@@ -316,6 +366,7 @@ class FilmotClient:
         endpoint: str,
         params: Dict[str, Any],
         data: Optional[Dict],
+        raw_body: bool = False,
     ) -> Tuple[Any, Optional[str]]:
         """Return ``(result, failover_reason)``; the reason is None when final."""
         url = provider.url(endpoint)
@@ -449,6 +500,25 @@ class FilmotClient:
                         provider.label, status, suffix,
                     ),
                     status,
+                ), None
+
+            if raw_body:
+                content = response.content
+                # Exports are written verbatim, so a body echoing a key is
+                # discarded rather than scrubbed (scrubbing would corrupt ZIPs).
+                problem = _raw_body_problem(content)
+                if problem:
+                    return self._error(
+                        provider, "FilmotResponseError",
+                        "The {} response contained {} and was discarded.".format(
+                            provider.label, problem,
+                        ),
+                    ), None
+                if hasattr(self.rate_limiter, 'report_success'):
+                    self.rate_limiter.report_success()
+                return ExportBody(
+                    content=content,
+                    content_type=str(response.headers.get("Content-Type") or ""),
                 ), None
 
             try:
@@ -653,6 +723,48 @@ class FilmotClient:
         if columns:
             params["columns"] = columns if isinstance(columns, str) else ",".join(columns)
         return self.get("/getchannelvideos", params=params)
+
+    def search_metadata(self, params: Dict[str, Any]) -> Any:
+        """
+        Search video titles and metadata (direct API only).
+
+        Args:
+            params: ``/getmetadatasearch`` parameters under their API names
+                (``titleQuery``, ``channelID``, ``minViews``, ``page``, ...).
+                A request costs 3 credits, or 1 when ``channelID`` names one
+                to five channels.
+
+        Returns:
+            ``{"result": [...]}`` holding ``/getvideos``-shaped records
+        """
+        return self.get("/getmetadatasearch", params={**params, "format": "json"})
+
+    def search_advanced_channels(self, params: Dict[str, Any]) -> Any:
+        """
+        Search Filmot's index of notable channels (direct API only; 1 credit).
+
+        Args:
+            params: ``/getadvancedchannelsearch`` parameters under their API
+                names (``topics``, ``minSubscribers``, ``countries``, ...)
+
+        Returns:
+            ``{"result", "page", "perpagecount", "maxresults"}``
+        """
+        return self.get("/getadvancedchannelsearch", params={**params, "format": "json"})
+
+    def export_subtitle_search(self, params: Dict[str, Any]) -> Any:
+        """
+        Export one page of subtitle-search matches (direct API only).
+
+        Args:
+            params: ``/getsubtitlesearch`` parameters under their API names,
+                including ``format`` (csv, json, jsonl, or zip). A page costs
+                5 credits, or 1 when ``channelID`` names one to five channels.
+
+        Returns:
+            An :class:`ExportBody` with the page's bytes, or an error dict
+        """
+        return self._request("GET", "/getsubtitlesearch", params=dict(params), raw_body=True)
 
     def search_subtitles(
         self,

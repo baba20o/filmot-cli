@@ -493,13 +493,40 @@ def _validate_get_channels(endpoint: str, payload: Any) -> None:
         _validate_channel_record(endpoint, value, "$[{}]".format(index))
 
 
+# /getadvancedchannelsearch adds these to the /getchannels record fields.
+_OPTIONAL_CHANNEL_FINDER_FIELDS: dict[str, Tuple[ExpectedType, str]] = {
+    "videocount": _NUMBER,
+    "avgdurationseconds": _NUMBER,
+    "avgvideoviewcount": _NUMBER,
+    "matchscore": _NUMBER,
+    "autolanguages": _TEXT,
+    "topiccloud": _TEXT,
+}
+
+
+def _validate_advanced_channel_search(endpoint: str, payload: Any) -> None:
+    response = _expect_mapping(endpoint, "$", payload)
+    if _validate_error_response(endpoint, response):
+        return
+    _optional_fields(endpoint, "$", response, {
+        "page": _NUMBER, "perpagecount": _NUMBER, "maxresults": _NUMBER,
+    })
+    results = _expect_field(endpoint, "$", response, "result", list, "array")
+    for index, value in enumerate(results):
+        path = "$.result[{}]".format(index)
+        _validate_channel_record(endpoint, value, path)
+        _optional_fields(endpoint, path, value, _OPTIONAL_CHANNEL_FINDER_FIELDS)
+
+
 _VALIDATORS: dict[str, Callable[[str, Any], None]] = {
     "getsearchsubtitles": _validate_search_subtitles,
     "getsearchchannels": _validate_search_channels,
     "getvideos": _validate_get_videos,
     "getchannels": _validate_get_channels,
-    # Channel listings carry /getvideos records.
+    # Channel listings and metadata searches carry /getvideos records.
     "getchannelvideos": _validate_get_videos,
+    "getmetadatasearch": _validate_get_videos,
+    "getadvancedchannelsearch": _validate_advanced_channel_search,
 }
 
 

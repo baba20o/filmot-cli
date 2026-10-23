@@ -68,6 +68,19 @@ python scripts/record_filmot_api_fixtures.py --only get_channels \
   --only get_channels_all --only get_channel_videos --force
 ```
 
+`metadata_search.json` (`/getmetadatasearch`), `advanced_channel_search.json`
+(`/getadvancedchannelsearch`, topics `SQLite`), and `subtitle_export.json`
+(`/getsubtitlesearch` with `format=json`) were recorded from the direct API on
+2026-10-23. The two video searches were scoped to one channel, so each request
+cost 1 credit. Titles, channel names, descriptions, topic words, and
+subtitle-hit context and match text are replaced. Each keeps three rows and two
+hits per row. Refresh them with:
+
+```bash
+python scripts/record_filmot_api_fixtures.py --only metadata_search \
+  --only advanced_channel_search --only subtitle_export --force
+```
+
 The recorder validates both the live body and its sanitized form. Runtime
 validation accepts additive fields but returns a machine-readable error when a
 required container or consumed field changes incompatibly.

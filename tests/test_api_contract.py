@@ -28,6 +28,8 @@ FIXTURE_ENDPOINTS = {
     "get_channels.json": "/getchannels",
     "get_channels_all.json": "/getchannels",
     "get_channel_videos.json": "/getchannelvideos",
+    "metadata_search.json": "/getmetadatasearch",
+    "advanced_channel_search.json": "/getadvancedchannelsearch",
 }
 
 
@@ -178,6 +180,32 @@ def test_channel_contract_accepts_absent_groups_null_windows_and_new_fields():
 
     assert validate_api_response("/getchannels", payload) is payload
     assert validate_api_response("/getchannels", base) is base
+
+
+@pytest.mark.parametrize("path,value,expected_path", [
+    (("page",), "1", "$.page"),
+    (("result", 0, "videocount"), "178", "$.result[0].videocount"),
+    (("result", 0, "topiccloud"), ["words"], "$.result[0].topiccloud"),
+    (("result", 0, "growth", "subcount", "28d", "delta"), "5", "$.result[0].growth.subcount.28d.delta"),
+])
+def test_advanced_channel_search_contract_flags_drift(path, value, expected_path):
+    payload = _fixture("advanced_channel_search.json")
+    _set(payload, path, value)
+
+    with pytest.raises(FilmotAPIContractError) as caught:
+        validate_api_response("/getadvancedchannelsearch", payload)
+
+    assert caught.value.path == expected_path
+
+
+def test_advanced_channel_search_requires_its_result_array():
+    payload = _fixture("advanced_channel_search.json")
+    del payload["result"]
+
+    with pytest.raises(FilmotAPIContractError) as caught:
+        validate_api_response("/getadvancedchannelsearch", payload)
+
+    assert (caught.value.path, caught.value.actual) == ("$.result", "missing")
 
 
 def test_channel_listings_use_the_video_record_contract():
@@ -334,6 +362,26 @@ def test_recorder_replaces_channel_profile_text_and_shortens_series():
     assert len(sanitized["channelchanges"]["name"]) == 2
     assert (len(sanitized["wordcloud"]), len(sanitized["subscribergrowth"])) == (3, 3)
     assert (len(sanitized["videostats"]["months"]), len(sanitized["videostats"]["languages"])) == (2, 2)
+
+
+def test_recorder_replaces_export_snippets_and_channel_topics():
+    recorder = _recorder()
+    export = {"result": [
+        {"id": "realvideo01", "hits": [{"context": "real spoken words", "matches": [{"text": "spoken"}]}] * 3},
+    ] * 4}
+    channels = {"result": [{"channelid": "UCreal", "topiccloud": "real topic words"}], "page": 1}
+
+    sanitized_export = recorder["sanitize_response"](recorder["compact_response"]("subtitle_export", export))
+    sanitized_channels = recorder["sanitize_response"](
+        recorder["compact_response"]("advanced_channel_search", channels),
+    )
+
+    rendered = json.dumps([sanitized_export, sanitized_channels])
+    for private in ("realvideo01", "real spoken words", "spoken", "UCreal", "real topic words"):
+        assert private not in rendered
+    assert len(sanitized_export["result"]) == 3
+    assert len(sanitized_export["result"][0]["hits"]) == 2
+    assert sanitized_channels["page"] == 1
 
 
 def test_recorder_sanitizer_drops_direct_api_key_fields():
