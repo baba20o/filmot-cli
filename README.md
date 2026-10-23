@@ -66,6 +66,10 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 - **Structured Export** — Markdown output with full metadata headers for LLM context
 - **Pipeline Mode** — Pipe Filmot or direct YouTube discovery results into the
   same provider-neutral download boundary
+- **Channel Intelligence** — `filmot channel` shows Filmot's channel profile,
+  growth, caption word cloud, profile history, and video statistics;
+  `filmot channel-videos` lists a channel's indexed videos, including removed
+  ones, and pipes into `download`
 
 ### Advanced Features
 - **Smart Caching** — File-based response caching with configurable TTL to reduce API calls
@@ -1400,6 +1404,65 @@ python main.py channels "Linus Tech Tips"
 python main.py channels mrbeast --raw
 ```
 
+### Channel Profiles and Analytics
+
+`channel` shows Filmot's profile for up to 20 channels: name, handle, country,
+subscribers, total views, join date, the range of indexed videos, and recent
+upload counts. Each argument is a UC channel ID, an `@handle`, or a channel
+URL, and arguments may be comma-separated. An `@handle` costs one channel
+search, which must return that exact handle. `channel` and `channel-videos`
+use the direct Filmot API, so they need `FILMOT_API_KEY`.
+
+```bash
+filmot channel @LinusTechTips
+filmot channel UCXuqSBlHAE6Xw-yeJA0Tunw --growth --words
+filmot channel @LinusTechTips --stats --monthly --since 2026-01-01
+filmot channel @LinusTechTips --all --raw
+```
+
+| Option | Adds | Credits |
+| --- | --- | --- |
+| _(none)_ | Profile, counts, and recent uploads | 1 |
+| `--about` | Description and biography | 1 |
+| `--growth` | View and subscriber change over 28, 90, 180, and 365 days, and the subscriber series | 1 |
+| `--words` | The most weighted caption terms | 1 |
+| `--history` | Previous names, handles, countries, and descriptions | 3 |
+| `--stats` | Video types, durations, view, like, and duration distributions, and caption languages | 3 |
+| `--monthly` | Video statistics by upload month | 3 |
+| `--all` | Everything above | 3 |
+
+Combined options cost the highest price among them. `--since` and `--until`
+(YYYY-MM-DD) bound the upload dates that video statistics cover (three years
+to today by default) and the subscriber series (five years by default).
+`--include-archive` also counts archived videos in video statistics. Statistics
+cover at most the 10,000 newest videos in range. Counts are Filmot snapshots
+and may differ from what YouTube shows now. Raw output lists the `requested`
+references with their resolved IDs, the returned `channels`, and any `missing`
+IDs that Filmot doesn't know.
+
+### List a Channel's Videos from Filmot's Index
+
+`channel-videos` lists up to 10 channels' videos from Filmot's index, newest
+first. The index also holds videos YouTube has since removed. Each page costs
+3 credits.
+
+```bash
+filmot channel-videos @LinusTechTips
+filmot channel-videos UCXuqSBlHAE6Xw-yeJA0Tunw --count 100 --pages 3
+filmot channel-videos @LinusTechTips --with-subtitles --page 4
+filmot channel-videos @LinusTechTips --count 50 --raw | filmot download -t ltt
+```
+
+`--count` sets the videos per channel on each page (20 by default); channels
+times `--count` may not exceed 200. `--pages` fetches consecutive pages starting
+at `--page`, stopping at the first empty page, which is the only end-of-listing
+signal Filmot gives. Raw output reports `exhausted` and the `next_page` to
+continue from. `--with-subtitles` keeps only videos Filmot knows have
+subtitles. If a later page fails, the earlier pages are kept and the result is
+`partial`. Raw output keeps a `videos` array in `/getvideos` shape, so it pipes
+into `download`; transcripts for removed videos then come from
+[Filmot's subtitle index](#transcripts-from-filmots-index).
+
 ### Channel Corpus: Download & Mine Channel Uploads
 
 Enumerate a channel's uploads playlist and download the available transcripts
@@ -2023,7 +2086,9 @@ retain their useful top-level domain keys and add `_filmot` metadata containing
 payload is the processed response after channel validation, client-side
 filtering/ranking, `--limit`, and `--max-hits`, with explicit scope metadata; it is not an
 untouched copy of the upstream API payload. `video` uses `videos`, `channels`
-uses `channels`, and `yt-search` uses `videos` plus effective `request`,
+uses `channels`, `channel` uses `requested`, `channels`, and `missing`,
+`channel-videos` uses `channels`, paging fields, and a `videos` array that
+`download` accepts, and `yt-search` uses `videos` plus effective `request`,
 `coverage`, and `enrichment` objects. `yt-playlists` uses `channel`,
 `playlists`, `request`, `coverage`, `api_calls`, and `continuation`;
 `yt-playlist` adds ordered `playlist_items`, current `videos`, and per-ID

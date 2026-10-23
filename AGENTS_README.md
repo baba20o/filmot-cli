@@ -1466,6 +1466,48 @@ same bounded envelope and a cooperative pre-page `cancel_check`.
 
 Use grouped OR for proximity queries. Do not put `|` inside a quoted NEAR operand like `"risk|drawdown" NEAR/10 "position"`.
 
+### Pattern 3c: Channel Intelligence from Filmot's Index
+
+Profile a channel and list its indexed videos without a YouTube Data API key.
+Both commands use the direct Filmot API (`FILMOT_API_KEY`) and accept UC IDs,
+`@handles`, and canonical channel URLs, also comma-separated. Each `@handle`
+costs one channel search and resolves only on an exact handle match; otherwise
+the result fails with `ChannelNotFound` at stage `resolve-channel`. More than
+20 channels (`channel`) or 10 (`channel-videos`) fails with `TooManyChannels`
+before any further handle is looked up.
+
+```bash
+# Profile and counts (1 credit); groups add detail
+filmot channel @exact_handle --raw
+filmot channel UC... --growth --words --raw              # still 1 credit
+filmot channel UC... --stats --monthly --since 2026-01-01 --raw   # 3 credits
+
+# Indexed videos, newest first (3 credits per page), then transcripts
+filmot channel-videos @exact_handle --count 100 --raw | filmot download -t TOPIC --count 100
+filmot channel-videos UC... --count 100 --page 2 --raw
+```
+
+`channel` raw data holds `requested` (each `reference`, its `channel_id`, and
+`resolved_by`), the upstream `channels` records, `missing` IDs Filmot doesn't
+know, and the `columns`, dates, and archive flag sent. `--about`, `--growth`,
+and `--words` keep the 1-credit price; `--history`, `--stats`, `--monthly`, and
+`--all` cost 3. `--since`/`--until` need `--growth`, `--stats`, `--monthly`, or
+`--all`, and `--include-archive` needs a video-statistics option; otherwise the
+command fails with `BadParameter` instead of silently ignoring them. Counts are
+Filmot snapshots, and statistics cover at most the 10,000 newest videos in the
+date range.
+
+`channel-videos` raw data holds `channels`, `count_per_channel`, `first_page`,
+`pages_fetched`, `exhausted`, `next_page`, `only_with_subtitles`, and `videos`
+in `/getvideos` shape, which `download` accepts. Channels times `--count` may
+not exceed 200. `--pages N` stops at the first empty page; only an empty page
+sets `exhausted`, because Filmot documents no other end signal, so a short
+page still yields a `next_page`. A later-page failure keeps earlier videos with
+status `partial`; a first-page failure fails the command. Removed videos stay
+in the listing, and `download` takes their transcripts from Filmot's subtitle
+index. `download` stops at its own `--count` (50 by default), so give both
+sides of the pipe the same count.
+
 ### Pattern 4: Technical Deep Dive
 ```bash
 filmot search '"CONCEPT" explained|"CONCEPT" tutorial' --full --lang en --sort density
@@ -1521,8 +1563,10 @@ Python from the current directory, so run Filmot only in directories you trust.
 Budget direct credits deliberately. They come from a monthly allowance. An
 unscoped subtitle-search page costs 5 credits, but only 1 when `--channel-id`
 names one to five channels, so scope searches to known channels when the
-question allows it. Every command that used the API prints a `Filmot API:` line
-on stderr, and `--raw` results carry the same details under `_filmot.api`:
+question allows it. `channel` costs 1 credit, or 3 with history or video
+statistics, and `channel-videos` costs 3 per page. Every command that used the
+API prints a `Filmot API:` line on stderr, and `--raw` results carry the same
+details under `_filmot.api`:
 credits charged and remaining, plan requests remaining, cache hits, and
 `failovers` showing which provider actually served each failed-over route.
 
@@ -1685,6 +1729,9 @@ filmot transcript VIDEO_ID --full -o transcript.txt
 | **Purge expired YouTube fields** | `filmot yt-data purge --dry-run` then `filmot yt-data purge --yes` |
 | **Fill missing library metadata from Filmot** | `filmot library enrich --dry-run` then `filmot library enrich` |
 | **Filmot-index video details** | `filmot video ID1,ID2 --raw` (add `--basic` for 1 direct credit) |
+| **Channel profile and growth** | `filmot channel @handle --growth --words --raw` (1 direct credit) |
+| **Channel video statistics** | `filmot channel UC... --stats --monthly --raw` (3 direct credits) |
+| **Channel's indexed videos to library** | `filmot channel-videos @handle --count 100 --raw \| filmot download -t TOPIC --count 100` |
 | **Named follow-up search** | `filmot search "query" --session TOPIC` |
 | **Locate a phrase across sources** | `filmot library compare "claim phrase" --sort density` |
 | **Raw local citations** | `filmot library compare "claim phrase" --topic TOPIC --raw` |

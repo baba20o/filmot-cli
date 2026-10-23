@@ -25,6 +25,9 @@ FIXTURE_ENDPOINTS = {
     "get_videos_columns.json": "/getvideos",
     "get_videos_columns_partial.json": "/getvideos",
     "get_videos_subtitles.json": "/getvideos",
+    "get_channels.json": "/getchannels",
+    "get_channels_all.json": "/getchannels",
+    "get_channel_videos.json": "/getchannelvideos",
 }
 
 
@@ -105,6 +108,86 @@ def test_video_contract_flags_drift_in_consumed_optional_columns(field, value):
         validate_api_response("/getvideos", payload)
 
     assert caught.value.path == "$[0].{}".format(field)
+
+
+def _set(payload, path, value):
+    target = payload
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+
+@pytest.mark.parametrize("path,value,expected_path", [
+    ((0, "isverified"), "yes", "$[0].isverified"),
+    ((0, "counts", "indexedvideos"), "582", "$[0].counts.indexedvideos"),
+    ((0, "counts", "recentuploads", "15d"), "3", "$[0].counts.recentuploads.15d"),
+    ((0, "growth", "subcount", "28d", "delta"), "0", "$[0].growth.subcount.28d.delta"),
+    ((0, "subscribergrowth", 0, "s"), None, "$[0].subscribergrowth[0].s"),
+    ((0, "wordcloud", 0, "weight"), "heavy", "$[0].wordcloud[0].weight"),
+    ((0, "channelchanges", "name"), {"val": "old"}, "$[0].channelchanges.name"),
+    ((0, "channelchanges", "name", 0, "val"), {"text": "old"}, "$[0].channelchanges.name[0].val"),
+    ((0, "growth", "subcount"), "rising", "$[0].growth.subcount"),
+    ((0, "videostats", "videotypes", "shorts"), "34", "$[0].videostats.videotypes.shorts"),
+    ((0, "videostats", "durationhistogram", 1), True, "$[0].videostats.durationhistogram[1]"),
+    (
+        (0, "videostats", "months", 0, "distributions", "viewcount", "median"), "1",
+        "$[0].videostats.months[0].distributions.viewcount.median",
+    ),
+])
+def test_channel_contract_flags_drift_in_every_displayed_group(path, value, expected_path):
+    payload = _fixture("get_channels_all.json")
+    _set(payload, path, value)
+
+    with pytest.raises(FilmotAPIContractError) as caught:
+        validate_api_response("/getchannels", payload)
+
+    assert caught.value.path == expected_path
+
+
+def test_channel_contract_requires_an_id_and_a_list():
+    payload = _fixture("get_channels.json")
+    del payload[0]["channelid"]
+
+    with pytest.raises(FilmotAPIContractError) as missing:
+        validate_api_response("/getchannels", payload)
+    with pytest.raises(FilmotAPIContractError) as not_a_list:
+        validate_api_response("/getchannels", {"channelid": "UC"})
+
+    assert missing.value.path == "$[0].channelid"
+    assert not_a_list.value.path == "$"
+
+
+def test_channel_contract_accepts_absent_groups_null_windows_and_new_fields():
+    payload = _fixture("get_channels_all.json")
+    record = payload[0]
+    record["growth"]["subcount"]["28d"] = None
+    record["growth"]["totalviewcount"] = None
+    record["username"] = None
+    record["futuregroup"] = {"anything": [1, "two"]}
+    # Additions inside the groups the CLI reads are ignored too.
+    record["growth"]["source"] = "metadata"
+    record["growth"]["subcount"]["7d"] = "pending"
+    record["growth"]["subcount"]["90d"]["note"] = "estimated"
+    record["counts"]["recentuploads"]["note"] = "approximate"
+    record["videostats"]["videotypes"]["premieres"] = "n/a"
+    record["videostats"]["distributions"]["duration"]["unit"] = "seconds"
+    record["videostats"]["distributions"]["commentcount"] = "later"
+    record["channelchanges"]["futurefield"] = {"note": "new"}
+    record["channelchanges"]["country"] = None
+    base = _fixture("get_channels.json")
+
+    assert validate_api_response("/getchannels", payload) is payload
+    assert validate_api_response("/getchannels", base) is base
+
+
+def test_channel_listings_use_the_video_record_contract():
+    payload = _fixture("get_channel_videos.json")
+    payload[1]["title"] = 7
+
+    with pytest.raises(FilmotAPIContractError) as caught:
+        validate_api_response("/getchannelvideos", payload)
+
+    assert caught.value.path == "$[1].title"
 
 
 @pytest.mark.parametrize("field", ["title", "duration", "uploaddate", "channelid", "channelname"])
@@ -229,6 +312,28 @@ def _recorder():
     return runpy.run_path(
         str(Path(__file__).resolve().parents[1] / "scripts" / "record_filmot_api_fixtures.py")
     )
+
+
+def test_recorder_replaces_channel_profile_text_and_shortens_series():
+    recorder = _recorder()
+    channel = {
+        "channelid": "UCreal", "username": "realname", "biography": "A real person's story",
+        "description": "Real description",
+        "channelchanges": {"name": [{"val": "Old real name", "dstart": "2019-01-01"}] * 3},
+        "wordcloud": [{"text": "realword", "weight": 9, "lang": "en"}] * 5,
+        "subscribergrowth": [{"d": "2026-01-01", "s": 5}] * 5,
+        "videostats": {"months": [{"month": "2026-01"}] * 4, "languages": [{"lang": "en"}] * 4},
+    }
+
+    compacted = recorder["compact_response"]("get_channels_all", [channel])
+    sanitized = recorder["sanitize_response"](compacted)[0]
+
+    rendered = json.dumps(sanitized)
+    for private in ("UCreal", "realname", "real person", "Real description", "Old real name", "realword"):
+        assert private not in rendered
+    assert len(sanitized["channelchanges"]["name"]) == 2
+    assert (len(sanitized["wordcloud"]), len(sanitized["subscribergrowth"])) == (3, 3)
+    assert (len(sanitized["videostats"]["months"]), len(sanitized["videostats"]["languages"])) == (2, 2)
 
 
 def test_recorder_sanitizer_drops_direct_api_key_fields():

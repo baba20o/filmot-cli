@@ -268,6 +268,31 @@ class ChannelResultData(TypedDict, total=False):
     channels: List[Dict[str, Any]]
 
 
+class ChannelProfileResultData(TypedDict, total=False):
+    """Filmot channel profiles and analytics emitted by ``channel``."""
+
+    requested: List[Dict[str, str]]
+    channels: List[Dict[str, Any]]
+    missing: List[str]
+    columns: Optional[str]
+    start_date: Optional[str]
+    end_date: Optional[str]
+    include_archive: bool
+
+
+class ChannelVideosResultData(TypedDict, total=False):
+    """Indexed channel videos emitted by ``channel-videos``; pipes into ``download``."""
+
+    channels: List[Dict[str, str]]
+    count_per_channel: int
+    first_page: int
+    pages_fetched: int
+    exhausted: bool
+    next_page: Optional[int]
+    only_with_subtitles: bool
+    videos: List[Dict[str, Any]]
+
+
 class ProxyResultData(TypedDict, total=False):
     """Proxy status, refresh, or bounded probe result."""
 

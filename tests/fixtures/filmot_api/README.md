@@ -55,6 +55,19 @@ python scripts/record_filmot_api_fixtures.py --only get_videos_subtitles \
   --video-id jNQXAC9IVRw --force
 ```
 
+`get_channels.json` (the base profile, 1 credit), `get_channels_all.json`
+(`columns=all` from `startDate=2026-04-01`, 3 credits), and
+`get_channel_videos.json` (three rows with every `/getvideos` metadata column,
+3 credits) were recorded from the direct API on 2026-10-23. Profile text,
+previous profile values, usernames, and caption terms are replaced. Word-cloud
+and subscriber series keep three entries, profile-history fields two, and
+monthly and language statistics two. Refresh them with:
+
+```bash
+python scripts/record_filmot_api_fixtures.py --only get_channels \
+  --only get_channels_all --only get_channel_videos --force
+```
+
 The recorder validates both the live body and its sanitized form. Runtime
 validation accepts additive fields but returns a machine-readable error when a
 required container or consumed field changes incompatibly.

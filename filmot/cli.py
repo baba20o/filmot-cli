@@ -559,6 +559,7 @@ def watchlist_clear():
 # Domain commands are standalone Click objects.  Registration lives here so
 # core/domain modules never import the root group and circular imports stay
 # impossible.
+from .commands.channel import channel, channel_videos
 from .commands.claims import claims
 from .commands.library import library, sessions, yt_data
 from .commands.proxy import proxy
@@ -600,6 +601,8 @@ for command in (
     search,
     video,
     channels,
+    channel,
+    channel_videos,
     export,
     search_all,
     transcript,
