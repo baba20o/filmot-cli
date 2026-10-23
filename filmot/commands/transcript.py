@@ -12,6 +12,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
+from rich.text import Text
 
 from ..api import FilmotClient
 from ..session_context import continuation_argv_prefix, session_option
@@ -563,7 +564,7 @@ def _render_transcript(
     if full:
         console.print(Panel(
             f"[bold]Video ID:[/bold] {data['video_id']}\n"
-            f"[bold]Language:[/bold] {data['language']} "
+            f"[bold]Language:[/bold] {escape(str(data['language']))} "
             f"{'(auto-generated)' if data.get('is_generated') else '(manual)'}\n"
             f"[bold]Duration:[/bold] "
             f"{format_timestamp(data.get('duration_seconds', 0))}\n"
@@ -575,15 +576,15 @@ def _render_transcript(
                 console.print(
                     f"\n[bold cyan][{item['start_formatted']}][/bold cyan]"
                 )
-                console.print(item["text"])
+                console.print(item["text"], markup=False)
         else:
-            console.print(f"\n{data['full_text']}")
+            console.print("\n" + data["full_text"], markup=False)
         return
 
     if chunk and "chunks" in data:
         console.print(Panel(
             f"[bold]Video ID:[/bold] {data['video_id']}\n"
-            f"[bold]Language:[/bold] {data['language']}\n"
+            f"[bold]Language:[/bold] {escape(str(data['language']))}\n"
             f"[bold]Chunks:[/bold] {len(data['chunks'])} × "
             f"{data['chunk_minutes']} min",
             title="Chunked Transcript",
@@ -593,13 +594,13 @@ def _render_transcript(
                 f"\n[bold yellow]━━━ {item['start_formatted']} ━━━[/bold yellow]"
             )
             text = item["text"]
-            console.print(text[:500] + "..." if len(text) > 500 else text)
+            console.print(text[:500] + "..." if len(text) > 500 else text, markup=False)
         return
 
     if timestamps and "segments" in data:
         console.print(Panel(
             f"[bold]Video ID:[/bold] {data['video_id']}\n"
-            f"[bold]Language:[/bold] {data['language']} "
+            f"[bold]Language:[/bold] {escape(str(data['language']))} "
             f"{'(auto-generated)' if data.get('is_generated') else '(manual)'}\n"
             f"[bold]Duration:[/bold] "
             f"{format_timestamp(data.get('duration_seconds', 0))}\n"
@@ -608,12 +609,12 @@ def _render_transcript(
         ))
         for segment in data["segments"]:
             timestamp = format_timestamp(segment["start"])
-            console.print(f"[dim][{timestamp}][/dim] {segment['text']}")
+            console.print(f"[dim][{timestamp}][/dim] {escape(str(segment['text']))}")
         return
 
     console.print(Panel(
         f"[bold]Video ID:[/bold] {data['video_id']}\n"
-        f"[bold]Language:[/bold] {data['language']} "
+        f"[bold]Language:[/bold] {escape(str(data['language']))} "
         f"{'(auto-generated)' if data.get('is_generated') else '(manual)'}\n"
         f"[bold]Duration:[/bold] "
         f"{format_timestamp(data.get('duration_seconds', 0))}\n"
@@ -622,10 +623,10 @@ def _render_transcript(
     ))
     text = data.get("full_text", "")
     if len(text) > 1000:
-        console.print(f"\n{text[:1000]}...\n")
+        console.print(f"\n{text[:1000]}...\n", markup=False)
         console.print("[dim]Use --full to see complete transcript[/dim]")
     else:
-        console.print(f"\n{text}")
+        console.print(f"\n{text}", markup=False)
 
 
 def _render_transcript_search(outcome: CommandResult[dict]) -> None:
@@ -633,7 +634,7 @@ def _render_transcript_search(outcome: CommandResult[dict]) -> None:
     data = outcome.data
     console.print(Panel(
         f"[bold]Video ID:[/bold] {data['video_id']}\n"
-        f"[bold]Query:[/bold] {data['query']}\n"
+        f"[bold]Query:[/bold] {escape(str(data['query']))}\n"
         f"[bold]Matches:[/bold] {data['match_count']}",
         title="Transcript Search",
     ))
@@ -646,16 +647,14 @@ def _render_transcript_search(outcome: CommandResult[dict]) -> None:
         console.print(
             f"\n[bold cyan]Match {index} @ {match['timestamp']}[/bold cyan]"
         )
-        highlighted = match["context"].replace(
-            query, f"[bold red]{query}[/bold red]"
-        ).replace(
-            query.lower(), f"[bold red]{query.lower()}[/bold red]"
-        ).replace(
-            query.upper(), f"[bold red]{query.upper()}[/bold red]"
-        ).replace(
-            query.capitalize(), f"[bold red]{query.capitalize()}[/bold red]"
-        )
-        console.print(f"  {highlighted}")
+        # A Text keeps the caption's own brackets literal.
+        highlighted = Text(str(match["context"]))
+        if query:
+            highlighted.highlight_words(
+                {query, query.lower(), query.upper(), query.capitalize()},
+                style="bold red",
+            )
+        console.print(Text.assemble("  ", highlighted))
 
 
 def _normalize_channel_enumeration_result(value: object) -> dict:
@@ -817,12 +816,12 @@ def _render_channel_download(outcome: CommandResult[dict]) -> None:
         ResultStatus.FAILED.value: ("Download Failed", "red"),
     }.get(outcome.status_value, ("Download Complete", "green"))
     for warning in outcome.warnings:
-        console.print("[yellow]{}[/yellow]".format(warning))
+        console.print("[yellow]{}[/yellow]".format(escape(str(warning))))
     for error in outcome.errors:
         if error.stage in {"enumerate", "enumeration", "pagination"}:
             console.print(
                 "[yellow]Upload enumeration issue: {}[/yellow]".format(
-                    error.message
+                    escape(str(error.message))
                 )
             )
     if data.get("already_synced"):
@@ -860,13 +859,13 @@ def _render_channel_download(outcome: CommandResult[dict]) -> None:
             "[bold {}]{}[/bold {}]\n\n".format(
                 status_style[1], status_style[0], status_style[1]
             )
-            + f"Channel: [bold]{channel.get('name', 'Unknown')}[/bold]\n"
+            + f"Channel: [bold]{escape(str(channel.get('name', 'Unknown')))}[/bold]\n"
             f"This session: [green]{data.get('downloaded', 0)}[/green] "
             f"downloaded, [red]{data.get('failed', 0)}[/red] failed\n"
             f"Upload slice: [bold]{data.get('enumerated', 0)}[/bold] videos\n"
             f"Total corpus: [bold]{data.get('corpus_done', 0)}[/bold] transcripts\n"
             f"Words downloaded: [bold]{int(data.get('words', 0)):,}[/bold]\n"
-            f"Storage: {data.get('storage', '')}",
+            f"Storage: {escape(str(data.get('storage', '')))}",
             title="Summary",
             border_style=status_style[1],
         ))
@@ -878,7 +877,7 @@ def _render_channel_download(outcome: CommandResult[dict]) -> None:
             "[yellow]More uploads are available. Continue upload enumeration "
             "with:[/yellow]\n"
             "[bold]{}[/bold]".format(
-                shlex.join([str(item) for item in continuation.get("argv") or []])
+                escape(shlex.join([str(item) for item in continuation.get("argv") or []]))
             )
         )
 
@@ -905,7 +904,7 @@ def _render_channel_status(outcome: CommandResult[dict]) -> None:
         table.add_column("Slug", style="dim")
         for channel in channels:
             table.add_row(
-                channel["name"],
+                escape(str(channel["name"])),
                 str(channel["downloaded"]),
                 str(channel["failed"]),
                 str(channel["total_videos"]),
@@ -914,7 +913,7 @@ def _render_channel_status(outcome: CommandResult[dict]) -> None:
                     if channel["last_updated"]
                     else ""
                 ),
-                channel["slug"],
+                escape(str(channel["slug"])),
             )
         console.print(table)
         return
@@ -922,7 +921,7 @@ def _render_channel_status(outcome: CommandResult[dict]) -> None:
     slug = data["slug"]
     stats = data.get("stats")
     if not stats:
-        console.print(f"[red]Channel '{slug}' not found.[/red]")
+        console.print(f"[red]Channel '{escape(str(slug))}' not found.[/red]")
         console.print(
             "[dim]Run 'filmot channel-status' to see available channels.[/dim]"
         )
@@ -930,8 +929,8 @@ def _render_channel_status(outcome: CommandResult[dict]) -> None:
 
     channel = stats.get("channel", {})
     console.print(Panel(
-        f"[bold]{channel.get('name', slug)}[/bold]\n"
-        f"Channel ID: {channel.get('channel_id', 'N/A')}\n\n"
+        f"[bold]{escape(str(channel.get('name', slug)))}[/bold]\n"
+        f"Channel ID: {escape(str(channel.get('channel_id', 'N/A')))}\n\n"
         f"Downloaded: [green]{stats['downloaded']}[/green] / "
         f"{stats['total_videos']}\n"
         f"Failed: [red]{stats['failed']}[/red]\n"
@@ -940,7 +939,7 @@ def _render_channel_status(outcome: CommandResult[dict]) -> None:
         f"Total duration: [bold]{stats['total_duration_hours']}[/bold] hours\n\n"
         f"Last sync: "
         f"{stats['last_sync'][:19] if stats['last_sync'] else 'never'}\n"
-        f"Storage: {stats['storage_path']}",
+        f"Storage: {escape(str(stats['storage_path']))}",
         title="Channel Corpus",
         border_style="cyan",
     ))
@@ -952,8 +951,8 @@ def _render_channel_search(outcome: CommandResult[dict]) -> None:
 
     data = outcome.data
     results = data.get("results") or []
-    display_query = data["display_query"]
-    slug = data["slug"]
+    display_query = escape(str(data["display_query"]))
+    slug = escape(str(data["slug"]))
     if not results:
         console.print(
             f"[dim]No matches for '{display_query}' in {slug}.[/dim]"
@@ -968,33 +967,31 @@ def _render_channel_search(outcome: CommandResult[dict]) -> None:
     query_kind = data["query_kind"]
     terms = data["highlight_terms"]
     for result in results:
-        console.print(f"[bold cyan]{result['title']}[/bold cyan]")
+        console.print(f"[bold cyan]{escape(str(result['title']))}[/bold cyan]")
         published = (
             result["published_at"][:10]
             if result["published_at"]
             else "N/A"
         )
         console.print(
-            f"  [dim]{result['video_id']} | {published} | "
+            f"  [dim]{escape(str(result['video_id']))} | {escape(str(published))} | "
             f"{result['match_count']} matches[/dim]"
         )
         for snippet in result["snippets"][:2]:
-            highlighted = snippet
+            # A Text keeps the snippet's own brackets literal.
+            highlighted = Text(str(snippet))
             if query_kind in {"near", "tilde"}:
-                for term in sorted(terms, key=len, reverse=True):
-                    highlighted = re.sub(
-                        re.escape(term),
-                        f"[bold yellow]{term}[/bold yellow]",
-                        highlighted,
-                        flags=re.IGNORECASE,
+                if terms:
+                    # One alternation, longest first, matched on the raw text.
+                    highlighted.highlight_regex(
+                        "(?i)" + "|".join(
+                            re.escape(term) for term in sorted(terms, key=len, reverse=True)
+                        ),
+                        style="bold yellow",
                     )
-            else:
-                query = data["query"]
-                highlighted = snippet.replace(
-                    query,
-                    f"[bold yellow]{query}[/bold yellow]",
-                )
-            console.print(f"  [dim]→[/dim] {highlighted}")
+            elif data["query"]:
+                highlighted.highlight_words([data["query"]], style="bold yellow")
+            console.print("  [dim]→[/dim]", highlighted)
         console.print()
 
 
@@ -1375,10 +1372,10 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                 payload=result,
             )
 
-        console.print(f"[red]Error: {result['error']}[/red]")
-        console.print(f"[dim]Video ID: {result.get('video_id', video_id)}[/dim]")
+        console.print(f"[red]Error: {escape(str(result['error']))}[/red]")
+        console.print(f"[dim]Video ID: {escape(str(result.get('video_id', video_id)))}[/dim]")
         if result.get("routes_tried"):
-            console.print(f"[dim]Routes tried: {', '.join(result['routes_tried'])}[/dim]")
+            console.print(f"[dim]Routes tried: {escape(', '.join(result['routes_tried']))}[/dim]")
 
         # Classify the failure so we give the RIGHT advice, not a blanket --fallback tip
         is_proxy = any(s in err_low for s in ("proxy", "tunnel", "max retries", "connection"))
@@ -1790,7 +1787,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                             f.write(f"[{ts}] {seg['text']}\n")
                     else:
                         f.write(transcript_data['full_text'])
-            output_message = f"[green]✓ Saved transcript to: {output}[/green]"
+            output_message = f"[green]✓ Saved transcript to: {escape(str(output))}[/green]"
         except Exception as e:
             message = str(_redact_diagnostic(f"Error saving file: {e}"))
             failed_outcome = CommandResult.failed(
@@ -1847,7 +1844,7 @@ def transcript_search(video_id: str, query: str, context: int, lang: str):
     """
     from ..transcript import search_in_transcript
 
-    with console.status(f"[bold green]Searching transcript for '{query}'..."):
+    with console.status(f"[bold green]Searching transcript for '{escape(query)}'..."):
         languages = [lang] if lang else None
         result = search_in_transcript(video_id, query, context, languages)
 
@@ -1990,7 +1987,7 @@ def channel_download(
             info = get_channel_info(requested_channel)
             _, channel_dir = downloader._resolve_channel_dir(info)
             if (channel_dir / "manifest.json").exists():
-                stderr_console.print(f"[yellow]Removing existing data for {info['name']}...[/yellow]")
+                stderr_console.print(f"[yellow]Removing existing data for {escape(str(info['name']))}...[/yellow]")
                 shutil.rmtree(channel_dir)
         except Exception as error:
             detail = f"{type(error).__name__}: {_whole_word_summary(error, 500)}"
@@ -2058,14 +2055,14 @@ def channel_download(
     # Keep the fallback for callers/tests supplying the legacy minimal shape.
     canonical_channel_id = info.get("channel_id") or requested_channel
     requested_line = (
-        f"\nRequested as: {requested_channel}"
+        f"\nRequested as: {escape(str(requested_channel))}"
         if requested_channel != canonical_channel_id
         else ""
     )
 
     console.print(Panel(
-        f"[bold]{info['name']}[/bold]\n"
-        f"Channel ID: {canonical_channel_id}"
+        f"[bold]{escape(str(info['name']))}[/bold]\n"
+        f"Channel ID: {escape(str(canonical_channel_id))}"
         f"{requested_line}\n"
         f"Videos: {_format_optional_count(info.get('video_count'))}\n"
         f"Subscribers: {_format_optional_count(info.get('subscriber_count'))}",
@@ -2294,9 +2291,15 @@ def channel_download(
                 languages=languages,
                 progress_callback=_route_progress_for(vid_id),
                 fresh_primary=True,
+                stop=_interrupted,
             )
 
             with _lock:
+                if 'error' in result and _interrupted.is_set():
+                    # Most likely the interrupt itself (Ctrl-C also stops
+                    # the route's worker process). The video stays pending,
+                    # and the next run retries it.
+                    return
                 if 'error' in result:
                     manifest['videos'][vid_id].update({
                         'status': 'failed',
@@ -2366,6 +2369,8 @@ def channel_download(
                 downloader._save_manifest(channel_dir, manifest)
 
         except Exception as e:
+            if _interrupted.is_set():
+                return  # left pending, as above
             with _lock:
                 manifest['videos'][vid_id].update({
                     'status': 'failed',
@@ -2397,44 +2402,53 @@ def channel_download(
             for i, v in enumerate(to_download):
                 if _interrupted.is_set():
                     break
-                title = v['title'][:50]
+                title = escape(v['title'][:50])
                 progress.update(task, description=f"[cyan]{title}...")
                 try:
                     _download_one(v)
+                    progress.advance(task)
+                    if i < len(to_download) - 1:
+                        _time.sleep(delay)
                 except KeyboardInterrupt:
                     _interrupted.set()
                     stderr_console.print("\n[yellow]Interrupted! Progress saved — re-run to resume.[/yellow]")
                     break
-                progress.advance(task)
-                if i < len(to_download) - 1:
-                    _time.sleep(delay)
         else:
             # Parallel mode with ThreadPoolExecutor
             from concurrent.futures import ThreadPoolExecutor, as_completed
             from contextvars import copy_context
 
+            executor = ThreadPoolExecutor(max_workers=workers)
             try:
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {}
-                    for v in to_download:
-                        # Each worker needs its own context snapshot so its
-                        # item events retain this invocation's investigation.
-                        fut = executor.submit(copy_context().run, _download_one, v)
-                        futures[fut] = v
+                futures = {}
+                for v in to_download:
+                    # Each worker needs its own context snapshot so its
+                    # item events retain this invocation's investigation.
+                    fut = executor.submit(copy_context().run, _download_one, v)
+                    futures[fut] = v
 
-                    for fut in as_completed(futures):
-                        if _interrupted.is_set():
-                            break
-                        v = futures[fut]
-                        try:
-                            fut.result()  # Raise any exception from the thread
-                        except Exception:
-                            pass  # Already handled inside _download_one
-                        progress.update(task, description=f"[cyan]{v['title'][:50]}...")
-                        progress.advance(task)
+                for fut in as_completed(futures):
+                    if _interrupted.is_set():
+                        break
+                    v = futures[fut]
+                    try:
+                        fut.result()  # Raise any exception from the thread
+                    except Exception:
+                        pass  # Already handled inside _download_one
+                    progress.update(task, description=f"[cyan]{escape(v['title'][:50])}...")
+                    progress.advance(task)
             except KeyboardInterrupt:
+                # Stop before waiting on the pool, which a `with` block
+                # would do first: queued downloads are cancelled unstarted,
+                # and running ones start no further route.
                 _interrupted.set()
-                stderr_console.print("\n[yellow]Interrupted! Progress saved — re-run to resume.[/yellow]")
+                executor.shutdown(wait=False, cancel_futures=True)
+                stderr_console.print(
+                    "\n[yellow]Interrupted! Stopping active downloads; "
+                    "progress is saved — re-run to resume.[/yellow]"
+                )
+            finally:
+                executor.shutdown(wait=True)
 
     # Final update
     manifest['last_sync'] = _dt.now().isoformat()
@@ -2653,7 +2667,7 @@ def channel_search(channel_slug: str, query: str, limit: int):
             qlabel = f'"{" ".join(parsed[1])}"~{parsed[2]}'
         else:
             qlabel = query
-        with console.status(f"[blue]Searching '{qlabel}' across {channel_slug}..."):
+        with console.status(f"[blue]Searching '{escape(qlabel)}' across {escape(channel_slug)}..."):
             results = downloader.search_corpus(channel_slug, query)
     except ValueError as e:
         outcome = CommandResult.failed(

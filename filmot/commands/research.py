@@ -11,6 +11,7 @@ import sys
 from typing import Optional
 
 import click
+from rich.markup import escape
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from ..api_contract import FilmotAPIContractError
@@ -750,8 +751,8 @@ def _research_candidate_preview(videos: list, count: int = 8) -> None:
                 f"/h{lexical.get('hit_spans', 0)}"
             )
         console.print(
-            f"  {index}. {str(video.get('title', 'Unknown'))[:66]} "
-            f"[dim]({video.get('channelname', 'Unknown')})[/dim]\n"
+            f"  {index}. {escape(str(video.get('title', 'Unknown'))[:66])} "
+            f"[dim]({escape(str(video.get('channelname', 'Unknown')))})[/dim]\n"
             f"     [dim]stage={origin}; relevance={selection.get('passage_coverage', 0):.2f}; "
             f"source-prior={selection.get('source_signal', 0):.2f}; "
             f"density={selection.get('density', 0):.2f}/min"
@@ -777,9 +778,9 @@ def _render_research_result(
             "conclusions.[/yellow]"
         )
     for warning in outcome.warnings:
-        console.print(f"[yellow]{warning}[/yellow]")
+        console.print(f"[yellow]{escape(str(warning))}[/yellow]")
     console.print(f"\n{'=' * 60}")
-    console.print(f"[bold]Research complete: {data['topic']}[/bold]")
+    console.print(f"[bold]Research complete: {escape(str(data['topic']))}[/bold]")
     console.print(
         f"  Saved: {data['saved']} | Skipped: {data['skipped']} | "
         f"Failed: {data['failed']} | Deduped: {data['deduped']} | "
@@ -798,27 +799,28 @@ def _render_research_result(
         console.print(f"\n[bold]Sources ({len(sources)}):[/bold]")
         for item in sources:
             console.print(
-                f"  - {item.get('title', 'Unknown')} "
-                f"({item.get('channel', 'Unknown')})"
+                f"  - {escape(str(item.get('title', 'Unknown')))} "
+                f"({escape(str(item.get('channel', 'Unknown')))})"
             )
     console.print("\n[dim]Next steps:[/dim]")
+    topic = escape(str(data["topic"]))
     console.print(
-        f'  filmot library search "your query" --topic {data["topic"]}'
+        f'  filmot library search "your query" --topic {topic}'
     )
     console.print(
-        f'  filmot library compare "claim" --topic {data["topic"]}'
+        f'  filmot library compare "claim" --topic {topic}'
     )
     console.print(
-        f'  filmot library echoes {data["topic"]}'
+        f'  filmot library echoes {topic}'
     )
     console.print(
-        f'  filmot claims add {data["topic"]} "exact claim statement"'
+        f'  filmot claims add {topic} "exact claim statement"'
     )
     console.print(
-        f'  filmot sessions {shlex.quote(current_session() or data["topic"])} --summary'
+        f'  filmot sessions {escape(shlex.quote(current_session() or data["topic"]))} --summary'
     )
     console.print(
-        f'  filmot library context {data["topic"]} -o context.txt'
+        f'  filmot library context {topic} -o context.txt'
     )
 
 
@@ -1159,13 +1161,13 @@ def research(
             effective_channel_ids = _merge_channel_ids(channel_id, resolved_ids)
             console.print(
                 "[cyan]Resolved --channel:[/cyan] "
-                + ", ".join(
+                + escape(", ".join(
                     f'{item["name"]} ({item["id"]})'
                     for item in resolved_channels
-                )
+                ))
             )
 
-        console.print(f"[bold]Researching: {topic}[/bold]")
+        console.print(f"[bold]Researching: {escape(topic)}[/bold]")
         console.print(f"[dim]Run ID: {run_id}[/dim]\n")
 
         # Phase 1: freshness scout. A scout failure is non-fatal but explicit.
@@ -1195,7 +1197,7 @@ def research(
 
                 validate_youtube_api()
                 with console.status(
-                    f"[bold cyan]Scouting YouTube for '{topic}' "
+                    f"[bold cyan]Scouting YouTube for '{escape(topic)}' "
                     f"(last {scout_days} days)...[/bold cyan]"
                 ):
                     scout_videos = search_recent(
@@ -1226,8 +1228,8 @@ def research(
                 )
                 for index, video in enumerate(scout_videos[:5], 1):
                     console.print(
-                        f"  {index}. {str(video.get('title', 'Unknown'))[:70]} "
-                        f"[dim]({str(video.get('published_at', ''))[:10]}, "
+                        f"  {index}. {escape(str(video.get('title', 'Unknown'))[:70])} "
+                        f"[dim]({escape(str(video.get('published_at', ''))[:10])}, "
                         f"{int(video.get('views', 0) or 0):,} views)[/dim]"
                     )
             except (ValueError, ImportError) as error:
@@ -1242,7 +1244,7 @@ def research(
                     error=detail,
                 )
                 console.print(
-                    f"[yellow]Scout: Failed ({detail})[/yellow]"
+                    f"[yellow]Scout: Failed ({escape(str(detail))})[/yellow]"
                 )
         else:
             checkpoint("scout", status="disabled", results=0)
@@ -1272,7 +1274,7 @@ def research(
                 candidate_pool=candidate_pool,
             )
             with console.status(
-                f"[bold green]Filmot {stage}: {query}[/bold green]"
+                f"[bold green]Filmot {stage}: {escape(query)}[/bold green]"
             ):
                 response = client.search_subtitles_all(
                     query=query,
@@ -1339,7 +1341,7 @@ def research(
                     search_page_errors.append(page_error)
                 console.print(
                     f"[yellow]Search scope is partial:[/yellow] "
-                    f"{response.get('page_error', 'later page failed')}"
+                    f"{escape(str(response.get('page_error', 'later page failed')))}"
                 )
             return response
 
@@ -1481,7 +1483,7 @@ def research(
             for stage, query in ladder:
                 console.print(
                     f"[dim]Qualified relationship pool: {len(videos)}/{depth}; "
-                    f"trying {stage}: {query}[/dim]"
+                    f"trying {stage}: {escape(query)}[/dim]"
                 )
                 results = run_search(stage, query)
                 stage_candidates = eligible_stage_candidates(results, stage)
@@ -1817,12 +1819,12 @@ def research(
                 )
                 console.print(
                     f"  [{index}/{selected_count}] [yellow]Skip[/yellow] "
-                    f"{title_text[:60]} (already saved)"
+                    f"{escape(title_text[:60])} (already saved)"
                 )
                 continue
 
             console.print(
-                f"  [{index}/{selected_count}] [dim]Fetching {title_text[:60]} "
+                f"  [{index}/{selected_count}] [dim]Fetching {escape(title_text[:60])} "
                 "(route ladder in progress)...[/dim]"
             )
             try:
@@ -1851,7 +1853,7 @@ def research(
                     )
                     console.print(
                         f"  [{index}/{selected_count}] [red]Fail[/red] "
-                        f"{title_text[:60]} [dim]- {error_display}[/dim]"
+                        f"{escape(title_text[:60])} [dim]- {escape(str(error_display))}[/dim]"
                     )
                     continue
 
@@ -1870,7 +1872,7 @@ def research(
                         )
                         console.print(
                             f"  [{index}/{selected_count}] [magenta]Dedupe[/magenta] "
-                            f"{title_text[:60]}"
+                            f"{escape(title_text[:60])}"
                         )
                         continue
                     seen_hashes.add(digest)
@@ -1886,7 +1888,7 @@ def research(
                     )
                     console.print(
                         f"  [{index}/{selected_count}] [yellow]Skip[/yellow] "
-                        f"{title_text[:60]} [dim]- empty transcript[/dim]"
+                        f"{escape(title_text[:60])} [dim]- empty transcript[/dim]"
                     )
                     continue
 
@@ -1932,7 +1934,7 @@ def research(
                 )
                 console.print(
                     f"  [{index}/{selected_count}] [green]✓[/green] "
-                    f"{title_text[:60]}"
+                    f"{escape(title_text[:60])}"
                 )
             except KeyboardInterrupt:
                 raise
@@ -1950,8 +1952,8 @@ def research(
                 )
                 console.print(
                     f"  [{index}/{selected_count}] [red]Fail[/red] "
-                    f"{title_text[:60]} [dim]- "
-                    f"{detail if verbose else _whole_word_summary(detail)}[/dim]"
+                    f"{escape(title_text[:60])} [dim]- "
+                    f"{escape(detail if verbose else _whole_word_summary(detail))}[/dim]"
                 )
 
         if proxy_errors:
@@ -2032,7 +2034,7 @@ def research(
                     f"{len(transcript_texts)} eligible seed transcript(s)...[/bold]"
                 )
                 console.print(
-                    f"  Entities: [cyan]{', '.join(terms[:8]) or 'none'}[/cyan]"
+                    f"  Entities: [cyan]{escape(', '.join(terms[:8])) or 'none'}[/cyan]"
                 )
                 probe_empty_reason = None
                 if not terms:
@@ -2118,7 +2120,7 @@ def research(
                     )
                     probe_queries_executed += 1
                     try:
-                        with console.status(f"Probing: {probe_query}"):
+                        with console.status(f"Probing: {escape(str(probe_query))}"):
                             probe_result = client.search_subtitles(
                                 query=probe_query,
                                 title=probe_title,
@@ -2150,8 +2152,8 @@ def research(
                             error=detail,
                         )
                         console.print(
-                            f"  Probe {index}: {probe_query} → "
-                            f"[red]error[/red] ({_whole_word_summary(detail)})"
+                            f"  Probe {index}: {escape(str(probe_query))} → "
+                            f"[red]error[/red] ({escape(_whole_word_summary(detail))})"
                         )
                         continue
 
@@ -2180,8 +2182,8 @@ def research(
                             error=detail,
                         )
                         console.print(
-                            f"  Probe {index}: {probe_query} → "
-                            f"[red]error[/red] ({_whole_word_summary(detail)})"
+                            f"  Probe {index}: {escape(str(probe_query))} → "
+                            f"[red]error[/red] ({escape(_whole_word_summary(detail))})"
                         )
                         continue
 
@@ -2297,7 +2299,7 @@ def research(
                         else "n/a"
                     )
                     console.print(
-                        f"  Probe {index}: {probe_query} "
+                        f"  Probe {index}: {escape(str(probe_query))} "
                         f"[dim](co-windows:{co_windows}; sources:{source_support}; "
                         f"score:{score_label}; scope:{scope_label})[/dim] → "
                         f"[green]{api_total:,} API results[/green]; "
@@ -2387,7 +2389,7 @@ def research(
                         video_id, title_text, channel_name
                     )
                     console.print(
-                        f"  [dim]Fetching probe discovery {title_text[:60]}...[/dim]"
+                        f"  [dim]Fetching probe discovery {escape(title_text[:60])}...[/dim]"
                     )
                     try:
                         transcript_result = fetch_transcript(video_id)
@@ -2409,8 +2411,8 @@ def research(
                                 route_errors=transcript_result.get("route_errors"),
                             )
                             console.print(
-                                f"  [red]Fail[/red] {title_text[:60]} "
-                                f"[dim]- {_transcript_failure_detail(transcript_result, verbose=verbose)}[/dim]"
+                                f"  [red]Fail[/red] {escape(title_text[:60])} "
+                                f"[dim]- {escape(_transcript_failure_detail(transcript_result, verbose=verbose))}[/dim]"
                             )
                             continue
                         full_text = transcript_result.get("full_text", "")
@@ -2426,7 +2428,7 @@ def research(
                                 reason="empty_transcript",
                             )
                             console.print(
-                                f"  [yellow]Skip[/yellow] {title_text[:60]} "
+                                f"  [yellow]Skip[/yellow] {escape(title_text[:60])} "
                                 f"[dim]- empty transcript[/dim]"
                             )
                             continue
@@ -2472,7 +2474,7 @@ def research(
                             routes_tried=transcript_result.get("routes_tried"),
                         )
                         console.print(
-                            f"  [green]✓[/green] {title_text[:60]} "
+                            f"  [green]✓[/green] {escape(title_text[:60])} "
                             "[dim](probe)[/dim]"
                         )
                     except KeyboardInterrupt:
@@ -2491,9 +2493,9 @@ def research(
                             error=detail,
                         )
                         console.print(
-                            f"  [red]Fail[/red] {title_text[:60]} "
+                            f"  [red]Fail[/red] {escape(title_text[:60])} "
                             f"[dim]- "
-                            f"{detail if verbose else _whole_word_summary(detail)}[/dim]"
+                            f"{escape(detail if verbose else _whole_word_summary(detail))}[/dim]"
                         )
                 checkpoint(
                     "probe",

@@ -1663,6 +1663,11 @@ if requested, has already happened by then. `--fresh` cannot be combined with
 the manifest, while a continuation slice adds new video identities to that
 same corpus.
 
+Ctrl-C stops a parallel download promptly. Queued videos never start, and
+running ones begin no further route, so none falls back to Filmot's subtitle
+index (which costs credits). A fetch the interrupt cut short records no
+failure, and the next run retries it.
+
 The manifest's latest compact `upload_enumeration` checkpoint uses
 `filmot.youtube-upload-enumeration/v1` and stores the provider,
 `observed_at`/`expires_at`, credential-free effective request, and coverage:
@@ -1956,6 +1961,7 @@ python main.py interactive
 ```
 filmot> help              # Show all commands
 filmot> search pandas     # Quick search
+filmot> search pandas --lang en --sort viewcount --order desc
 filmot> show 1            # Show details of result #1
 filmot> save 1            # Save result to watchlist
 filmot> watchlist         # View watchlist
@@ -1965,6 +1971,13 @@ filmot> cache stats       # View cache statistics
 filmot> history           # View search history
 filmot> quit              # Exit REPL
 ```
+
+Search filters take `filmot search` option names, such as `--lang`,
+`--min-views`, `--sort`, `--order`, `--exclude`, `--min-duration`, and
+`--manual-subs`, and `defaults` accepts the same names. An unknown option or a
+bad value is reported without spending a search, and a failed search leaves the
+REPL running. `--sort density` sorts on the client, so it is available only in
+`filmot search`.
 
 ---
 

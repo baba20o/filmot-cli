@@ -8,6 +8,7 @@ import shlex
 from typing import Optional
 
 import click
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -43,7 +44,7 @@ def _render_library_list(
     if not rows:
         if topic:
             console.print(
-                f"[yellow]No transcripts in topic: {topic}[/yellow]"
+                f"[yellow]No transcripts in topic: {escape(str(topic))}[/yellow]"
             )
         else:
             console.print(
@@ -53,7 +54,7 @@ def _render_library_list(
         return
 
     if topic:
-        table = Table(title=f"Transcripts in '{topic}'")
+        table = Table(title=f"Transcripts in '{escape(str(topic))}'")
         table.add_column("Video ID", style="cyan")
         table.add_column("Title", style="white", max_width=50)
         table.add_column("Channel", style="green")
@@ -64,9 +65,9 @@ def _render_library_list(
             if len(title) > 47:
                 title = title[:47] + "..."
             table.add_row(
-                str(row.get("video_id", "")),
-                title,
-                str(row.get("channel", "Unknown")),
+                escape(str(row.get("video_id", ""))),
+                escape(title),
+                escape(str(row.get("channel", "Unknown"))),
                 f"{int(row.get('char_count', 0)):,} chars",
                 (
                     str(row.get("saved_at"))[:10]
@@ -82,7 +83,7 @@ def _render_library_list(
     table.add_column("Topic", style="cyan")
     table.add_column("Transcripts", style="white", justify="right")
     for row in rows:
-        table.add_row(str(row.get("topic", "")), str(row.get("count", 0)))
+        table.add_row(escape(str(row.get("topic", ""))), str(row.get("count", 0)))
     console.print(table)
     total = sum(int(row.get("count", 0)) for row in rows)
     console.print(
@@ -123,7 +124,7 @@ def _render_library_search(
         )
 
     if not rows:
-        console.print(f"[yellow]No matches for '{query}'[/yellow]")
+        console.print(f"[yellow]No matches for '{escape(query)}'[/yellow]")
         if not topic:
             console.print(
                 "[dim]Try searching within a specific topic: "
@@ -137,13 +138,13 @@ def _render_library_search(
     )
     for row in rows[:10]:
         console.print(
-            f"[bold cyan]{row['video_id']}[/bold cyan] "
+            f"[bold cyan]{escape(str(row['video_id']))}[/bold cyan] "
             f"({row['match_count']} matches)"
         )
         console.print(
-            f"  Topic: [green]{row['topic']}[/green] | "
-            f"{row.get('title', 'Unknown')} - "
-            f"{row.get('channel', 'Unknown')}"
+            f"  Topic: [green]{escape(str(row['topic']))}[/green] | "
+            f"{escape(str(row.get('title', 'Unknown')))} - "
+            f"{escape(str(row.get('channel', 'Unknown')))}"
         )
         details = row.get("match_details") or []
         if details:
@@ -157,12 +158,12 @@ def _render_library_search(
                 console.print(
                     "  [dim]{}{}[/dim]".format(
                         locator,
-                        match.get("excerpt", ""),
+                        escape(str(match.get("excerpt", ""))),
                     )
                 )
         else:
             for match in row.get("matches", [])[:2]:
-                console.print(f"  [dim]...{match}[/dim]")
+                console.print(f"  [dim]...{escape(str(match))}[/dim]")
         console.print()
 
 
@@ -367,9 +368,9 @@ def _render_yt_data_status(
             "unmanaged": "dim",
         }.get(classification, "red")
         table.add_row(
-            str(row.get("topic") or ""),
-            str(row.get("video_id") or ""),
-            "[{}]{}[/{}]".format(color, classification, color),
+            escape(str(row.get("topic") or "")),
+            escape(str(row.get("video_id") or "")),
+            "[{}]{}[/{}]".format(color, escape(classification), color),
             str(row.get("expires_at") or "—"),
             str(row.get("owned_path_count") or 0),
         )
@@ -989,7 +990,7 @@ def library_search(query: str, topic: str, substring: bool, raw: bool):
         status = (
             nullcontext()
             if raw
-            else console.status(f"Searching library for '{query}'...")
+            else console.status(f"Searching library for '{escape(query)}'...")
         )
         with status:
             results = lib.search(
@@ -1085,20 +1086,21 @@ def _render_library_context(
     summary = data.get("summary") or {}
     if outcome.status_value == ResultStatus.EMPTY.value:
         console.print(
-            f"[yellow]No transcripts in topic: {topic}[/yellow]"
+            f"[yellow]No transcripts in topic: {escape(topic)}[/yellow]"
         )
         return
 
     output = data.get("output")
     if output:
-        console.print(f"[green]✓ Saved context to: {output}[/green]")
+        console.print(f"[green]✓ Saved context to: {escape(str(output))}[/green]")
         console.print(
             f"[dim]Size: {int(summary.get('chars', 0)):,} characters[/dim]"
         )
         return
 
     content = str(rows[0].get("content") or "") if rows else ""
-    console.print(content)
+    # Transcripts are printed as written: "[music]" is a caption, not markup.
+    console.print(content, markup=False)
 
 
 @library.command("context")
@@ -1123,7 +1125,7 @@ def library_context(topic: str, max_chars: int, output: str, fmt: str):
     lib = get_library()
 
     try:
-        with console.status(f"Building context from '{topic}'..."):
+        with console.status(f"Building context from '{escape(topic)}'..."):
             if fmt == "structured":
                 context = _build_structured_context(lib, topic, max_chars)
             else:
@@ -1316,7 +1318,7 @@ def _render_library_stats(
         console.print("\n[bold]By Topic:[/bold]")
         for row in rows:
             console.print(
-                f"  {row['topic']}: {row['count']} transcripts"
+                f"  {escape(str(row['topic']))}: {row['count']} transcripts"
             )
 
 
@@ -1590,25 +1592,25 @@ def _render_library_delete(
         count = int(deleted or 0)
         if count:
             console.print(
-                f"[green]✓ Deleted topic '{target}' "
+                f"[green]✓ Deleted topic '{escape(target)}' "
                 f"({count} transcripts)[/green]"
             )
         else:
             console.print(
-                f"[yellow]Topic not found or empty: {target}[/yellow]"
+                f"[yellow]Topic not found or empty: {escape(target)}[/yellow]"
             )
         return
 
     if bool(deleted):
         topic = outcome.data.get("topic")
-        scope_label = f"from {topic}" if topic else "from all topics"
+        scope_label = f"from {escape(str(topic))}" if topic else "from all topics"
         console.print(
-            f"[green]✓ Deleted transcript {target} "
+            f"[green]✓ Deleted transcript {escape(target)} "
             f"{scope_label}[/green]"
         )
     else:
         console.print(
-            f"[yellow]Transcript not found: {target}[/yellow]"
+            f"[yellow]Transcript not found: {escape(target)}[/yellow]"
         )
 
 
@@ -1753,14 +1755,14 @@ def _render_library_migrate_topic(
 
     if reason == "already-canonical":
         console.print(
-            f"[dim]No migration is needed: '{requested_topic}' already uses "
-            f"'{canonical_slug}'.[/dim]"
+            f"[dim]No migration is needed: '{escape(str(requested_topic))}' already uses "
+            f"'{escape(str(canonical_slug))}'.[/dim]"
         )
         return
     if reason == "no-source-files":
         console.print(
             f"[dim]No legacy transcript files found at "
-            f"{summary.get('source')}.[/dim]"
+            f"{escape(str(summary.get('source')))}.[/dim]"
         )
         return
 
@@ -1768,11 +1770,11 @@ def _render_library_migrate_topic(
     remaining = int(summary.get("remaining", 0))
     console.print(
         f"[green]Migrated {migrated} transcript file(s) to "
-        f"'{canonical_slug}'.[/green]"
+        f"'{escape(str(canonical_slug))}'.[/green]"
     )
     if remaining:
         console.print(
-            f"[yellow]{remaining} file(s) remain in '{legacy_slug}', usually "
+            f"[yellow]{remaining} file(s) remain in '{escape(legacy_slug)}', usually "
             "because the destination already exists or a source file is invalid."
             "[/yellow]"
         )
@@ -1904,8 +1906,8 @@ def library_migrate_topic(topic: str, yes: bool):
 
     console.print(
         Panel(
-            f"[bold yellow]Legacy source:[/bold yellow] {source}\n"
-            f"[bold green]Destination:[/bold green] {destination}\n"
+            f"[bold yellow]Legacy source:[/bold yellow] {escape(str(source))}\n"
+            f"[bold green]Destination:[/bold green] {escape(str(destination))}\n"
             f"[bold]Transcript files:[/bold] {len(source_files)}\n\n"
             "Old slugs can represent more than one original topic. This "
             "operation assigns the entire source directory to the destination; "
@@ -2028,7 +2030,7 @@ def _render_library_compare(
 
     if not rows:
         console.print(
-            f"[yellow]No sources mention '{query}'[/yellow]"
+            f"[yellow]No sources mention '{escape(query)}'[/yellow]"
         )
         return
 
@@ -2039,7 +2041,7 @@ def _render_library_compare(
         )
     console.print(
         Panel(
-            f"[bold]'{query}' mentioned {summary.get('matches', 0)} times "
+            f"[bold]'{escape(query)}' mentioned {summary.get('matches', 0)} times "
             f"across {len(rows)} sources[/bold]",
             title="Cross-Source Concordance",
         )
@@ -2055,31 +2057,28 @@ def _render_library_compare(
             else ""
         )
         console.print(
-            f"\n[bold cyan]{row.get('title', 'Unknown')}[/bold cyan]"
+            f"\n[bold cyan]{escape(str(row.get('title', 'Unknown')))}[/bold cyan]"
         )
         console.print(
-            f"  [dim]Channel:[/dim] {row.get('channel', 'Unknown')} | "
-            f"[dim]Topic:[/dim] {row.get('topic', '')} | "
+            f"  [dim]Channel:[/dim] {escape(str(row.get('channel', 'Unknown')))} | "
+            f"[dim]Topic:[/dim] {escape(str(row.get('topic', '')))} | "
             f"[bold]{match_count} {mentions_label}{density_str}[/bold]"
         )
         console.print(
             f"  [dim]Video:[/dim] "
-            f"https://youtube.com/watch?v={row.get('video_id', '')}"
+            f"https://youtube.com/watch?v={escape(str(row.get('video_id', '')))}"
         )
         details = row.get("excerpt_details") or [
             {"excerpt": match} for match in row.get("excerpts", [])[:3]
         ]
         for match in details[:3]:
-            highlighted = str(match.get("excerpt", ""))
-            for variant in (
-                query,
-                query.lower(),
-                query.upper(),
-                query.capitalize(),
-            ):
-                highlighted = highlighted.replace(
-                    variant,
-                    f"[bold yellow]{variant}[/bold yellow]",
+            # A Text keeps the excerpt's own brackets literal while the
+            # query is highlighted as written and in its common cases.
+            highlighted = Text(str(match.get("excerpt", "")), style="dim")
+            if query:
+                highlighted.highlight_words(
+                    {query, query.lower(), query.upper(), query.capitalize()},
+                    style="bold yellow",
                 )
             locator = ""
             if match.get("timestamp") and match.get("url"):
@@ -2087,7 +2086,9 @@ def _render_library_compare(
                     url=match["url"],
                     timestamp=match["timestamp"],
                 )
-            console.print(f"  [dim]{locator}{highlighted}[/dim]")
+            console.print(Text.assemble(
+                "  ", Text.from_markup(locator, style="dim"), highlighted,
+            ))
 
     console.print(
         f"\n[dim]Sources sorted by {summary.get('sort_label')} "
@@ -2130,7 +2131,7 @@ def library_compare(
         status = (
             nullcontext()
             if raw
-            else console.status(f"Comparing '{query}' across sources...")
+            else console.status(f"Comparing '{escape(query)}' across sources...")
         )
         with status:
             results = lib.search(query, topic=topic)
@@ -2306,7 +2307,7 @@ def _render_library_echoes(
                 matched=summary.get("matched_pairs", 0),
                 clusters=summary.get("clusters", 0),
             ),
-            title="Echo Analysis: {}".format(data.get("topic", "")),
+            title="Echo Analysis: {}".format(escape(str(data.get("topic", "")))),
         )
     )
     matched_rows = sorted(
@@ -2326,8 +2327,8 @@ def _render_library_echoes(
         table.add_column("Shared n-grams", justify="right")
         for row in matched_rows[:ECHO_HUMAN_PAIR_LIMIT]:
             table.add_row(
-                str(row.get("source_a", "")),
-                str(row.get("source_b", "")),
+                escape(str(row.get("source_a", ""))),
+                escape(str(row.get("source_b", ""))),
                 "{:.3f}".format(float(row.get("score") or 0)),
                 str(row.get("shared_shingles", 0)),
             )
@@ -2355,7 +2356,7 @@ def _render_library_echoes(
         )
     )
     if data.get("artifact"):
-        console.print("[green]Saved reproducible artifact: {}[/green]".format(data["artifact"]))
+        console.print("[green]Saved reproducible artifact: {}[/green]".format(escape(str(data["artifact"]))))
 
 
 @library.command("echoes")
@@ -2495,7 +2496,7 @@ def _render_sessions(
     for error in outcome.errors:
         console.print(
             "[yellow]Incomplete session ledger:[/yellow] {}".format(
-                error.message
+                escape(str(error.message))
             )
         )
     data = outcome.data
@@ -2514,7 +2515,7 @@ def _render_sessions(
         table.add_column("Last activity", style="dim")
         for row in rows:
             table.add_row(
-                str(row["name"]),
+                escape(str(row["name"])),
                 str(row["events"]),
                 str(row["last_ts"]).replace("T", " "),
             )
@@ -2578,7 +2579,7 @@ def _render_sessions(
                     claim_events=claims.get("mutation_events", 0),
                     claim_ids=len(claims.get("unique_claim_ids") or []),
                 ),
-                title="Session Summary: {}".format(name),
+                title="Session Summary: {}".format(escape(str(name))),
             )
         )
         scope_rows = searches.get("scope_rows") or []
@@ -2703,7 +2704,7 @@ def _render_sessions(
             for row in research_scope_rows:
                 table.add_row(
                     str(row.get("stage", "")),
-                    str(row.get("query", "")),
+                    escape(str(row.get("query", ""))),
                     str(row.get("api_total", 0)),
                     str(row.get("candidates_fetched", 0)),
                     str(row.get("post_filter_count", 0)),
@@ -2722,7 +2723,7 @@ def _render_sessions(
             for row in scout_rows:
                 table.add_row(
                     str(row.get("run_id", "")),
-                    str(row.get("query", "")),
+                    escape(str(row.get("query", ""))),
                     "{}d / {} / n={}".format(
                         row.get("days")
                         if row.get("days") is not None else "-",
@@ -2830,7 +2831,7 @@ def _render_sessions(
                 )
                 table.add_row(
                     probe_label,
-                    str(row.get("query", "")),
+                    escape(str(row.get("query", ""))),
                     basis,
                     str(row.get("api_total", 0)),
                     str(row.get("scoped", 0)),
@@ -2869,10 +2870,10 @@ def _render_sessions(
                     else:
                         origin_query = "not recorded"
                 table.add_row(
-                    str(row.get("video_id", "")),
-                    str(row.get("title") or "Unknown"),
+                    escape(str(row.get("video_id", ""))),
+                    escape(str(row.get("title") or "Unknown")),
                     origin,
-                    str(origin_query),
+                    escape(str(origin_query)),
                 )
             console.print(table)
             omitted = int(saved_provenance.get("omitted", 0))
@@ -2889,10 +2890,10 @@ def _render_sessions(
 
     events = data.get("events") or []
     if not events:
-        console.print(f"[yellow]No session found for '{name}'.[/yellow]")
+        console.print(f"[yellow]No session found for '{escape(str(name))}'.[/yellow]")
         return
 
-    console.print(f"[bold]Session: {name}[/bold] ({len(events)} events)\n")
+    console.print(f"[bold]Session: {escape(str(name))}[/bold] ({len(events)} events)\n")
     for event in events:
         ts = str(event.get("ts", "")).replace("T", " ")
         kind = event.get("kind", "?")
@@ -2935,8 +2936,8 @@ def _render_sessions(
         else:
             detail = json_mod.dumps(event_data, ensure_ascii=False)
         console.print(
-            f"  [dim]{ts}[/dim] [cyan]{kind}[/cyan] "
-            f"[dim]{event.get('status', '')}[/dim]  {detail}"
+            f"  [dim]{ts}[/dim] [cyan]{escape(str(kind))}[/cyan] "
+            f"[dim]{escape(str(event.get('status', '')))}[/dim]  {escape(detail)}"
         )
 
 

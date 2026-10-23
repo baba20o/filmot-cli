@@ -3,6 +3,7 @@
 import click
 import errno
 import sys
+from rich.markup import escape
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from ._version import __version__
@@ -106,7 +107,7 @@ def _render_cache_result(outcome: CommandResult) -> None:
     table.add_row("Expired Entries", str(stats["expired_entries"]))
     table.add_row("Size", f"{stats['size_mb']} MB")
     table.add_row("TTL", f"{stats['ttl_seconds']} seconds")
-    table.add_row("Directory", stats["cache_dir"])
+    table.add_row("Directory", escape(str(stats["cache_dir"])))
     console.print(table)
 
 
@@ -144,7 +145,7 @@ def _render_batch_result(outcome: CommandResult) -> None:
     console.print(f"  Avg time: {stats['avg_duration_ms']:.0f}ms")
     if data.get("artifact"):
         console.print(
-            f"\n[green]✓ Results exported to: {data['artifact']}[/green]"
+            f"\n[green]✓ Results exported to: {escape(str(data['artifact']))}[/green]"
         )
 
 
@@ -196,7 +197,7 @@ def batch(file: str, output: str, fmt: str):
         log_result("batch", outcome, data=outcome.data)
         _command_error(f"Failed to load queries: {e}")
 
-    console.print(f"[bold]Loaded {len(queries)} queries from {file}[/bold]")
+    console.print(f"[bold]Loaded {len(queries)} queries from {escape(str(file))}[/bold]")
 
     with Progress(
         SpinnerColumn(),
@@ -319,7 +320,7 @@ def batch_template(fmt: str, output: str):
         outcome,
         data=data,
     )
-    console.print(f"[green]✓ Created template: {outcome.data['output']}[/green]")
+    console.print(f"[green]✓ Created template: {escape(str(outcome.data['output']))}[/green]")
 
 
 # ========== WATCHLIST ==========
@@ -347,8 +348,8 @@ def _render_watchlist_list(outcome: CommandResult) -> None:
     for index, item in enumerate(items, 1):
         table.add_row(
             str(index),
-            item.get("title", "")[:45],
-            item.get("channel_name", "")[:20],
+            escape(str(item.get("title", ""))[:45]),
+            escape(str(item.get("channel_name", ""))[:20]),
             "✓" if item.get("watched") else "",
             item.get("added_at", "")[:10],
             item.get("video_id", ""),
@@ -471,7 +472,7 @@ def watchlist_add(video_id: str, notes: str):
         },
     )
     if outcome.status_value == ResultStatus.COMPLETED.value:
-        console.print(f"[green]✓ Added: {outcome.data['title']}[/green]")
+        console.print(f"[green]✓ Added: {escape(str(outcome.data['title']))}[/green]")
     else:
         console.print("[yellow]Video already in watchlist.[/yellow]")
 
@@ -501,7 +502,7 @@ def watchlist_remove(video_id: str):
         data=data,
     )
     if outcome.status_value == ResultStatus.COMPLETED.value:
-        console.print(f"[green]✓ Removed video: {video_id}[/green]")
+        console.print(f"[green]✓ Removed video: {escape(video_id)}[/green]")
     else:
         console.print(f"[yellow]Video not found in watchlist.[/yellow]")
 

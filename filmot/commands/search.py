@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 import click
 from rich import print as rprint
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
@@ -416,7 +417,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
 
         fetch_many = pages > 1 or candidate_pool is not None
         with _search_status(
-            f"[bold green]Searching subtitles for '{query}'...", raw=raw
+            f"[bold green]Searching subtitles for '{escape(query)}'...", raw=raw
         ):
             if fetch_many:
                 results = client.search_subtitles_all(
@@ -436,9 +437,9 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
         if client.last_query_rewrite and not raw:
             diagnostics.append(
                 f"[dim]Rewrote unsupported proximity syntax:[/dim] "
-                f"[dim]{client.last_query_rewrite['from']}[/dim] "
+                f"[dim]{escape(str(client.last_query_rewrite['from']))}[/dim] "
                 f"[dim]->[/dim] "
-                f"[dim]{client.last_query_rewrite['to']}[/dim]"
+                f"[dim]{escape(str(client.last_query_rewrite['to']))}[/dim]"
             )
 
         if "error" in results:
@@ -526,7 +527,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
             diagnostics.append(
                 "[yellow]Partial result set:[/yellow] pagination stopped early"
                 + (
-                    f" ({_whole_word_summary(results['page_error'])})"
+                    f" ({escape(_whole_word_summary(results['page_error']))})"
                     if results.get("page_error")
                     else ""
                 )
@@ -547,7 +548,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
         videos_list = _result_videos(results)
         if not videos_list and title:
             diagnostics.append(
-                f"[yellow]No results with --title \"{title}\". "
+                f"[yellow]No results with --title \"{escape(title)}\". "
                 "Try without --title to broaden the search.[/yellow]"
             )
 
@@ -565,7 +566,7 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
                 f'{item["name"]} ({item["id"]})' for item in resolved_channels
             )
             diagnostics.insert(
-                0, f"[cyan]Resolved --channel:[/cyan] {rendered}"
+                0, f"[cyan]Resolved --channel:[/cyan] {escape(rendered)}"
             )
 
         output_results: SearchResultData = dict(results)
@@ -854,11 +855,14 @@ def _display_hit(hit: dict, video_id: str, context_chars: int = 50):
             line_dur = line.get("dur", 0)
             line_ts = _format_timestamp(line_start)
             line_link = _deep_link(video_id, line_start)
-            # Highlight the token in the line text
-            highlighted = line_text.replace(token, f"[bold yellow]{token}[/bold yellow]")
-            highlighted = highlighted.replace(token.capitalize(), f"[bold yellow]{token.capitalize()}[/bold yellow]")
-            highlighted = highlighted.replace(token.upper(), f"[bold yellow]{token.upper()}[/bold yellow]")
-            console.print(f"      [[link={line_link}]{line_ts}[/link]] {highlighted}")
+            # Highlight the token as written, capitalized, or upper-case.
+            # A Text renders the caption's own brackets literally.
+            highlighted = Text(str(line_text))
+            if token:
+                highlighted.highlight_words(
+                    {token, token.capitalize(), token.upper()}, style="bold yellow"
+                )
+            console.print(f"      [[link={line_link}]{line_ts}[/link]]", highlighted)
     else:
         # Hit format 0: Context snippets
         ctx_before = hit.get("ctx_before", "")
@@ -868,7 +872,10 @@ def _display_hit(hit: dict, video_id: str, context_chars: int = 50):
         ctx_before = ctx_before[-context_chars:] if len(ctx_before) > context_chars else ctx_before
         ctx_after = ctx_after[:context_chars] if len(ctx_after) > context_chars else ctx_after
 
-        console.print(f"      [[link={link}]{timestamp}[/link]] ...{ctx_before} [bold yellow]{token}[/bold yellow] {ctx_after}...")
+        console.print(
+            f"      [[link={link}]{timestamp}[/link]] ...{escape(ctx_before)} "
+            f"[bold yellow]{escape(token)}[/bold yellow] {escape(ctx_after)}..."
+        )
 
 
 def _hit_fingerprint_text(video: dict) -> str:
@@ -1054,9 +1061,9 @@ def _render_transcript_grep(outcome: CommandResult[dict]) -> None:
             if outcome.errors
             else "transcript grep failed"
         )
-        console.print(f"[red]Error:[/red] {message}")
+        console.print(f"[red]Error:[/red] {escape(str(message))}")
         return
-    query = outcome.data.get("query", "")
+    query = escape(str(outcome.data.get("query", "")))
     rows = outcome.data.get("matches", [])
     if not rows:
         console.print(f"[dim]No matches for '{query}' in transcript.[/dim]")
@@ -1065,7 +1072,7 @@ def _render_transcript_grep(outcome: CommandResult[dict]) -> None:
     for row in rows:
         timestamp = row["timestamp"]
         link = row["deep_link"]
-        excerpt = row["excerpt"]
+        excerpt = escape(str(row["excerpt"]))
         if link:
             console.print(
                 f"  [[cyan]{timestamp}[/cyan]] "
@@ -1123,7 +1130,7 @@ def _freshness_hint(start_date: str, end_date: str, query: str) -> Optional[str]
     days = 7
     if sd is not None:
         days = max(3, min(30, (today - sd).days + 2))
-    safe_query = query.replace('"', "'")[:60]
+    safe_query = escape(query.replace('"', "'")[:60])
     return (
         f"[yellow]Freshness note:[/yellow] Filmot indexes ~24-48h behind upload. "
         f"For launch-day / breaking coverage, also run: "
@@ -1251,7 +1258,7 @@ def _bulk_download_transcripts(
                 text = data.get("transcript", "")[:500]
                 seen_hashes.add(hashlib.md5(text.encode()).hexdigest())
 
-    console.print(f"\n[bold]Bulk downloading {len(videos_to_download)} transcripts to '{topic}'...[/bold]\n")
+    console.print(f"\n[bold]Bulk downloading {len(videos_to_download)} transcripts to '{escape(topic)}'...[/bold]\n")
 
     for i, video in enumerate(videos_to_download, 1):
         video_id = video["video_id"]
@@ -1333,7 +1340,7 @@ def _bulk_download_transcripts(
                 console.print(
                     f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] "
                     f"{video_id} - "
-                    f"{_transcript_failure_detail(result, verbose=False)}"
+                    f"{escape(_transcript_failure_detail(result, verbose=False))}"
                 )
                 continue
 
@@ -1448,7 +1455,7 @@ def _bulk_download_transcripts(
             )
             success_count += 1
             saved_records.append((topic, video_id))
-            console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {title[:50]}...")
+            console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {escape(str(title)[:50])}...")
 
         except Exception as e:
             log_event(
@@ -1462,7 +1469,7 @@ def _bulk_download_transcripts(
             console.print(
                 f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] "
                 f"{video_id} - "
-                f"{type(e).__name__}: {_whole_word_summary(e)}"
+                f"{escape(f'{type(e).__name__}: {_whole_word_summary(e)}')}"
             )
 
     summary = f"\n[bold]Complete:[/bold] {success_count} saved, {skip_count} skipped, {fail_count} failed"
@@ -1503,7 +1510,7 @@ def _bulk_download_transcripts(
         console.print(f"[dim]{enrichment_summary_line(filmot_summary)}[/dim]")
     if proxy_errors:
         console.print("[yellow]Proxy connection failures detected — your proxy may be down. Try --no-proxy to connect directly.[/yellow]")
-    console.print(f"[dim]View with: filmot library list {topic}[/dim]")
+    console.print(f"[dim]View with: filmot library list {escape(topic)}[/dim]")
     if videos_to_download and fail_count == len(videos_to_download):
         _command_error(
             f"All {fail_count} selected transcript downloads failed."
@@ -1540,7 +1547,7 @@ def _display_subtitle_results(
     scope = results.get("scope", {})
     fetched = scope.get("candidates_fetched", len(all_videos))
     pages = scope.get("pages_fetched", results.get("pages_fetched", 1))
-    panel_text = f"[bold]Found {total:,} API results for: {query}[/bold]"
+    panel_text = f"[bold]Found {total:,} API results for: {escape(str(query))}[/bold]"
     if fetched != total or len(videos) != fetched or pages > 1:
         panel_text += (
             f"\n[dim]Fetched {fetched:,} candidate(s) across {pages} page(s); "
@@ -1593,12 +1600,18 @@ def _display_subtitle_results(
         else:
             video_url = f"https://youtube.com/watch?v={video_id}"
 
-        console.print(f"\n[bold cyan]{i}. {title}[/bold cyan]{echo_tag}")
-        console.print(f"   [dim]Channel:[/dim] {channel} ({channel_subs_str} subs) | [dim]Country:[/dim] {channel_country}")
+        console.print(f"\n[bold cyan]{i}. {escape(str(title))}[/bold cyan]{echo_tag}")
+        console.print(
+            f"   [dim]Channel:[/dim] {escape(str(channel))} ({channel_subs_str} subs) | "
+            f"[dim]Country:[/dim] {escape(str(channel_country))}"
+        )
         console.print(f"   [dim]Views:[/dim] {views:,} | [dim]Likes:[/dim] {likes:,}{eng_str} | [dim]Duration:[/dim] {duration_str}")
-        console.print(f"   [dim]Category:[/dim] {category} | [dim]Language:[/dim] {lang} | [dim]Uploaded:[/dim] {upload_date}")
-        console.print(f"   [dim]Video:[/dim] {video_url}")
-        console.print(f"   [dim]Channel:[/dim] https://youtube.com/channel/{channel_id}")
+        console.print(
+            f"   [dim]Category:[/dim] {escape(str(category))} | [dim]Language:[/dim] {escape(str(lang))} | "
+            f"[dim]Uploaded:[/dim] {escape(str(upload_date))}"
+        )
+        console.print(f"   [dim]Video:[/dim] {escape(video_url)}")
+        console.print(f"   [dim]Channel:[/dim] https://youtube.com/channel/{escape(str(channel_id))}")
 
         # Display hits (subtitle matches) with density scoring
         if hits:
@@ -1873,7 +1886,7 @@ def channels(term: str, raw: bool):
     try:
         client = FilmotClient()
         with _search_status(
-            f"[bold green]Searching channels for '{term}'...", raw=raw
+            f"[bold green]Searching channels for '{escape(term)}'...", raw=raw
         ):
             result = client.search_channels(term)
 
@@ -1982,7 +1995,7 @@ def _display_channel_results(
         console.print("[yellow]No channels found.[/yellow]")
         return
 
-    console.print(Panel(f"[bold]Found {len(channels)} channels matching: {term}[/bold]"))
+    console.print(Panel(f"[bold]Found {len(channels)} channels matching: {escape(str(term))}[/bold]"))
 
     # The direct API reports channel countries; the RapidAPI gateway does not.
     show_country = any(channel.get("countryname") for channel in channels[:20])
@@ -2010,7 +2023,7 @@ def _display_channel_results(
         row = [str(i), name, handle, str(subs), str(views)]
         if show_country:
             row.append(str(channel.get("countryname") or ""))
-        table.add_row(*row, channel_id)
+        table.add_row(*(escape(cell) for cell in row), escape(channel_id))
 
     console.print(table)
 
@@ -2019,7 +2032,7 @@ def _display_channel_results(
     for i, channel in enumerate(channels[:5], 1):
         channel_id = str(channel.get("channelid") or "")
         name = str(channel.get("name") or "Unknown")
-        console.print(f"   {i}. [cyan]{name}[/cyan]: https://youtube.com/channel/{channel_id}")
+        console.print(f"   {i}. [cyan]{escape(name)}[/cyan]: https://youtube.com/channel/{escape(channel_id)}")
 
     if len(channels) > 20:
         console.print(f"\n[dim]... and {len(channels) - 20} more results[/dim]")
@@ -2035,13 +2048,13 @@ def _render_export_result(
     data = outcome.data
     console.print(
         f"[green]✓ Exported {len(data.get('result') or [])} videos to: "
-        f"{data.get('output', '')}[/green]"
+        f"{escape(str(data.get('output', '')))}[/green]"
     )
     if outcome.status_value == ResultStatus.PARTIAL.value:
         detail = outcome.errors[0].message if outcome.errors else ""
         console.print(
             "[yellow]Partial export:[/yellow] pagination stopped early"
-            + (f" ({detail})" if detail else "")
+            + (f" ({escape(detail)})" if detail else "")
             + "."
         )
 
@@ -2083,7 +2096,7 @@ def export(query: str, output: str, fmt: str, pages: int, detailed: bool,
     try:
         client = FilmotClient()
         with console.status(
-            f"[bold green]Fetching {pages} page(s) for '{query}'..."
+            f"[bold green]Fetching {pages} page(s) for '{escape(query)}'..."
         ):
             if pages == 1:
                 results = client.search_subtitles(
@@ -2215,13 +2228,13 @@ def _render_search_all_result(
         detail = outcome.errors[0].message if outcome.errors else ""
         console.print(
             "[yellow]Partial result set:[/yellow] pagination stopped early"
-            + (f" ({detail})" if detail else "")
+            + (f" ({escape(detail)})" if detail else "")
             + "."
         )
 
     if data.get("output"):
         console.print(
-            f"[green]✓ Exported to: {data.get('exported_path', '')}[/green]"
+            f"[green]✓ Exported to: {escape(str(data.get('exported_path', '')))}[/green]"
         )
     else:
         _display_subtitle_results(outcome, str(data.get("query", "")))
@@ -2252,7 +2265,7 @@ def search_all(query: str, pages: int, max_results: int, lang: str,
     try:
         client = FilmotClient()
 
-        with console.status(f"[bold green]Fetching up to {pages} pages for '{query}'..."):
+        with console.status(f"[bold green]Fetching up to {pages} pages for '{escape(query)}'..."):
             results = client.search_subtitles_all(
                 query=query,
                 max_pages=pages,
@@ -2549,7 +2562,7 @@ def _render_yt_search_result(
 
     if not videos:
         console.print(
-            f"[yellow]No videos found for '{query}' in the last {days} "
+            f"[yellow]No videos found for '{escape(query)}' in the last {days} "
             "days.[/yellow]"
         )
         return
@@ -2564,7 +2577,7 @@ def _render_yt_search_result(
         ("Event", "event_type"),
     ):
         if filters.get(key):
-            filter_labels.append(f"{label}: {filters[key]}")
+            filter_labels.append(f"{label}: {escape(str(filters[key]))}")
     filter_text = " | ".join(filter_labels)
 
     published_after = request.get("published_after")
@@ -2590,7 +2603,7 @@ def _render_yt_search_result(
     )
     console.print(
         Panel(
-            f"[bold]Found {len(videos)} videos for:[/bold] {query}\n"
+            f"[bold]Found {len(videos)} videos for:[/bold] {escape(query)}\n"
             f"[bold]UTC period:[/bold] {period} | "
             f"[bold]Order:[/bold] {order}\n"
             f"[bold]Coverage:[/bold] {scope_line}\n"
@@ -2609,15 +2622,15 @@ def _render_yt_search_result(
         duration_str = format_duration(video.get("duration")) or "unknown"
         view_count = video.get("views")
         views = f"{view_count:,}" if isinstance(view_count, int) else "unknown"
-        published = str(video.get("published_at", ""))[:10]
+        published = escape(str(video.get("published_at", ""))[:10])
 
         console.print(
             f"\n[bold cyan]{index}. "
-            f"{video.get('title') or 'Untitled video'}[/bold cyan]"
+            f"{escape(str(video.get('title') or 'Untitled video'))}[/bold cyan]"
         )
         console.print(
             f"   Channel: [green]"
-            f"{video.get('channel_title') or 'Unknown channel'}[/green]"
+            f"{escape(str(video.get('channel_title') or 'Unknown channel'))}[/green]"
         )
         console.print(
             f"   Views: {views} | Duration: {duration_str} | "
@@ -2650,18 +2663,18 @@ def _render_yt_search_result(
             description = str(video["description"])[:200]
             if len(str(video.get("description", ""))) > 200:
                 description += "..."
-            console.print(f"   [dim]{description}[/dim]")
+            console.print(f"   [dim]{escape(description)}[/dim]")
 
         if data.get("transcript"):
             transcript_result = video.get("transcript_search") or {}
-            search_term = transcript_result.get("query") or (
+            search_term = escape(str(transcript_result.get("query") or (
                 data.get("transcript_query") or query
-            )
+            )))
             if transcript_result.get("status") == "failed":
                 error = transcript_result.get("error") or {}
                 error_type = error.get("type") or "TranscriptError"
                 console.print(
-                    f"   [dim]Transcript unavailable ({error_type})[/dim]"
+                    f"   [dim]Transcript unavailable ({escape(str(error_type))})[/dim]"
                 )
             elif transcript_result.get("match_count", 0) > 0:
                 console.print(
@@ -2672,7 +2685,7 @@ def _render_yt_search_result(
                 for match in transcript_result.get("matches", [])[:3]:
                     console.print(
                         f"      [{match.get('timestamp', '?')}] ..."
-                        f"{str(match.get('context', ''))[:100]}..."
+                        f"{escape(str(match.get('context', ''))[:100])}..."
                     )
             else:
                 console.print(
@@ -2935,7 +2948,7 @@ def yt_search(query: str, days: int, max_results: int, pages: int,
         pub_after = _youtube_cli_bound(published_after, end_of_day=False)
         pub_before = _youtube_cli_bound(published_before, end_of_day=True)
         with _search_status(
-            f"[bold green]Searching YouTube for '{query}' "
+            f"[bold green]Searching YouTube for '{escape(query)}' "
             f"(last {days} days)...",
             raw=raw,
         ):
@@ -3210,7 +3223,7 @@ def _render_yt_video_result(
     coverage = outcome.data.get("coverage") or {}
     if not videos:
         missing = coverage.get("missing_video_ids") or []
-        suffix = " ({})".format(", ".join(map(str, missing))) if missing else ""
+        suffix = " ({})".format(escape(", ".join(map(str, missing)))) if missing else ""
         console.print(
             "[yellow]No public video metadata was returned{}.[/yellow]".format(
                 suffix
@@ -3234,13 +3247,13 @@ def _render_yt_video_result(
         comments = video.get("comments")
         console.print(
             "\n[bold cyan]{}. {}[/bold cyan]".format(
-                index, video.get("title") or "Untitled video"
+                index, escape(str(video.get("title") or "Untitled video"))
             )
         )
         console.print(
             "   Channel: [green]{}[/green] | Published: {}".format(
-                video.get("channel_title") or "Unknown channel",
-                str(video.get("published_at") or "unknown")[:10],
+                escape(str(video.get("channel_title") or "Unknown channel")),
+                escape(str(video.get("published_at") or "unknown")[:10]),
             )
         )
         console.print(
@@ -3270,7 +3283,7 @@ def _render_yt_video_result(
             description = str(video["description"])
             console.print(
                 "   [dim]{}[/dim]".format(
-                    description[:500] + ("..." if len(description) > 500 else "")
+                    escape(description[:500]) + ("..." if len(description) > 500 else "")
                 )
             )
 
