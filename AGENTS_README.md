@@ -437,6 +437,9 @@ filmot library search "attack vector" --topic prompt-injection --raw
 filmot library compare "dark oxygen" --topic deep-sea-mining
 filmot library compare "dark oxygen" --topic deep-sea-mining --raw
 
+# Read a bounded time window from one saved copy (local only; never fetches)
+filmot library read VIDEO_ID --topic deep-sea-mining --from 1:30 --to 3:00 --raw
+
 # Advisory full-transcript shared-phrasing analysis
 filmot library echoes deep-sea-mining
 filmot library echoes deep-sea-mining --ngram 5 --threshold 0.5 --raw

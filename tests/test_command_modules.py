@@ -51,6 +51,7 @@ def test_top_level_command_topology_is_stable():
         "enrich",
         "list",
         "migrate-topic",
+        "read",
         "search",
         "stats",
     }
