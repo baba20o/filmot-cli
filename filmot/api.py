@@ -150,14 +150,19 @@ def _raw_body_problem(content: bytes, *, depth: int = 0) -> Optional[str]:
     needles = [secret.encode("utf-8") for secret in _known_secrets() if secret]
     if any(needle in content for needle in needles):
         return "a configured credential"
-    # ZIP readers locate an archive by its end record and accept leading
-    # bytes (a BOM, a preamble), so detect archives the same way.
-    if not zipfile.is_zipfile(io.BytesIO(content)):
+    # Check whatever the export's own ZIP validation would open. A reader
+    # finds an archive by its end record and accepts leading bytes (a BOM, a
+    # preamble); zipfile.is_zipfile is stricter on newer Pythons (it rejects
+    # mismatched disk numbers, for one), so it must not decide what is checked.
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except Exception:  # not an archive; nothing downstream can open it either
         return None
     if depth >= _NESTED_ARCHIVE_DEPTH:
+        archive.close()
         return "archives nested too deeply to check"
     try:
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        with archive:
             for entry in archive.infolist():
                 problem = _raw_body_problem(archive.read(entry), depth=depth + 1)
                 if problem:

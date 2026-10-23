@@ -316,6 +316,23 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- `filmot interactive` could not search: every search failed on keywords the
+  client does not take (`sort`, `order`), and `cache stats` was missing. REPL
+  searches now take `filmot search` option names, report an unknown option or
+  a bad value without searching, and survive a failed request; `cache stats`
+  works.
+- Ctrl-C in `channel-download --workers N` waited for every queued transcript
+  before stopping. Queued downloads are now cancelled, running ones start no
+  further route (the Filmot index fallback included), and a fetch the interrupt
+  cut short records no failure; the next run retries it.
+- Titles, channel names, captions, and queries were read as Rich markup:
+  `[music]` vanished from search hits and transcripts, and a stray `[/bold]`
+  failed the command. Search, library, transcript, channel, research, claims,
+  watchlist, and REPL output now print them as written.
+- The credential check on export ZIPs decided what to open with
+  `zipfile.is_zipfile`, which newer Pythons apply more strictly than the ZIP
+  reader, so an archive with mismatched disk numbers could skip it. Every
+  archive the reader opens is now checked entry by entry.
 - The transcript helper process imported modules from the current directory,
   so a planted `json.py` or package there could replace one it uses. It now
   starts without that directory on its import path.

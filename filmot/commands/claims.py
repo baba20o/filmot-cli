@@ -7,6 +7,7 @@ import re
 from typing import Optional
 
 import click
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -123,14 +124,14 @@ def _render_mutation(outcome: CommandResult[ClaimResultData]) -> None:
     created = bool(data.get("created"))
     if action == "add":
         message = "Created" if created else "Already present"
-        console.print("[green]{} claim {}[/green]".format(message, claim_id))
+        console.print("[green]{} claim {}[/green]".format(message, escape(str(claim_id))))
     elif action == "cite":
         message = "Added" if created else "Already attached"
         console.print(
             "[green]{} {} evidence for {}[/green]".format(
                 message,
-                summary.get("relation", ""),
-                claim_id,
+                escape(str(summary.get("relation", ""))),
+                escape(str(claim_id)),
             )
         )
     elif action == "assess":
@@ -138,9 +139,9 @@ def _render_mutation(outcome: CommandResult[ClaimResultData]) -> None:
         console.print(
             "[green]{} {}: {} / {}[/green]".format(
                 message,
-                claim_id,
-                summary.get("verdict", "open"),
-                summary.get("confidence", "unknown"),
+                escape(str(claim_id)),
+                escape(str(summary.get("verdict", "open"))),
+                escape(str(summary.get("confidence", "unknown"))),
             )
         )
 
@@ -149,7 +150,7 @@ def _render_claims(outcome: CommandResult[ClaimResultData]) -> None:
     rows = outcome.data.get("rows") or []
     topic = outcome.data.get("topic", "")
     if not rows:
-        console.print("[yellow]No claims recorded for '{}'.[/yellow]".format(topic))
+        console.print("[yellow]No claims recorded for '{}'.[/yellow]".format(escape(str(topic))))
         return
 
     if len(rows) == 1 and outcome.data.get("claim_id"):
@@ -159,35 +160,35 @@ def _render_claims(outcome: CommandResult[ClaimResultData]) -> None:
             Panel(
                 "[bold]{}[/bold]\n\nVerdict: [cyan]{}[/cyan]  "
                 "Confidence: [cyan]{}[/cyan]\nEvidence: {} across {} sources".format(
-                    claim.get("text", ""),
-                    claim.get("verdict", "open"),
-                    claim.get("confidence", "unknown"),
+                    escape(str(claim.get("text", ""))),
+                    escape(str(claim.get("verdict", "open"))),
+                    escape(str(claim.get("confidence", "unknown"))),
                     summary.get("evidence", 0),
                     summary.get("sources", 0),
                 ),
-                title=str(claim.get("claim_id", "Claim")),
+                title=escape(str(claim.get("claim_id", "Claim"))),
             )
         )
         if claim.get("assessment_note"):
-            console.print("[dim]Assessment:[/dim] {}".format(claim["assessment_note"]))
+            console.print("[dim]Assessment:[/dim] {}".format(escape(str(claim["assessment_note"]))))
         for evidence in claim.get("evidence") or []:
             locator = evidence.get("locator")
             if evidence.get("video_id") and evidence.get("start_seconds") is not None:
                 locator = "{}s".format(evidence["start_seconds"])
             console.print(
                 "\n  [bold cyan]{}[/bold cyan] {}{}".format(
-                    evidence.get("relation", ""),
-                    evidence.get("deep_link") or evidence.get("source", ""),
-                    " ({})".format(locator) if locator else "",
+                    escape(str(evidence.get("relation", ""))),
+                    escape(str(evidence.get("deep_link") or evidence.get("source", ""))),
+                    " ({})".format(escape(str(locator))) if locator else "",
                 )
             )
             if evidence.get("excerpt"):
-                console.print("    [dim]{}[/dim]".format(evidence["excerpt"]))
+                console.print("    [dim]{}[/dim]".format(escape(str(evidence["excerpt"]))))
             if evidence.get("note"):
-                console.print("    Note: {}".format(evidence["note"]))
+                console.print("    Note: {}".format(escape(str(evidence["note"]))))
         return
 
-    table = Table(title="Claims: {}".format(topic))
+    table = Table(title="Claims: {}".format(escape(str(topic))))
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Verdict")
     table.add_column("Confidence")
@@ -196,11 +197,11 @@ def _render_claims(outcome: CommandResult[ClaimResultData]) -> None:
     for claim in rows:
         summary = claim.get("summary") or {}
         table.add_row(
-            str(claim.get("claim_id", "")),
-            str(claim.get("verdict", "open")),
-            str(claim.get("confidence", "unknown")),
+            escape(str(claim.get("claim_id", ""))),
+            escape(str(claim.get("verdict", "open"))),
+            escape(str(claim.get("confidence", "unknown"))),
             str(summary.get("evidence", 0)),
-            str(claim.get("text", "")),
+            escape(str(claim.get("text", ""))),
         )
     console.print(table)
 

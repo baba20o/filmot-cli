@@ -80,8 +80,10 @@ def test_concurrent_reservations_keep_the_spacing_and_burst_limits(tmp_path, mon
 
 
 def test_concurrent_processes_wait_behind_each_others_reservations(tmp_path, monkeypatch):
-    # Two limiters stand in for two processes. Sleeping is skipped, so only
-    # the reservations, not elapsed time, can space the requests out.
+    # Two limiters stand in for two processes. Time stands still and sleeping
+    # is skipped, so only the reservations can space the requests out (on a
+    # slow runner, real time between calls shortened the measured waits).
+    monkeypatch.setattr("filmot.rate_limiter.time.time", lambda: 100.0)
     monkeypatch.setattr("filmot.rate_limiter.time.sleep", lambda seconds: None)
     db_path = tmp_path / "rate_limit.db"
     first = SharedRateLimiter(requests_per_second=2.0, burst_size=5, db_path=db_path)
@@ -89,7 +91,5 @@ def test_concurrent_processes_wait_behind_each_others_reservations(tmp_path, mon
 
     waits = [first.acquire(), second.acquire(), first.acquire(), second.acquire()]
 
-    assert waits[0] == 0
-    assert waits[1:] == [pytest.approx(0.5 * n, abs=0.05) for n in (1, 2, 3)]
-    timestamps = rows(db_path)
-    assert [b - a for a, b in zip(timestamps, timestamps[1:])] == [pytest.approx(0.5, abs=0.05)] * 3
+    assert waits == [0, pytest.approx(0.5), pytest.approx(1.0), pytest.approx(1.5)]
+    assert rows(db_path) == [pytest.approx(s) for s in (100.0, 100.5, 101.0, 101.5)]

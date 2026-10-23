@@ -15,6 +15,7 @@ from youtube_transcript_api._errors import (
 from typing import Any, Callable, Optional
 import re
 import os
+import threading
 import time
 import requests
 
@@ -572,6 +573,7 @@ def get_transcript(
     progress_callback: Optional[Callable[[dict], None]] = None,
     fresh_primary: bool = False,
     source: Optional[str] = None,
+    stop: Optional[threading.Event] = None,
 ) -> dict:
     """
     Fetch the full transcript for a YouTube video.
@@ -587,6 +589,9 @@ def get_transcript(
         source: ``auto`` (YouTube, then Filmot's subtitle index), ``youtube``,
                 or ``filmot`` (the index only). Defaults to
                 ``FILMOT_TRANSCRIPT_SOURCE``, then ``auto``.
+        stop: Optional event. Once it is set no further route starts, the
+              index fallback included, and the result is a ``Cancelled``
+              error; a route already running ends within its deadline.
 
     Returns:
         dict with:
@@ -643,6 +648,9 @@ def get_transcript(
             )
         return index
 
+    if stop is not None and stop.is_set():
+        return _stopped_result(video_id, [], [])
+
     if source == "filmot":
         index = index_attempt(1)
         index["routes_tried"] = [ROUTE]
@@ -659,11 +667,15 @@ def get_transcript(
         route_timeout=route_timeout,
         progress_callback=progress_callback,
         fresh_primary=fresh_primary,
+        stop=stop,
     )
     if "error" not in result or source == "youtube" or not index_available():
         # Without a usable Filmot key the YouTube outcome stands untouched.
         return result
     youtube_routes = list(result.get("routes_tried") or [])
+    if stop is not None and stop.is_set():
+        # The index costs Filmot credits; spend none once asked to stop.
+        return _stopped_result(video_id, youtube_routes, result.get("route_errors") or [])
     index = index_attempt(len(youtube_routes) + 1)
     routes_tried = [*youtube_routes, ROUTE]
     route_errors = list(result.get("route_errors") or [])
@@ -693,6 +705,7 @@ def _youtube_transcript(
     route_timeout: Optional[float] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
     fresh_primary: bool = False,
+    stop: Optional[threading.Event] = None,
 ) -> dict:
     """Fetch a transcript through the YouTube route ladder only."""
     attempts: list[str] = []
@@ -705,14 +718,26 @@ def _youtube_transcript(
         else _env_timeout("FILMOT_TRANSCRIPT_ROUTE_TIMEOUT", DEFAULT_ROUTE_TIMEOUT)
     )
 
-    for attempt_number, (label, route_config, on_outcome) in enumerate(
-        _iter_routes(
-            progress_callback,
-            route_errors,
-            fresh_primary=fresh_primary,
-        ),
-        1,
-    ):
+    routes = _iter_routes(
+        progress_callback,
+        route_errors,
+        fresh_primary=fresh_primary,
+    )
+    attempt_number = 0
+    while True:
+        # Check before asking for the next route: producing one leases a pool
+        # session, and may refresh the pool first.
+        if stop is not None and stop.is_set():
+            return _stopped_result(video_id, attempts, route_errors)
+        try:
+            label, route_config, on_outcome = next(routes)
+        except StopIteration:
+            break
+        attempt_number += 1
+        if stop is not None and stop.is_set():
+            if on_outcome is not None:
+                on_outcome("release", None)  # hand the pool lease back unused
+            return _stopped_result(video_id, attempts, route_errors)
         attempts.append(label)
         started = time.monotonic()
         _emit_progress(
@@ -931,6 +956,17 @@ def _youtube_transcript(
         "video_id": video_id,
         "routes_tried": attempts,
         "route_errors": route_errors,
+    }
+
+
+def _stopped_result(video_id: str, routes_tried: list, route_errors: list) -> dict:
+    """The result of a fetch whose ``stop`` event was set before its next route."""
+    return {
+        "error": "transcript fetch stopped before its next route",
+        "error_type": "Cancelled",
+        "video_id": video_id,
+        "routes_tried": list(routes_tried),
+        "route_errors": list(route_errors),
     }
 
 

@@ -2,6 +2,7 @@
 
 import io
 import json
+import struct
 import sys
 import zipfile
 from pathlib import Path
@@ -476,6 +477,22 @@ def test_a_zip_with_leading_bytes_is_still_checked(transport, prefix):
     content = prefix + _zip_holding("key test-rapidapi-key\n" * 20)
     assert b"test-rapidapi-key" not in content
     assert zipfile.ZipFile(io.BytesIO(content)).namelist()  # readers accept the prefix
+    transport.queues["direct"].append(FakeResponse(200, content=content, headers=CREDITS))
+
+    result = make_client(transport).export_subtitle_search({"query": "gpu", "format": "zip"})
+
+    assert result["error_type"] == "FilmotResponseError"
+    assert "configured credential" in result["error"]
+
+
+def test_any_zip_the_reader_opens_is_checked_whatever_is_zipfile_says(transport, monkeypatch):
+    # Newer Pythons' is_zipfile rejects an end record whose disk numbers
+    # differ, though ZipFile (and so the export's own validation) opens it.
+    content = bytearray(b"leading preamble\n" + _zip_holding("key test-rapidapi-key\n" * 20))
+    struct.pack_into("<H", content, content.rfind(b"PK\x05\x06") + 4, 1)
+    content = bytes(content)
+    assert zipfile.ZipFile(io.BytesIO(content)).namelist()
+    monkeypatch.setattr(zipfile, "is_zipfile", lambda *args, **kwargs: False)
     transport.queues["direct"].append(FakeResponse(200, content=content, headers=CREDITS))
 
     result = make_client(transport).export_subtitle_search({"query": "gpu", "format": "zip"})
