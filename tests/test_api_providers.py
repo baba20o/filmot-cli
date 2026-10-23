@@ -347,6 +347,40 @@ def test_retry_after_waits_are_clamped(transport, monkeypatch, retry_after, expe
     sleep.assert_called_once_with(expected)
 
 
+def test_channel_endpoints_send_documented_parameters(transport):
+    transport.queues["direct"] += [
+        FakeResponse(200, [], headers=CREDITS),
+        FakeResponse(200, [], headers=CREDITS),
+        FakeResponse(200, [], headers=CREDITS),
+    ]
+    client = make_client(transport)
+
+    client.get_channels(
+        ["UCdirect000000000000000a", "UCdirect000000000000000b"],
+        columns=("growth", "wordcloud"), start_date="2026-01-01", end_date="2026-03-01",
+        include_archive=True,
+    )
+    client.get_channel_videos(
+        "UCdirect000000000000000a", count_per_channel=50, page=2,
+        only_with_subtitles=True, columns=("viewcount", "manualsubs"),
+    )
+    client.get_channel_videos("UCdirect000000000000000a")
+
+    profiles, listing, defaults = transport.calls
+    assert profiles["url"] == "https://direct.filmot.invalid/api/v1/getchannels"
+    assert profiles["params"] == {
+        "channelID": "UCdirect000000000000000a,UCdirect000000000000000b",
+        "columns": "growth,wordcloud", "startDate": "2026-01-01", "endDate": "2026-03-01",
+        "includeArchive": "true",
+    }
+    assert listing["url"] == "https://direct.filmot.invalid/api/v1/getchannelvideos"
+    assert listing["params"] == {
+        "channelID": "UCdirect000000000000000a", "countPerChannel": 50, "page": 2,
+        "onlyWithSubtitles": "true", "columns": "viewcount,manualsubs",
+    }
+    assert defaults["params"] == {"channelID": "UCdirect000000000000000a"}
+
+
 def test_a_deadline_caps_socket_timeouts(transport):
     transport.queues["rapidapi"].append(FakeResponse(200, []))
     client = make_client(transport)

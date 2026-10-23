@@ -44,6 +44,9 @@ _FIXTURE_NAMES = (
     "get_videos",
     "get_videos_columns",
     "get_videos_subtitles",
+    "get_channels",
+    "get_channels_all",
+    "get_channel_videos",
 )
 
 
@@ -83,6 +86,13 @@ def _sanitize_string(key: str, value: str, ordinal: int) -> str:
         return re.sub(r"\d{2}:\d{2}:\d{2}", "03:04:05", value)
     if lowered == "description":
         return "Recorded video description"
+    if lowered == "biography":
+        return "Recorded channel biography"
+    if lowered == "username":
+        return "recorded-username-{:03d}".format(ordinal)
+    if lowered == "val":
+        # A previous channel profile value (channelchanges).
+        return "Recorded previous value {:03d}".format(ordinal)
     if lowered == "t":
         # Indexed caption text (subtitles column).
         return "recorded caption line"
@@ -127,6 +137,8 @@ def compact_response(name: str, payload: Any) -> Any:
         ]
     elif isinstance(payload, list):
         payload = payload[:3]
+        if name.startswith("get_channels"):
+            payload = [_compact_channel(channel) for channel in payload]
         if name == "get_videos_subtitles":
             payload = [
                 dict(video, subtitles=[
@@ -138,6 +150,29 @@ def compact_response(name: str, payload: Any) -> Any:
                 for video in payload
             ]
     return payload
+
+
+def _compact_channel(channel: Any) -> Any:
+    """Shorten a channel record's long series while keeping every group."""
+    if not isinstance(channel, dict):
+        return channel
+    channel = dict(channel)
+    for key in ("subscribergrowth", "wordcloud"):
+        if isinstance(channel.get(key), list):
+            channel[key] = channel[key][:3]
+    if isinstance(channel.get("channelchanges"), dict):
+        channel["channelchanges"] = {
+            field: values[:2] if isinstance(values, list) else values
+            for field, values in channel["channelchanges"].items()
+        }
+    stats = channel.get("videostats")
+    if isinstance(stats, dict):
+        stats = dict(stats)
+        for key in ("months", "languages"):
+            if isinstance(stats.get(key), list):
+                stats[key] = stats[key][:2]
+        channel["videostats"] = stats
+    return channel
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -159,6 +194,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--query", default='"SQLite WAL"')
     parser.add_argument("--channel-term", default="SQLite")
     parser.add_argument("--video-id", default="dQw4w9WgXcQ")
+    parser.add_argument("--channel-id", default="UCHnyfMqiRRG1u-2MsSQLbXA")
+    parser.add_argument(
+        "--stats-start",
+        default="2026-04-01",
+        help="startDate for the columns=all channel fixture; keeps it small",
+    )
     parser.add_argument(
         "--provider",
         choices=("auto", "direct", "rapidapi"),
@@ -223,6 +264,13 @@ def main() -> int:
         "get_videos_subtitles": lambda: client.get_videos(
             args.video_id, columns=("subtitles", "lastfetchdate"), lang="en",
         ),
+        "get_channels": lambda: client.get_channels(args.channel_id),
+        "get_channels_all": lambda: client.get_channels(
+            args.channel_id, columns="all", start_date=args.stats_start,
+        ),
+        "get_channel_videos": lambda: client.get_channel_videos(
+            args.channel_id, count_per_channel=3, columns=VIDEO_METADATA_COLUMNS,
+        ),
     }
     endpoints = {
         "search_subtitles_context": "/getsearchsubtitles",
@@ -231,6 +279,9 @@ def main() -> int:
         "get_videos": "/getvideos",
         "get_videos_columns": "/getvideos",
         "get_videos_subtitles": "/getvideos",
+        "get_channels": "/getchannels",
+        "get_channels_all": "/getchannels",
+        "get_channel_videos": "/getchannelvideos",
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -254,9 +305,9 @@ def main() -> int:
                     destination
                 )
             )
-        destination.write_text(
-            json.dumps(sanitized, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+        # Bytes keep LF line endings on Windows too (.gitattributes eol=lf).
+        destination.write_bytes(
+            (json.dumps(sanitized, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
         )
         print(destination)
     return 0

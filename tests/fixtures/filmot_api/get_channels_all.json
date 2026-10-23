@@ -1,0 +1,366 @@
+[
+  {
+    "channelid": "recorded-channel-001",
+    "name": "Recorded channel 001",
+    "handle": "@recorded-channel-001",
+    "thumbnailurl": "https://example.invalid/resource",
+    "country": "Recorded country",
+    "subcount": 21400000,
+    "totalviewcount": 4682429691,
+    "joindate": "2010-07-21",
+    "fetcheddate": "2018-11-23",
+    "updatedate": "2026-10-21",
+    "firstvideodate": "2010-08-15",
+    "lastvideodate": "2026-10-15",
+    "isofficialartist": false,
+    "isverified": true,
+    "isjoinable": false,
+    "counts": {
+      "indexedvideos": 582,
+      "partialdatavideos": 75,
+      "recentuploads": {
+        "15d": 3,
+        "30d": 6,
+        "60d": 13,
+        "180d": 43,
+        "360d": 80
+      }
+    },
+    "description": "Recorded video description",
+    "biography": null,
+    "channelchanges": {
+      "country": [
+        {
+          "val": "Recorded previous value 001",
+          "dstart": "2018-11-23",
+          "dend": "2024-07-15"
+        }
+      ],
+      "description": [
+        {
+          "val": "Recorded previous value 001",
+          "dstart": "2018-11-23",
+          "dend": "2024-07-15"
+        }
+      ],
+      "handle": [
+        {
+          "val": "Recorded previous value 001",
+          "dstart": "2023-02-21",
+          "dend": "2024-07-15"
+        }
+      ],
+      "name": [
+        {
+          "val": "Recorded previous value 001",
+          "dstart": "2018-11-23",
+          "dend": "2024-07-15"
+        }
+      ]
+    },
+    "growth": {
+      "totalviewcount": {
+        "28d": {
+          "startdate": "2026-09-24",
+          "enddate": "2026-10-21",
+          "actualdays": 28,
+          "startcount": 4586513053,
+          "endcount": 4682429691,
+          "delta": 95916638,
+          "normalizeddelta": 96444026
+        },
+        "90d": {
+          "startdate": "2026-07-13",
+          "enddate": "2026-10-21",
+          "actualdays": 100,
+          "startcount": 4394138436,
+          "endcount": 4682429691,
+          "delta": 288291255,
+          "normalizeddelta": 258316954
+        },
+        "180d": {
+          "startdate": "2026-04-20",
+          "enddate": "2026-10-21",
+          "actualdays": 184,
+          "startcount": 4202923836,
+          "endcount": 4682429691,
+          "delta": 479505855,
+          "normalizeddelta": 468125693
+        },
+        "365d": {
+          "startdate": "2025-10-21",
+          "enddate": "2026-10-21",
+          "actualdays": 366,
+          "startcount": 3737369367,
+          "endcount": 4682429691,
+          "delta": 945060324,
+          "normalizeddelta": 943719318
+        }
+      },
+      "subcount": {
+        "28d": {
+          "startdate": "2026-09-24",
+          "enddate": "2026-10-22",
+          "actualdays": 28,
+          "startcount": 21300000,
+          "endcount": 21400000,
+          "delta": 100000,
+          "normalizeddelta": 99538
+        },
+        "90d": {
+          "startdate": "2026-07-26",
+          "enddate": "2026-10-22",
+          "actualdays": 89,
+          "startcount": 21000000,
+          "endcount": 21400000,
+          "delta": 400000,
+          "normalizeddelta": 405544
+        },
+        "180d": {
+          "startdate": "2026-04-25",
+          "enddate": "2026-10-22",
+          "actualdays": 180,
+          "startcount": 20600000,
+          "endcount": 21400000,
+          "delta": 800000,
+          "normalizeddelta": 798039
+        },
+        "365d": {
+          "startdate": "2025-10-22",
+          "enddate": "2026-10-22",
+          "actualdays": 365,
+          "startcount": 19300000,
+          "endcount": 21400000,
+          "delta": 2100000,
+          "normalizeddelta": 2098099
+        }
+      }
+    },
+    "subscribergrowth": [
+      {
+        "d": "2026-04-12",
+        "s": 20600000
+      },
+      {
+        "d": "2026-04-26",
+        "s": 20600000
+      },
+      {
+        "d": "2026-05-10",
+        "s": 20700000
+      }
+    ],
+    "wordcloud": [
+      {
+        "text": "recorded transcript line",
+        "weight": 485922,
+        "lang": "en"
+      },
+      {
+        "text": "recorded transcript line",
+        "weight": 373154,
+        "lang": "en"
+      },
+      {
+        "text": "recorded transcript line",
+        "weight": 357631,
+        "lang": "en"
+      }
+    ],
+    "videostats": {
+      "startdate": "2026-04-01",
+      "enddate": "2026-10-23",
+      "analyzedvideos": 50,
+      "durationhistogramedgessec": [
+        0,
+        30,
+        120,
+        300,
+        600,
+        1200,
+        2400,
+        5400,
+        2147483647
+      ],
+      "videotypes": {
+        "regular": 15,
+        "shorts": 34,
+        "livestreams": 0,
+        "unknown": 1
+      },
+      "durationhistogram": [
+        0,
+        30,
+        4,
+        1,
+        0,
+        11,
+        3,
+        0
+      ],
+      "unknowndurationcount": 1,
+      "distributions": {
+        "duration": {
+          "n": 49,
+          "mean": 649.49,
+          "sd": 938.31,
+          "q1": 71,
+          "median": 101,
+          "q3": 1365,
+          "min": 42,
+          "max": 3534
+        },
+        "viewcount": {
+          "n": 49,
+          "mean": 1368500.67,
+          "sd": 1014135.9,
+          "q1": 618355,
+          "median": 1089663,
+          "q3": 1895192,
+          "min": 137041,
+          "max": 4852660
+        },
+        "likecount": {
+          "n": 49,
+          "mean": 43163.35,
+          "sd": 32693.02,
+          "q1": 17093,
+          "median": 37797,
+          "q3": 57488,
+          "min": 3610,
+          "max": 149893
+        }
+      },
+      "languages": [
+        {
+          "lang": "en",
+          "total": 49,
+          "automatic": 49,
+          "manual": 0
+        }
+      ],
+      "months": [
+        {
+          "month": "2026-04",
+          "videotypes": {
+            "regular": 3,
+            "shorts": 5,
+            "livestreams": 0,
+            "unknown": 0
+          },
+          "durationhistogram": [
+            0,
+            5,
+            0,
+            0,
+            0,
+            2,
+            1,
+            0
+          ],
+          "unknowndurationcount": 0,
+          "distributions": {
+            "duration": {
+              "n": 8,
+              "mean": 935.75,
+              "sd": 1225.44,
+              "q1": 62.75,
+              "median": 93,
+              "q3": 1682.5,
+              "min": 61,
+              "max": 3534
+            },
+            "viewcount": {
+              "n": 8,
+              "mean": 1971244.38,
+              "sd": 665865.73,
+              "q1": 1755644.25,
+              "median": 1952123,
+              "q3": 2279768.5,
+              "min": 794998,
+              "max": 3191424
+            },
+            "likecount": {
+              "n": 8,
+              "mean": 67372.75,
+              "sd": 35240.84,
+              "q1": 52446.75,
+              "median": 63334,
+              "q3": 83203.75,
+              "min": 16312,
+              "max": 139012
+            }
+          },
+          "languages": [
+            {
+              "lang": "en",
+              "total": 8,
+              "automatic": 8,
+              "manual": 0
+            }
+          ]
+        },
+        {
+          "month": "2026-05",
+          "videotypes": {
+            "regular": 2,
+            "shorts": 5,
+            "livestreams": 0,
+            "unknown": 0
+          },
+          "durationhistogram": [
+            0,
+            3,
+            2,
+            0,
+            0,
+            2,
+            0,
+            0
+          ],
+          "unknowndurationcount": 0,
+          "distributions": {
+            "duration": {
+              "n": 7,
+              "mean": 515.86,
+              "sd": 660.36,
+              "q1": 89.5,
+              "median": 127,
+              "q3": 719,
+              "min": 73,
+              "max": 1794
+            },
+            "viewcount": {
+              "n": 7,
+              "mean": 825038.43,
+              "sd": 437456.39,
+              "q1": 513210.5,
+              "median": 701707,
+              "q3": 1138799,
+              "min": 262619,
+              "max": 1506924
+            },
+            "likecount": {
+              "n": 7,
+              "mean": 26874,
+              "sd": 16946.68,
+              "q1": 12840.5,
+              "median": 18880,
+              "q3": 41943,
+              "min": 7515,
+              "max": 52156
+            }
+          },
+          "languages": [
+            {
+              "lang": "en",
+              "total": 7,
+              "automatic": 7,
+              "manual": 0
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

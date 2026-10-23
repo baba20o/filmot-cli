@@ -328,10 +328,178 @@ def _validate_get_videos(endpoint: str, payload: Any) -> None:
     _validate_video_record(endpoint, response, "$")
 
 
+_NUMBER: Tuple[ExpectedType, str] = ((int, float), "number")
+_TEXT: Tuple[ExpectedType, str] = (str, "string")
+
+# /getchannels fields and groups the CLI displays. Absent or null is fine (the
+# API omits ``username`` without a legacy name, and groups appear only when
+# requested); any other type is drift.
+_OPTIONAL_CHANNEL_FIELDS: dict[str, Tuple[ExpectedType, str]] = {
+    **{
+        field: _TEXT
+        for field in (
+            "name", "username", "handle", "thumbnailurl", "country", "description",
+            "biography", "joindate", "fetcheddate", "updatedate", "firstvideodate",
+            "lastvideodate",
+        )
+    },
+    "subcount": (int, "int"),
+    "totalviewcount": (int, "int"),
+    "isofficialartist": ((bool, int), "bool or int"),
+    "isverified": ((bool, int), "bool or int"),
+    "isjoinable": ((bool, int), "bool or int"),
+    "counts": (Mapping, "object"),
+    "growth": (Mapping, "object"),
+    "channelchanges": (Mapping, "object"),
+    "subscribergrowth": (list, "array"),
+    "wordcloud": (list, "array"),
+    "videostats": (Mapping, "object"),
+}
+
+
+def _optional_fields(
+    endpoint: str,
+    path: str,
+    value: Mapping[str, Any],
+    fields: Mapping[str, Tuple[ExpectedType, str]],
+) -> None:
+    """Type-check the listed fields that are present and not null."""
+    for field, (expected_type, label) in fields.items():
+        if value.get(field) is not None:
+            _expect_field(endpoint, path, value, field, expected_type, label)
+
+
+# Keys the CLI reads inside /getchannels groups. Other keys are additions and
+# pass unchecked, like unknown fields anywhere else.
+_RECENT_UPLOAD_WINDOWS = ("15d", "30d", "60d", "180d", "360d")
+_GROWTH_METRICS = ("totalviewcount", "subcount")
+_GROWTH_WINDOWS = ("28d", "90d", "180d", "365d")
+_VIDEO_TYPES = ("regular", "shorts", "livestreams", "unknown")
+_DISTRIBUTION_MEASURES = ("duration", "viewcount", "likecount")
+_SUMMARY_FIELDS = ("n", "mean", "sd", "q1", "median", "q3", "min", "max")
+_HISTORY_FIELDS = ("name", "country", "description", "handle")
+
+
+def _numbers(endpoint: str, path: str, value: Any, fields: Sequence[str]) -> None:
+    """An object whose listed fields, when present and not null, are numbers."""
+    mapping = _expect_mapping(endpoint, path, value)
+    _optional_fields(endpoint, path, mapping, {field: _NUMBER for field in fields})
+
+
+def _validate_video_stats(endpoint: str, path: str, value: Any) -> None:
+    """``videostats`` and each of its ``months`` share one shape."""
+    stats = _expect_mapping(endpoint, path, value)
+    _optional_fields(endpoint, path, stats, {
+        "month": _TEXT,
+        "startdate": _TEXT,
+        "enddate": _TEXT,
+        "analyzedvideos": _NUMBER,
+        "unknowndurationcount": _NUMBER,
+        "durationhistogram": (list, "array"),
+        "durationhistogramedgessec": (list, "array"),
+        "languages": (list, "array"),
+        "months": (list, "array"),
+    })
+    for key in ("durationhistogram", "durationhistogramedgessec"):
+        for index, item in enumerate(stats.get(key) or []):
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                _fail(endpoint, "{}.{}[{}]".format(path, key, index), "number", item)
+    if stats.get("videotypes") is not None:
+        _numbers(endpoint, path + ".videotypes", stats["videotypes"], _VIDEO_TYPES)
+    if stats.get("distributions") is not None:
+        distributions = _expect_mapping(endpoint, path + ".distributions", stats["distributions"])
+        for measure in _DISTRIBUTION_MEASURES:
+            if distributions.get(measure) is not None:
+                _numbers(
+                    endpoint, "{}.distributions.{}".format(path, measure),
+                    distributions[measure], _SUMMARY_FIELDS,
+                )
+    for index, language in enumerate(stats.get("languages") or []):
+        language_path = "{}.languages[{}]".format(path, index)
+        entry = _expect_mapping(endpoint, language_path, language)
+        _expect_field(endpoint, language_path, entry, "lang", str)
+        _optional_fields(endpoint, language_path, entry, {
+            "total": _NUMBER, "automatic": _NUMBER, "manual": _NUMBER,
+        })
+    for index, month in enumerate(stats.get("months") or []):
+        _validate_video_stats(endpoint, "{}.months[{}]".format(path, index), month)
+
+
+def _validate_channel_record(endpoint: str, value: Any, path: str) -> None:
+    channel = _expect_mapping(endpoint, path, value)
+    _expect_field(endpoint, path, channel, "channelid", str)
+    _optional_fields(endpoint, path, channel, _OPTIONAL_CHANNEL_FIELDS)
+    counts = channel.get("counts")
+    if counts is not None:
+        _optional_fields(endpoint, path + ".counts", counts, {
+            "indexedvideos": _NUMBER, "partialdatavideos": _NUMBER,
+        })
+        if counts.get("recentuploads") is not None:
+            _numbers(
+                endpoint, path + ".counts.recentuploads", counts["recentuploads"],
+                _RECENT_UPLOAD_WINDOWS,
+            )
+    growth = channel.get("growth") or {}
+    for metric in _GROWTH_METRICS:
+        if growth.get(metric) is None:
+            continue
+        metric_path = "{}.growth.{}".format(path, metric)
+        windows = _expect_mapping(endpoint, metric_path, growth[metric])
+        for window in _GROWTH_WINDOWS:
+            change = windows.get(window)
+            if change is None:
+                continue
+            window_path = "{}.{}".format(metric_path, window)
+            _optional_fields(endpoint, window_path, _expect_mapping(endpoint, window_path, change), {
+                "startdate": _TEXT,
+                "enddate": _TEXT,
+                "actualdays": _NUMBER,
+                "startcount": _NUMBER,
+                "endcount": _NUMBER,
+                "delta": _NUMBER,
+                "normalizeddelta": _NUMBER,
+            })
+    for index, point in enumerate(channel.get("subscribergrowth") or []):
+        point_path = "{}.subscribergrowth[{}]".format(path, index)
+        point = _expect_mapping(endpoint, point_path, point)
+        _expect_field(endpoint, point_path, point, "d", str)
+        _expect_field(endpoint, point_path, point, "s", *_NUMBER)
+    for index, term in enumerate(channel.get("wordcloud") or []):
+        term_path = "{}.wordcloud[{}]".format(path, index)
+        term = _expect_mapping(endpoint, term_path, term)
+        _expect_field(endpoint, term_path, term, "text", str)
+        _expect_field(endpoint, term_path, term, "weight", *_NUMBER)
+    for field, changes in (channel.get("channelchanges") or {}).items():
+        # The CLI lists every array here; a non-array addition is skipped.
+        if changes is None or (field not in _HISTORY_FIELDS and not _is_sequence(changes)):
+            continue
+        field_path = "{}.channelchanges.{}".format(path, field)
+        for index, change in enumerate(_expect_list(endpoint, field_path, changes)):
+            change_path = "{}[{}]".format(field_path, index)
+            _optional_fields(endpoint, change_path, _expect_mapping(endpoint, change_path, change), {
+                "val": _TEXT, "dstart": _TEXT, "dend": _TEXT,
+            })
+    if channel.get("videostats") is not None:
+        _validate_video_stats(endpoint, path + ".videostats", channel["videostats"])
+
+
+def _validate_get_channels(endpoint: str, payload: Any) -> None:
+    if not _is_sequence(payload):
+        response = _expect_mapping(endpoint, "$", payload)
+        if _validate_error_response(endpoint, response):
+            return
+        _fail(endpoint, "$", "array", payload)
+    for index, value in enumerate(payload):
+        _validate_channel_record(endpoint, value, "$[{}]".format(index))
+
+
 _VALIDATORS: dict[str, Callable[[str, Any], None]] = {
     "getsearchsubtitles": _validate_search_subtitles,
     "getsearchchannels": _validate_search_channels,
     "getvideos": _validate_get_videos,
+    "getchannels": _validate_get_channels,
+    # Channel listings carry /getvideos records.
+    "getchannelvideos": _validate_get_videos,
 }
 
 

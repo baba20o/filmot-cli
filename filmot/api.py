@@ -580,6 +580,80 @@ class FilmotClient:
             params["lang"] = lang
         return self.get("/getvideos", params=params)
 
+    def get_channels(
+        self,
+        channel_ids: Any,
+        columns: Optional[Any] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_archive: bool = False,
+    ) -> Any:
+        """
+        Get channel profiles, counts, and optional analytics (direct API only).
+
+        Args:
+            channel_ids: Up to 20 UC channel IDs, as a list or comma-separated string
+            columns: Optional fields and groups, as a list or comma-separated
+                string. Profile, growth, and word-cloud requests cost 1 credit;
+                ``channelchanges`` or video statistics cost 3.
+            start_date: Inclusive ``YYYY-MM-DD`` start of the video-statistics
+                upload range and the subscriber series
+            end_date: Inclusive ``YYYY-MM-DD`` end of those ranges
+            include_archive: Also consider archived videos in video statistics
+
+        Returns:
+            One record per known channel, in request order
+        """
+        params = {
+            "channelID": channel_ids if isinstance(channel_ids, str) else ",".join(channel_ids),
+        }
+        if columns:
+            params["columns"] = columns if isinstance(columns, str) else ",".join(columns)
+        if start_date:
+            params["startDate"] = start_date
+        if end_date:
+            params["endDate"] = end_date
+        if include_archive:
+            params["includeArchive"] = "true"
+        return self.get("/getchannels", params=params)
+
+    def get_channel_videos(
+        self,
+        channel_ids: Any,
+        count_per_channel: Optional[int] = None,
+        page: Optional[int] = None,
+        only_with_subtitles: bool = False,
+        columns: Optional[Any] = None,
+    ) -> Any:
+        """
+        Get channels' indexed videos, newest first (direct API only; 3 credits).
+
+        Args:
+            channel_ids: Up to 10 UC channel IDs, as a list or comma-separated string
+            count_per_channel: Videos per channel per page; channels times this
+                may not exceed 200
+            page: One-based page, applied to each channel independently; a
+                page past the end returns no videos
+            only_with_subtitles: Return only videos known to have subtitles
+            columns: Optional extra fields, as a list or comma-separated string
+                (the ``/getvideos`` fields, e.g. ``VIDEO_METADATA_COLUMNS``)
+
+        Returns:
+            Video records in ``/getvideos`` shape
+        """
+        params = {
+            "channelID": channel_ids if isinstance(channel_ids, str) else ",".join(channel_ids),
+        }
+        if count_per_channel is not None:
+            params["countPerChannel"] = count_per_channel
+        if page is not None:
+            params["page"] = page
+        if only_with_subtitles:
+            params["onlyWithSubtitles"] = "true"
+        if columns:
+            params["columns"] = columns if isinstance(columns, str) else ",".join(columns)
+        return self.get("/getchannelvideos", params=params)
+
     def search_subtitles(
         self,
         query: str,

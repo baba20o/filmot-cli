@@ -1,0 +1,30 @@
+[
+  {
+    "channelid": "recorded-channel-001",
+    "name": "Recorded channel 001",
+    "handle": "@recorded-channel-001",
+    "thumbnailurl": "https://example.invalid/resource",
+    "country": "Recorded country",
+    "subcount": 21400000,
+    "totalviewcount": 4682429691,
+    "joindate": "2010-07-21",
+    "fetcheddate": "2018-11-23",
+    "updatedate": "2026-10-21",
+    "firstvideodate": "2010-08-15",
+    "lastvideodate": "2026-10-15",
+    "isofficialartist": false,
+    "isverified": true,
+    "isjoinable": false,
+    "counts": {
+      "indexedvideos": 582,
+      "partialdatavideos": 75,
+      "recentuploads": {
+        "15d": 3,
+        "30d": 6,
+        "60d": 13,
+        "180d": 43,
+        "360d": 80
+      }
+    }
+  }
+]

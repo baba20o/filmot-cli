@@ -65,6 +65,23 @@ recorded in `docs/FIELD_TEST_LOG.md`.
   Retry-After wait, or provider failover starts past the deadline. The
   deadline is fixed when created, so setup and cache lookups count against it,
   and `Deadline.cancel()` ends it early.
+- `channel` shows Filmot's profile for up to 20 channels (`/getchannels`):
+  identity, subscribers, total views, indexed-video range, and recent uploads,
+  for 1 direct credit. `--about`, `--growth`, and `--words` add the description,
+  28- to 365-day growth with the subscriber series, and caption terms at the
+  same price. `--history`, `--stats`, and `--monthly` add previous profile
+  values, video statistics, and monthly breakdowns for 3 credits. `--since`,
+  `--until`, and `--include-archive` refine statistics and are refused when no
+  selected group uses them.
+- `channel-videos` lists up to 10 channels' videos from Filmot's index, newest
+  first (`/getchannelvideos`, 3 credits per page), including videos YouTube has
+  removed. `--count`, `--page`, `--pages`, and `--with-subtitles` control the
+  listing; paging stops at the first empty page, and raw output reports
+  `exhausted` and `next_page`. Its raw `videos` array pipes into `download`.
+- Both commands take UC IDs, `@handles`, or canonical channel URLs. A handle
+  costs one channel search and resolves only on an exact handle match.
+- `FilmotClient.get_channels()` and `get_channel_videos()`, with runtime
+  response contracts and sanitized recorded fixtures for both endpoints.
 - `docs/YOUTUBE_ROADMAP.md`, a durable ranked queue for future public read surfaces,
   OAuth/policy gates, and the admission checklist for each new YouTube slice.
 - Named search-session routing through `--session` and `FILMOT_SESSION`, with
