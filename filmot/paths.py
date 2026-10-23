@@ -17,14 +17,20 @@ import uuid
 from pathlib import Path
 from typing import Optional, Union
 
+from .environment import expand_trusted
+
 
 PathInput = Optional[Union[str, os.PathLike]]
 APP_NAME = "filmot"
 
 
 def _absolute(path: Union[str, os.PathLike], *, base: Optional[Path] = None) -> Path:
-    """Return an expanded absolute path without requiring it to exist."""
-    expanded = Path(os.path.expandvars(str(path))).expanduser()
+    """Return an expanded absolute path without requiring it to exist.
+
+    Variables expand only from the trusted environment, never from names a
+    project .env added (see ``filmot.environment``).
+    """
+    expanded = Path(expand_trusted(str(path))).expanduser()
     if not expanded.is_absolute():
         expanded = (base or Path.cwd()) / expanded
     return expanded.resolve(strict=False)

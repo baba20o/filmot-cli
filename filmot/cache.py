@@ -2,11 +2,18 @@
 
 import json
 import hashlib
+import re
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from .paths import user_cache_dir
+
+
+# Entries are named by an MD5 hex digest. FILMOT_CACHE_DIR may hold other
+# files, so JSON named any other way is never read or deleted.
+_ENTRY_NAME = re.compile(r"[0-9a-f]{32}\.json")
+_LATEST_TIMESTAMP = 1e11  # seconds; about the year 5138
 
 
 class Cache:
@@ -25,20 +32,34 @@ class Cache:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._auto_purge()
     
+    def _entries(self) -> List[Path]:
+        """Files this cache wrote. Anything else in the directory is left alone."""
+        return [
+            path for path in self.cache_dir.glob("*.json") if _ENTRY_NAME.fullmatch(path.name)
+        ]
+
+    @staticmethod
+    def _read_entry(path: Path) -> Optional[Dict[str, Any]]:
+        """The entry stored at ``path``, or None when unreadable or not an entry."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                cached = json.load(f)
+        except (ValueError, OSError):
+            return None
+        timestamp = cached.get("timestamp") if isinstance(cached, dict) else None
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            return None
+        # A plausible write time; NaN, infinities, and absurd values fail.
+        if not 0 <= timestamp < _LATEST_TIMESTAMP:
+            return None
+        return cached if "data" in cached else None
+
+    def _expired(self, cached: Optional[Dict[str, Any]], now: float) -> bool:
+        return cached is None or now - cached["timestamp"] > self.ttl
+
     def _auto_purge(self) -> None:
-        """Silently remove expired entries on startup to prevent unbounded growth."""
-        current_time = time.time()
-        for cache_file in self.cache_dir.glob("*.json"):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cached = json.load(f)
-                if current_time - cached.get("timestamp", 0) > self.ttl:
-                    cache_file.unlink()
-            except (json.JSONDecodeError, IOError, OSError):
-                try:
-                    cache_file.unlink()
-                except OSError:
-                    pass
+        """Silently remove expired or corrupt entries to prevent unbounded growth."""
+        self.clear_expired()
 
     def _get_cache_key(
         self,
@@ -82,19 +103,17 @@ class Cache:
         
         if not cache_path.exists():
             return None
-        
-        try:
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                cached = json.load(f)
-            
-            # Check if cache is still valid
-            if time.time() - cached.get("timestamp", 0) > self.ttl:
-                cache_path.unlink()  # Delete expired cache
-                return None
-            
-            return cached.get("data")
-        except (json.JSONDecodeError, IOError):
+
+        cached = self._read_entry(cache_path)
+        if cached is None:
             return None
+        if self._expired(cached, time.time()):
+            try:
+                cache_path.unlink()  # Delete expired cache
+            except OSError:
+                pass
+            return None
+        return cached.get("data")
     
     def set(
         self,
@@ -138,40 +157,30 @@ class Cache:
             Number of cache entries deleted
         """
         count = 0
-        for cache_file in self.cache_dir.glob("*.json"):
+        for cache_file in self._entries():
             try:
                 cache_file.unlink()
                 count += 1
-            except IOError:
+            except OSError:
                 pass
         return count
-    
+
     def clear_expired(self) -> int:
         """
-        Clear only expired cache entries.
-        
+        Clear expired or corrupt cache entries.
+
         Returns:
-            Number of expired entries deleted
+            Number of entries deleted
         """
         count = 0
         current_time = time.time()
-        
-        for cache_file in self.cache_dir.glob("*.json"):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cached = json.load(f)
-                
-                if current_time - cached.get("timestamp", 0) > self.ttl:
-                    cache_file.unlink()
-                    count += 1
-            except (json.JSONDecodeError, IOError):
-                # Delete corrupted cache files
+        for cache_file in self._entries():
+            if self._expired(self._read_entry(cache_file), current_time):
                 try:
                     cache_file.unlink()
                     count += 1
-                except IOError:
+                except OSError:
                     pass
-        
         return count
     
     def stats(self) -> Dict[str, Any]:
@@ -187,20 +196,16 @@ class Cache:
         size_bytes = 0
         current_time = time.time()
         
-        for cache_file in self.cache_dir.glob("*.json"):
+        for cache_file in self._entries():
             total += 1
-            size_bytes += cache_file.stat().st_size
-            
             try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cached = json.load(f)
-                
-                if current_time - cached.get("timestamp", 0) > self.ttl:
-                    expired += 1
-                else:
-                    valid += 1
-            except (json.JSONDecodeError, IOError):
+                size_bytes += cache_file.stat().st_size
+            except OSError:
+                pass
+            if self._expired(self._read_entry(cache_file), current_time):
                 expired += 1
+            else:
+                valid += 1
         
         return {
             "total_entries": total,

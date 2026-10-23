@@ -1084,7 +1084,8 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
     \b
       Use --fallback to auto-transcribe when YouTube captions are unavailable.
-      Requires: yt-dlp, boto3, AWS profile 'APIBoss' with Transcribe access.
+      Requires: yt-dlp, boto3, and FILMOT_S3_BUCKET (an S3 bucket you control);
+      FILMOT_AWS_PROFILE and FILMOT_AWS_REGION are optional.
       Flow: Download audio → Upload S3 → Transcribe → Cleanup
 
     Examples:

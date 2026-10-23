@@ -17,6 +17,45 @@ import time
 from typing import Any, Dict, Iterable, Optional, Sequence
 
 
+# The directory holding the filmot package, whether installed or a checkout.
+_PACKAGE_ROOT = str(Path(__file__).resolve().parent.parent)
+# The worker must never import from the directory Filmot runs in, where a
+# planted json.py (say) would shadow the real module. So it starts with -s and
+# without PYTHONPATH, which keeps that directory out of startup imports such
+# as sitecustomize, and its first statement replaces sys.path (``python -c``
+# puts the working directory there) with this process's import path minus
+# the working directory, passed on the command line. It then loads filmot
+# from _PACKAGE_ROOT alone: a checkout run from its own root is missing from
+# that path, and another installed Filmot must not stand in for it.
+_BOOTSTRAP = (
+    "import sys; module, root, *path = sys.argv[1:]; sys.path[:] = path; "
+    "del sys.argv[1:]; import importlib.machinery, importlib.util, runpy; "
+    "spec = importlib.machinery.PathFinder.find_spec('filmot', [root]); "
+    "sys.modules['filmot'] = package = importlib.util.module_from_spec(spec); "
+    "spec.loader.exec_module(package); "
+    "runpy.run_module(module, run_name='__main__', alter_sys=True)"
+)
+
+
+def _canonical(path: str) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _worker_sys_path() -> list:
+    """This process's import path, minus anything naming the working directory.
+
+    Relative entries go, and so do absolute ones resolving to the current
+    directory (``-m`` puts it first; a PYTHONPATH of "." adds it). The
+    bootstrap finds filmot itself through _PACKAGE_ROOT.
+    """
+    working_directory = _canonical(os.getcwd())
+    entries = [
+        entry for entry in sys.path
+        if entry and os.path.isabs(entry) and _canonical(entry) != working_directory
+    ]
+    return list(dict.fromkeys(entries))
+
+
 class IsolatedWorkerError(RuntimeError):
     """Base class for failures supervising an isolated worker."""
 
@@ -94,8 +133,9 @@ def run_json_worker(
     """Run one Python worker and return its single JSON-object response.
 
     ``command`` is an internal test seam. Production callers pass a module
-    name, which is launched as ``sys.executable -m <module>``. Sensitive
-    values belong only in ``payload`` and are sent over stdin.
+    name, which ``_BOOTSTRAP`` runs without the working directory on
+    sys.path. Sensitive values belong only in ``payload`` and are sent over
+    stdin.
     """
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero")
@@ -103,7 +143,9 @@ def run_json_worker(
     worker_command = (
         [str(part) for part in command]
         if command is not None
-        else [sys.executable, "-m", module]
+        else [
+            sys.executable, "-s", "-c", _BOOTSTRAP, module, _PACKAGE_ROOT, *_worker_sys_path(),
+        ]
     )
     encoded_payload = json.dumps(
         payload,
@@ -112,14 +154,10 @@ def run_json_worker(
     ).encode("utf-8")
     secret_values = tuple(str(secret) for secret in secrets if secret)
     deadline = time.monotonic() + timeout_seconds
-    worker_environment = os.environ.copy()
-    package_root = str(Path(__file__).resolve().parent.parent)
-    existing_python_path = worker_environment.get("PYTHONPATH")
-    worker_environment["PYTHONPATH"] = (
-        package_root
-        if not existing_python_path
-        else package_root + os.pathsep + existing_python_path
-    )
+    # The worker gets its import path on the command line instead.
+    worker_environment = {
+        name: value for name, value in os.environ.items() if name.upper() != "PYTHONPATH"
+    }
 
     try:
         process = subprocess.Popen(

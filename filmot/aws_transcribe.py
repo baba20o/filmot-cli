@@ -10,6 +10,8 @@ import requests
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Tuple, Optional
+
+from .environment import env_number
 import json
 
 try:
@@ -18,10 +20,14 @@ try:
 except ImportError:
     HAS_BOTO3 = False
 
-# AWS configuration
-AWS_PROFILE_NAME = 'APIBoss'
-AWS_REGION_NAME = 'us-east-1'
-S3_BUCKET_NAME = 'gpttransscripts'
+# AWS settings. There is deliberately no default bucket: S3 bucket names are
+# global, so a built-in name would send other users' audio to whoever owns it.
+AWS_PROFILE_ENV = "FILMOT_AWS_PROFILE"
+AWS_REGION_ENV = "FILMOT_AWS_REGION"
+S3_BUCKET_ENV = "FILMOT_S3_BUCKET"
+DEFAULT_AWS_REGION = "us-east-1"
+# Connect and read seconds for downloading the finished transcript.
+TRANSCRIPT_FETCH_TIMEOUT = (10, 60)
 _PROXY_ENV_VARS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -141,7 +147,7 @@ def download_audio(video_id: str, output_dir: Optional[str] = None) -> str:
         mode = "auto"
 
     if pool is not None and mode in {"auto", "proxy-only"}:
-        retry_limit = int(os.environ.get("FILMOT_PROXY_RETRY_LIMIT", "3"))
+        retry_limit = env_number("FILMOT_PROXY_RETRY_LIMIT", 3, minimum=1)
         attempted_ids: set[str] = set()
         for _ in range(retry_limit):
             try:
@@ -387,7 +393,7 @@ def fetch_transcript_text(transcript_uri: str) -> str:
     Returns:
         Transcript text
     """
-    response = requests.get(transcript_uri)
+    response = requests.get(transcript_uri, timeout=TRANSCRIPT_FETCH_TIMEOUT)
     response.raise_for_status()
     data = response.json()
     return data['results']['transcripts'][0]['transcript']
@@ -426,30 +432,41 @@ def transcribe_video(
     cleanup: bool = True,
     progress_callback=None,
     audio_dir: Optional[str] = None,
-    aws_profile: str = AWS_PROFILE_NAME,
-    aws_region: str = AWS_REGION_NAME,
-    s3_bucket: str = S3_BUCKET_NAME,
+    aws_profile: Optional[str] = None,
+    aws_region: Optional[str] = None,
+    s3_bucket: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """Transcribe a YouTube video using AWS Transcribe.
-    
+
     This is the main entry point for AWS fallback transcription.
-    
+
     Args:
         video_id: YouTube video ID
         identify_language: Auto-detect language (True) or use en-US (False)
         cleanup: Clean up temporary files and AWS job after completion
         progress_callback: Optional callback function(stage, message)
         audio_dir: Directory for temporary audio files
-        aws_profile: AWS profile name
-        aws_region: AWS region
-        s3_bucket: S3 bucket for audio storage
-    
+        aws_profile: AWS profile name; defaults to FILMOT_AWS_PROFILE, then
+            boto3's default credentials
+        aws_region: AWS region; defaults to FILMOT_AWS_REGION, then us-east-1
+        s3_bucket: S3 bucket for audio storage; defaults to FILMOT_S3_BUCKET,
+            and one of the two is required
+
     Returns:
         Tuple of (transcript_text, detected_language or None)
-        
+
     Raises:
-        AWSTranscribeError: If transcription fails
+        AWSTranscribeError: If transcription fails, or before any audio is
+            downloaded when no bucket is configured
     """
+    s3_bucket = s3_bucket or os.environ.get(S3_BUCKET_ENV, "").strip()
+    if not s3_bucket:
+        raise AWSTranscribeError(
+            "The AWS Transcribe fallback needs an S3 bucket you control: set {} "
+            "(and optionally {} and {}).".format(S3_BUCKET_ENV, AWS_PROFILE_ENV, AWS_REGION_ENV)
+        )
+    aws_profile = aws_profile or os.environ.get(AWS_PROFILE_ENV, "").strip() or None
+    aws_region = aws_region or os.environ.get(AWS_REGION_ENV, "").strip() or DEFAULT_AWS_REGION
     # Check dependencies
     deps_ok, deps_msg = check_dependencies()
     if not deps_ok:

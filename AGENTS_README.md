@@ -1591,7 +1591,10 @@ Use AWS Transcribe fallback:
 ```bash
 filmot transcript VIDEO_ID --fallback --full
 ```
-Requires: `yt-dlp`, `boto3`, `requests`, and AWS profile `APIBoss` configured.
+Requires `yt-dlp`, `boto3`, and `requests`, plus `FILMOT_S3_BUCKET` (an S3 bucket
+you control; there is no default). `FILMOT_AWS_PROFILE` (default: boto3's
+default credentials) and `FILMOT_AWS_REGION` (default `us-east-1`) are
+optional. Without a bucket the fallback fails before downloading audio.
 
 ### Filmot API providers, credits, and failover
 
@@ -1607,10 +1610,14 @@ provider with `filmot --api-provider direct|rapidapi COMMAND ...` or
 non-https base URL or a malformed host stops the command before any request,
 with a `ProviderConfigurationError`. A
 project `.env` also cannot set the per-user config location or TLS trust
-variables, and its `${VAR}` references are not expanded. These limits cover
-configuration loading only. Treat any other project `.env` setting, proxies
-included, as trusted configuration. The transcript helper process also starts
-Python from the current directory, so run Filmot only in directories you trust.
+variables, and its `${VAR}` references are not expanded. It cannot set
+`PYTHON*` variables either. Path settings (`WEBSHARE_SESSION_FILE`,
+`FILMOT_RATE_LIMIT_DB`, `FILMOT_DATA_DIR`, and the like) never expand variable
+names a project `.env` added; Filmot records those in `FILMOT_PROJECT_ENV_NAMES`
+for child processes. The transcript helper process starts without the current
+directory on its import path. Treat any other project `.env` setting, proxies
+included, as trusted configuration, and run Filmot only in directories you
+trust.
 
 Budget direct credits deliberately. They come from a monthly allowance. An
 unscoped subtitle-search page costs 5 credits, but only 1 when `--channel-id`

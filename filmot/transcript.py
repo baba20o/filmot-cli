@@ -18,6 +18,7 @@ import os
 import time
 import requests
 
+from .environment import env_number
 from ._process import (
     IsolatedWorkerProtocolError,
     IsolatedWorkerTimeout,
@@ -30,7 +31,7 @@ from .proxy_pool import (
 )
 
 # Default number of pool sessions to try on transport-class failures.
-_POOL_RETRY_LIMIT = int(os.getenv("FILMOT_PROXY_RETRY_LIMIT", "4"))
+_POOL_RETRY_LIMIT = env_number("FILMOT_PROXY_RETRY_LIMIT", 4, minimum=1)
 
 # Every individual HTTP operation gets a connect/read deadline, and every
 # complete route attempt gets a wall-clock budget. The route budget matters
@@ -1599,7 +1600,8 @@ def get_transcript_with_fallback(
     5. Fetch result and cleanup
     
     Requires:
-    - AWS credentials configured (profile 'APIBoss')
+    - FILMOT_S3_BUCKET set, and AWS credentials (FILMOT_AWS_PROFILE, or
+      boto3's defaults) with S3 and Transcribe access
     - yt-dlp installed
     - boto3 and requests packages
     

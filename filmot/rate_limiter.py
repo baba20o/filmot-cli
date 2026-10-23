@@ -4,6 +4,7 @@ Supports both in-process and cross-process rate limiting via SQLite.
 """
 
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 from collections import deque
 
+from .environment import expand_trusted
 from .paths import user_state_dir
 
 logger = logging.getLogger(__name__)
@@ -21,7 +23,7 @@ def _default_shared_db() -> Path:
     """Return the current per-user cross-process rate-limit database."""
     configured = os.environ.get("FILMOT_RATE_LIMIT_DB")
     if configured:
-        path = Path(os.path.expandvars(configured)).expanduser()
+        path = Path(expand_trusted(configured)).expanduser()
         if not path.is_absolute():
             path = Path.cwd() / path
         return path.resolve(strict=False)
@@ -134,6 +136,7 @@ class SharedRateLimiter(RateLimiter):
         self.consecutive_errors = 0
         self.backoff_factor = 1.0
         self.max_backoff = 10.0
+        self._reservations = 0
         self._db_available = self._init_db()
 
     def _init_db(self) -> bool:
@@ -155,6 +158,9 @@ class SharedRateLimiter(RateLimiter):
                 ON request_log (timestamp)
             """)
             conn.commit()
+            # A CLI process makes a handful of requests, so prune at startup
+            # rather than waiting for a periodic cleanup that never comes.
+            self._cleanup_old(conn)
             conn.close()
             logger.debug("Shared rate limiter DB ready: %s", self.db_path)
             return True
@@ -162,29 +168,50 @@ class SharedRateLimiter(RateLimiter):
             logger.warning("Shared rate limiter DB unavailable (%s) — falling back to in-memory", e)
             return False
 
-    def _count_recent_requests(self, conn: sqlite3.Connection, window: float) -> int:
-        """Count requests from all processes within the sliding window."""
-        cutoff = time.time() - window
-        row = conn.execute(
-            "SELECT COUNT(*) FROM request_log WHERE timestamp > ?", (cutoff,)
-        ).fetchone()
-        return row[0] if row else 0
+    def _reserve(self, conn: sqlite3.Connection) -> float:
+        """Record this request's slot and return how long to wait for it.
 
-    def _get_oldest_in_window(self, conn: sqlite3.Connection, window: float) -> Optional[float]:
-        """Get the oldest request timestamp within the window."""
-        cutoff = time.time() - window
-        row = conn.execute(
-            "SELECT MIN(timestamp) FROM request_log WHERE timestamp > ?", (cutoff,)
-        ).fetchone()
-        return row[0] if row and row[0] is not None else None
-
-    def _record_request(self, conn: sqlite3.Connection):
-        """Record a request from this process."""
+        A slot is when the request will be sent, possibly in the future, so
+        the next process waits behind it rather than measuring from now. It
+        comes at least ``min_interval`` after the latest slot (any process)
+        and late enough that the one-second window ending at it holds fewer
+        than ``burst_size`` slots, which keeps queued slots from bursting.
+        """
+        now = time.time()
+        window = 1.0
+        self._reservations += 1
+        if self._reservations % 20 == 0:
+            # Long-running processes prune as they go, inside this transaction.
+            conn.execute("DELETE FROM request_log WHERE timestamp < ?", (now - 60.0,))
+        slot = now
+        row = conn.execute("SELECT MAX(timestamp) FROM request_log").fetchone()
+        if row and row[0] is not None:
+            slot = max(slot, row[0] + self.min_interval)
+        # Apply backoff if we've been hitting 429s
+        with self.lock:
+            if self.backoff_factor > 1.0:
+                slot += (self.backoff_factor - 1.0) * self.min_interval
+        while True:
+            in_window = conn.execute(
+                "SELECT timestamp FROM request_log WHERE timestamp > ? AND timestamp <= ? "
+                "ORDER BY timestamp",
+                (slot - window, slot),
+            ).fetchall()
+            if len(in_window) < self.burst_size:
+                break
+            # Wait until enough of the oldest slots have left the window.
+            oldest = in_window[len(in_window) - self.burst_size][0]
+            later = oldest + window
+            while later - window < oldest:
+                # Rounding can leave the oldest inside the window, and the
+                # loop would never advance; step to the next float instead.
+                later = math.nextafter(later, math.inf)
+            slot = max(slot, later)
         conn.execute(
             "INSERT INTO request_log (timestamp, pid) VALUES (?, ?)",
-            (time.time(), os.getpid()),
+            (slot, os.getpid()),
         )
-        conn.commit()
+        return max(0.0, slot - now)
 
     def _cleanup_old(self, conn: sqlite3.Connection):
         """Remove entries older than 60 seconds to keep the table small."""
@@ -196,61 +223,29 @@ class SharedRateLimiter(RateLimiter):
         if not self._db_available:
             return super().acquire()
 
-        wait_time = 0.0
         try:
-            conn = sqlite3.connect(str(self.db_path), timeout=5)
-            conn.execute("PRAGMA busy_timeout=5000")
-
-            # Check how many requests are in the current 1-second window
-            window = 1.0
-            recent = self._count_recent_requests(conn, window)
-
-            if recent >= self.burst_size:
-                oldest = self._get_oldest_in_window(conn, window)
-                if oldest:
-                    wait_time = (oldest + window) - time.time()
-                    if wait_time < 0:
-                        wait_time = 0
-
-            # Ensure minimum interval from most recent request (any process)
-            row = conn.execute(
-                "SELECT MAX(timestamp) FROM request_log"
-            ).fetchone()
-            if row and row[0] is not None:
-                interval_wait = (row[0] + self.min_interval) - time.time()
-                if interval_wait > wait_time:
-                    wait_time = interval_wait
-
-            # Apply backoff if we've been hitting 429s
-            with self.lock:
-                if self.backoff_factor > 1.0:
-                    extra = (self.backoff_factor - 1.0) * self.min_interval
-                    wait_time += extra
-
-            if wait_time > 0:
-                logger.debug("Shared rate limiter: waiting %.1fs (pid=%d)", wait_time, os.getpid())
-                conn.close()
-                time.sleep(wait_time)
-                conn = sqlite3.connect(str(self.db_path), timeout=5)
+            conn = sqlite3.connect(str(self.db_path), timeout=5, isolation_level=None)
+            try:
                 conn.execute("PRAGMA busy_timeout=5000")
-
-            # Record this request
-            self._record_request(conn)
-
-            # Periodic cleanup
-            with self.lock:
-                self.total_requests += 1
-                if self.total_requests % 20 == 0:
-                    self._cleanup_old(conn)
-                if wait_time > 0:
-                    self.total_waits += 1
-                    self.total_wait_time += wait_time
-
-            conn.close()
+                # Reserve under the write lock, so concurrent processes take
+                # turns computing their waits instead of bursting together.
+                conn.execute("BEGIN IMMEDIATE")
+                wait_time = self._reserve(conn)
+                conn.execute("COMMIT")
+            finally:
+                conn.close()
         except Exception as e:
             logger.warning("Shared rate limiter error (%s) — falling back to in-memory", e)
             return super().acquire()
 
+        if wait_time > 0:
+            logger.debug("Shared rate limiter: waiting %.1fs (pid=%d)", wait_time, os.getpid())
+            time.sleep(wait_time)
+        with self.lock:
+            self.total_requests += 1
+            if wait_time > 0:
+                self.total_waits += 1
+                self.total_wait_time += wait_time
         return wait_time
 
     def report_success(self):
