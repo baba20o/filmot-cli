@@ -186,6 +186,7 @@ def library():
         filmot library list prompt-injection   # List transcripts in topic
         filmot library search "attack"         # Search across all transcripts
         filmot library search "claim" --raw    # Timestamped local citations
+        filmot library read VIDEO --from 1:00 --to 2:00 # Local-only passage
         filmot library echoes prompt-injection  # Advisory full-text lineage scan
         filmot library context prompt-injection # Get all text for LLM context
         filmot library stats                   # Show library statistics
@@ -965,6 +966,126 @@ def library_list(topic: str, raw: bool):
         _emit_library_raw(outcome)
     else:
         _render_library_list(outcome)
+
+
+def _render_library_read(outcome: CommandResult) -> None:
+    """Present the same bounded passage and provenance exposed by raw output."""
+    from ..passages import passage_timestamp
+
+    data = outcome.data
+    if outcome.status_value == ResultStatus.FAILED.value:
+        for candidate in data.get("candidates", []):
+            console.print(Text("Topic: {} | {}".format(candidate["topic"], candidate["path"])))
+        if data.get("candidates_truncated"):
+            console.print("More copies exist; use filmot library list to inspect topics.")
+        console.print(Text(data["acquisition_guidance"]))
+        _render_library_failure(outcome, "Saved passage read failed")
+        return
+    saved = data["saved_copy"]
+    source = saved["source"]
+    console.print(Text("{} | topic: {} | language: {} | source: {}".format(
+        data["video_id"], data["topic"], saved["language"] or "unknown",
+        source.get("transcript_source") or "unknown",
+    )))
+    if source.get("title") or source.get("channel"):
+        console.print(Text("{} | {}".format(
+            source.get("title") or "Unknown title",
+            source.get("channel") or "Unknown channel",
+        )))
+    console.print(Text("Saved: {} | {}".format(
+        saved["saved_at"] or "unknown", saved["path"],
+    )), soft_wrap=True)
+    window = data["window"]
+    console.print(Text("Window: [{}, {}) seconds; overlapping saved segments".format(
+        window["from_seconds"], window["to_seconds"],
+    )))
+    if not data["rows"]:
+        console.print("No saved segments overlap this window.")
+    for row in data["rows"]:
+        end_time = (
+            passage_timestamp(row["end_seconds"])
+            if row["end_seconds"] is not None else "end unknown"
+        )
+        console.print(Text("[{} - {}] {}\n{}{}".format(
+            row["timestamp"], end_time, row["url"], row["text"],
+            " [text truncated]" if row["text_truncated"] else "",
+        )))
+    summary = data["summary"]
+    console.print(Text("Segments: {}/{}; text characters: {}/{}; truncated: {}".format(
+        summary["returned_segments"], summary["matching_segments"],
+        summary["returned_chars"], summary["matching_chars"],
+        "yes" if summary["truncated"] else "no",
+    )))
+    for warning in outcome.warnings:
+        console.print(Text(warning))
+
+
+@library.command("read")
+@click.argument("video")
+@click.option("--topic", default=None, help="Select an exact saved topic copy; required when copies exist in multiple topics")
+@click.option("--from", "from_time", required=True, help="Window start: seconds, M:SS, or H:MM:SS (inclusive)")
+@click.option("--to", "to_time", required=True, help="Window end in the same formats (exclusive)")
+@click.option("--max-chars", type=click.IntRange(1, 100000), default=6000, show_default=True, help="Maximum returned transcript text characters")
+@click.option("--max-segments", type=click.IntRange(1, 1000), default=80, show_default=True, help="Maximum returned caption segments")
+@click.option("--raw", is_flag=True, help="Output one versioned JSON result with the same bounds")
+def library_read(video, topic, from_time, to_time, max_chars, max_segments, raw):
+    """Read a bounded time window from one saved transcript; never fetch.
+
+    VIDEO accepts a YouTube ID or URL. All matching topic copies are counted,
+    even identical copies; --topic selects one explicitly. Segments overlapping
+    [--from, --to) retain their saved timing and may extend beyond the window.
+    Missing durations are selected by start time. Text-only or invalid records
+    fail locally. No storage or session events are written.
+
+    To acquire a fresh copy, use filmot transcript VIDEO --save-to NEW_TOPIC.
+    Existing save targets do not refresh caption text.
+
+    \b
+        filmot library read dQw4w9WgXcQ --topic music --from 1:00 --to 2:00
+        filmot library read dQw4w9WgXcQ --from 60 --to 120 --raw
+    """
+    from ..discovery import youtube_video_id
+    from ..library import get_library
+    from ..passages import PassageReadError, parse_passage_time, read_saved_passage
+
+    guidance = (
+        "To acquire a fresh copy, use filmot transcript VIDEO --save-to NEW_TOPIC "
+        "with a new topic name. Existing save targets do not refresh caption text."
+    )
+    data = {"video": video, "topic": topic, "local_only": True, "rows": [],
+            "acquisition_guidance": guidance}
+    stage = "parse-selection"
+    try:
+        video_id = youtube_video_id(video)
+        if video_id is None:
+            raise ValueError("expected an 11-character YouTube video ID or supported URL")
+        start, end = parse_passage_time(from_time), parse_passage_time(to_time)
+        if end <= start:
+            raise ValueError("--to must be greater than --from")
+        stage = "read-saved-copy"
+        data = read_saved_passage(get_library(), video_id, start=start, end=end,
+                                  topic=topic, max_chars=max_chars, max_segments=max_segments)
+        data["acquisition_guidance"] = guidance
+        warnings = []
+        if data["summary"]["truncated"]:
+            warnings.append("Output truncated; narrow the window or raise --max-chars / --max-segments.")
+        if data["summary"]["segments_without_duration"]:
+            warnings.append("Some saved durations are unknown; those segments were selected by start time.")
+        outcome = CommandResult("library-read", ResultStatus.COMPLETED if data["rows"] else ResultStatus.EMPTY,
+                                data, warnings=warnings)
+    except Exception as error:
+        if isinstance(error, PassageReadError):
+            data.update(error.details)
+            detail = ErrorDetail(error.kind, str(error), stage=stage)
+        else:
+            detail = ErrorDetail.from_exception(error, stage=stage)
+        outcome = CommandResult.failed("library-read", data, detail)
+    if raw:
+        _emit_raw_result(outcome)
+    else:
+        _render_library_read(outcome)
+    if outcome.status_value == ResultStatus.FAILED.value:
+        raise click.exceptions.Exit(1)
 
 
 @library.command("search")

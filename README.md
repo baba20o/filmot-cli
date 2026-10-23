@@ -57,6 +57,7 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 ### Research & Analysis
 - **Compound Research** — `filmot research` orchestrates search → filter → download → summary in one command
 - **Cross-Source Concordance** — `filmot library compare` locates matching passages across saved sources
+- **Local Passage Reading** — `filmot library read` reads a bounded time window from an explicit saved copy without fetching
 - **Claim & Evidence Register** — Record atomic claims, classified citations, contradictions, and human assessments in a strict append-only store
 - **Echo Analysis** — Compare full saved transcripts for reproducible shared-phrasing and possible-lineage clusters
 - **Named Sessions** — Route follow-up searches to an investigation and derive a summary without replaying every event
@@ -1192,6 +1193,10 @@ filmot library search "dark oxygen"
 # Raw search rows include citation-ready excerpt details when timestamps exist
 filmot library search "dark oxygen" --topic deep-sea-mining --raw
 
+# Read a saved passage locally, selecting the topic copy explicitly
+filmot library read VIDEO_ID --topic deep-sea-mining --from 1:30 --to 3:00
+filmot library read VIDEO_ID --topic deep-sea-mining --from 90 --to 180 --raw
+
 # Force substring matching (catches plurals automatically via fallback)
 filmot library search "patent" --substring
 
@@ -1233,7 +1238,14 @@ filmot library delete VIDEO_ID
 filmot library delete topic-name --all
 ```
 
-`library list`, `search`, `compare`, and `stats` are read-only and never append
+`library read VIDEO --from TIME --to TIME` reads saved caption segments only;
+it never fetches on a miss or ambiguous selection. Multiple topic copies require
+`--topic`. Defaults cap returned text at 6,000 characters and 80 segments, with
+explicit truncation, provenance, language, and timing in human and raw output.
+See [Local passage reading](docs/LOCAL_PASSAGES.md) for window semantics, JSON fields,
+text-only records, and separate acquisition/refresh guidance.
+
+`library list`, `read`, `search`, `compare`, and `stats` are read-only and never append
 session events. `library context` is also read-only when it prints to stdout;
 writing context to a file, including the auto-save performed by structured
 format, logs the write. An explicit `--output` creates missing parent

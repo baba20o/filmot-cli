@@ -220,6 +220,12 @@ recorded in `docs/FIELD_TEST_LOG.md`.
   Kana, Bopomofo, and Hangul tokenization ranges.
 - Preservation of optional timestamped caption segments and normalized source
   metadata in newly saved transcript-library records.
+- `library read VIDEO --from TIME --to TIME` reads a bounded time window from
+  one saved transcript copy, with its provenance, and never fetches. Copies in
+  several topics require `--topic`, and text-only records fail with guidance.
+  Output is capped at 6,000 characters and 80 segments by default
+  (`--max-chars`, `--max-segments`), and `--raw` emits the same bounded result.
+  See [Local passage reading](docs/LOCAL_PASSAGES.md).
 
 ### Changed
 
