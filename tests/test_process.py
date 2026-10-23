@@ -1,5 +1,6 @@
 """Tests for the hard-cancellable JSON worker supervisor."""
 
+import os
 from pathlib import Path
 import sys
 from unittest.mock import patch
@@ -25,6 +26,80 @@ def test_json_worker_round_trips_unicode():
     )
 
     assert result == {"echo": "人工知能 café"}
+
+
+def test_the_real_worker_never_imports_from_the_working_directory(tmp_path, monkeypatch):
+    marker = tmp_path / "planted-module-imported.txt"
+    trap = "open({!r}, 'a').write(__name__ + '\\n')\n".format(str(marker))
+    for name in ("json.py", "runpy.py", "sitecustomize.py", "youtube_transcript_api.py"):
+        (tmp_path / name).write_text(trap, encoding="utf-8")
+    (tmp_path / "filmot").mkdir()
+    (tmp_path / "filmot" / "__init__.py").write_text(trap, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    response = run_json_worker(
+        "filmot._transcript_worker", {"protocol_version": 1}, timeout_seconds=30,
+    )
+
+    assert response["error"]["error_type"] == "WorkerRequestError"
+    assert not marker.exists(), marker.read_text(encoding="utf-8")
+
+
+def test_a_relative_or_empty_pythonpath_cannot_reach_the_working_directory(tmp_path, monkeypatch):
+    # "." and an empty component both name the working directory, and
+    # sitecustomize would run during startup, before any bootstrap code.
+    marker = tmp_path / "planted-module-imported.txt"
+    trap = "open({!r}, 'a').write(__name__ + '\\n')\n".format(str(marker))
+    for name in ("sitecustomize.py", "usercustomize.py", "json.py"):
+        (tmp_path / name).write_text(trap, encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["", ".", ""]))
+    monkeypatch.chdir(tmp_path)
+
+    response = run_json_worker(
+        "filmot._transcript_worker", {"protocol_version": 1}, timeout_seconds=30,
+    )
+
+    assert response["error"]["error_type"] == "WorkerRequestError"
+    assert not marker.exists(), marker.read_text(encoding="utf-8")
+
+
+def test_the_worker_import_path_drops_the_working_directory(tmp_path, monkeypatch):
+    from filmot import _process
+
+    elsewhere = tmp_path / "site"
+    elsewhere.mkdir()
+    monkeypatch.chdir(tmp_path)
+    working_directory = str(tmp_path)
+    if os.name == "nt":
+        working_directory = working_directory.upper()  # same directory, other case
+    monkeypatch.setattr(sys, "path", ["", ".", "relative", working_directory, str(elsewhere)])
+
+    path = _process._worker_sys_path()
+
+    assert path == [str(elsewhere)]
+
+
+def test_a_checkout_run_from_its_root_never_runs_an_installed_filmot(tmp_path, monkeypatch):
+    # From the checkout root, the checkout leaves the worker's import path
+    # with the rest of the working directory; an installed copy that is still
+    # on it must not stand in for the package this process runs.
+    from filmot import _process
+
+    marker = tmp_path / "installed-filmot-imported.txt"
+    trap = "open({!r}, 'a').write(__name__ + '\\n')\n".format(str(marker))
+    installed = tmp_path / "site-packages" / "filmot"
+    installed.mkdir(parents=True)
+    for name in ("__init__.py", "_transcript_worker.py"):
+        (installed / name).write_text(trap, encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(installed.parent)] + sys.path)
+    monkeypatch.chdir(_process._PACKAGE_ROOT)
+
+    response = run_json_worker(
+        "filmot._transcript_worker", {"protocol_version": 1}, timeout_seconds=30,
+    )
+
+    assert response["error"]["error_type"] == "WorkerRequestError"
+    assert not marker.exists(), marker.read_text(encoding="utf-8")
 
 
 def test_timed_out_worker_is_killed_and_reaped(tmp_path):

@@ -217,10 +217,18 @@ per-user config does. If it would have changed anything (for an endpoint,
 anything but the default), `filmot config` lists it, and Filmot warns once when
 a command first sets up its Filmot API client.
 
-These limits cover configuration loading only. A project `.env` still applies
-to everything else, including proxies and Filmot's data and cache locations.
-The transcript helper process also starts Python from the current directory.
-Run Filmot only in directories you trust.
+A project `.env` cannot set `PYTHON*` variables either, because those steer
+every Python child process. Filmot records the names a project `.env` did set,
+and path settings such as `WEBSHARE_SESSION_FILE`, `FILMOT_RATE_LIMIT_DB`, or
+`FILMOT_DATA_DIR` never expand them. So a project variable cannot complete a
+trusted path like `$PROXY_DIR/sessions.txt`. The transcript helper process
+starts without the current directory on its import path, so a module planted
+there cannot replace one it uses.
+
+These limits cover configuration loading, those paths, and the helper process.
+A project `.env` still applies to everything else, including proxies and
+Filmot's data and cache locations, so run Filmot only in directories you
+trust.
 
 When a provider asks Filmot to wait (`Retry-After`), a wait in whole seconds
 is capped at 60 seconds. Any other value, such as an HTTP date, waits 5
@@ -237,6 +245,12 @@ state:
 | Per-user configuration and proxy credentials | Windows `%APPDATA%\filmot`; macOS `~/Library/Application Support/filmot`; Linux `${XDG_CONFIG_HOME:-~/.config}/filmot` | `FILMOT_CONFIG_DIR` |
 | Per-user mutable state, including proxy health and rate limiting | Windows `%LOCALAPPDATA%\filmot`; macOS `~/Library/Application Support/filmot`; Linux `${XDG_STATE_HOME:-~/.local/state}/filmot` | `FILMOT_STATE_DIR` |
 | Response cache | Native per-user cache directory (`%LOCALAPPDATA%`, `~/Library/Caches`, or `${XDG_CACHE_HOME:-~/.cache}`) under `filmot` | `FILMOT_CACHE_DIR` |
+
+The response cache reads and deletes only files named like its entries (32
+hexadecimal digits and `.json`), so other files in `FILMOT_CACHE_DIR` are left
+alone. A numeric
+setting such as `FILMOT_PROXY_RETRY_LIMIT` that doesn't hold a usable number
+falls back to its default, with one warning, instead of stopping Filmot.
 
 Configuration precedence is: existing process environment, per-user
 `config.env`, then an explicit `.env` in the current working directory. The
@@ -921,6 +935,23 @@ has. It cannot translate, so `--lang` must match a language Filmot indexed.
 Index lines carry start times only, so each segment ends where the next begins,
 and the last ends within 10 seconds. The captions are Filmot's snapshot and can
 be older than the video's current captions.
+
+#### AWS Transcribe fallback
+
+`--fallback` downloads a video's audio, uploads it to an S3 bucket you
+control, and transcribes it with AWS Transcribe when no captions are
+available. It needs `yt-dlp`, `boto3`, and these settings, in your environment
+or per-user `config.env`:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `FILMOT_S3_BUCKET` | _(none; required)_ | Bucket that receives the audio. |
+| `FILMOT_AWS_PROFILE` | boto3's default credentials | AWS profile with S3 and Transcribe access. |
+| `FILMOT_AWS_REGION` | `us-east-1` | Region for S3 and Transcribe. |
+
+There is no default bucket, because S3 bucket names are global: a built-in name
+would send other people's audio to whoever owns it. Without
+`FILMOT_S3_BUCKET`, `--fallback` stops before downloading any audio.
 
 Library saves retain the complete text plus any source caption segments and
 their timestamps. Filmot also normalizes citation-ready source metadata such

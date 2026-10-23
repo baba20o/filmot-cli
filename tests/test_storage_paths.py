@@ -582,6 +582,79 @@ def test_whitespace_only_overrides_mean_the_defaults(tmp_path):
     assert _endpoints(reported["first"]) == DEFAULT_ENDPOINTS
 
 
+_PROJECT_NAMES_PROBE = '''
+import json, os, subprocess, sys
+import filmot.config as config
+
+child = subprocess.run(
+    [sys.executable, "-c",
+     "import os, filmot.config; print(os.environ.get('FILMOT_PROJECT_ENV_NAMES'))"],
+    capture_output=True, text=True, check=True,
+)
+print(json.dumps({
+    "ignored": sorted(config.IGNORED_PROJECT_SETTINGS),
+    "pythonpath": os.environ.get("PYTHONPATH"),
+    "names": os.environ.get("FILMOT_PROJECT_ENV_NAMES"),
+    "child": child.stdout.strip(),
+}))
+'''
+
+
+def test_a_project_env_cannot_set_python_variables_and_its_names_are_recorded(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text(
+        "PYTHONPATH={}\nPYTHONSTARTUP=startup.py\nPROJECT_ONLY=1\n"
+        "FILMOT_PROJECT_ENV_NAMES=NOTHING\n".format(tmp_path / "attacker"),
+        encoding="utf-8",
+    )
+    user_config = tmp_path / "config.env"
+    user_config.write_text("FILMOT_API_KEY=user-direct\n", encoding="utf-8")
+    probe = tmp_path / "probe.py"
+    probe.write_text(_PROJECT_NAMES_PROBE, encoding="utf-8")
+    environment = {
+        name: value for name, value in os.environ.items()
+        if name.upper() not in {
+            "PYTHONPATH", "PYTHONSTARTUP", "PROJECT_ONLY",
+            "FILMOT_TRUSTED_CONFIG", "FILMOT_PROJECT_ENV_NAMES", "FILMOT_CONFIG_DIR",
+        }
+    }
+    environment["FILMOT_CONFIG_FILE"] = str(user_config)
+
+    result = subprocess.run(
+        [sys.executable, str(probe)],
+        cwd=project, env=environment, check=True, capture_output=True, text=True,
+    )
+
+    report = json.loads(result.stdout)
+    assert report["ignored"] == ["FILMOT_PROJECT_ENV_NAMES", "PYTHONPATH", "PYTHONSTARTUP"]
+    assert report["pythonpath"] is None
+    assert report["names"] == report["child"] == "PROJECT_ONLY"
+
+
+def test_a_project_variable_cannot_complete_a_trusted_storage_path(monkeypatch, tmp_path):
+    from filmot import paths, proxy_pool, rate_limiter
+
+    attacker = tmp_path / "attacker"
+    monkeypatch.setenv("PROXY_DIR", str(attacker))
+    monkeypatch.setenv("FILMOT_PROJECT_ENV_NAMES", "PROXY_DIR")
+    monkeypatch.setenv("WEBSHARE_SESSION_FILE", "$PROXY_DIR/sessions.txt")
+    monkeypatch.setenv("FILMOT_RATE_LIMIT_DB", "${PROXY_DIR}/rate_limit.db")
+    monkeypatch.setenv("FILMOT_DATA_DIR", "$PROXY_DIR/data")
+
+    resolved = [
+        proxy_pool._resolve_session_file(),
+        rate_limiter._default_shared_db(),
+        paths.project_data_dir(),
+    ]
+
+    assert all(str(attacker) not in str(path) for path in resolved), resolved
+    assert all("PROXY_DIR" in str(path) for path in resolved), resolved
+    # The same variable from the trusted environment still expands.
+    monkeypatch.delenv("FILMOT_PROJECT_ENV_NAMES")
+    assert str(attacker) in str(proxy_pool._resolve_session_file())
+
+
 def test_environment_loading_is_centralized_and_explicit():
     package = Path(__file__).resolve().parents[1] / "filmot"
     calls = []

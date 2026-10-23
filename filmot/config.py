@@ -20,6 +20,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values, load_dotenv
 
+from .environment import PROJECT_ENV_NAMES, record_project_env_names
 from .paths import config_file
 
 
@@ -47,15 +48,19 @@ CONFIG_LOCATION_SETTINGS = (
 # expansion, points a child elsewhere.
 TRUSTED_CONFIG_PIN = "FILMOT_TRUSTED_CONFIG"
 # A project .env (in a cloned repository, say) cannot set these: the endpoints,
-# the config location, and TLS trust and key logging, which with a proxy would
-# expose request headers.
+# the config location, TLS trust and key logging, which with a proxy would
+# expose request headers, and the record of names it did set.
 PROTECTED_SETTINGS = (
     *ENDPOINT_OVERRIDES,
     *CONFIG_LOCATION_SETTINGS,
     TRUSTED_CONFIG_PIN,
+    PROJECT_ENV_NAMES,
     "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR",
     "SSLKEYLOGFILE",
 )
+# Nor any PYTHON* variable: those steer every Python child process (the
+# transcript worker included), e.g. PYTHONPATH could inject modules.
+PROTECTED_PREFIXES = ("PYTHON",)
 # Windows environment names are case-insensitive.
 _PROTECTED_NAMES = frozenset(name.upper() for name in PROTECTED_SETTINGS)
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -97,24 +102,33 @@ def _trusted_config_file():
     return directory / "config.env" if directory is not None else pinned
 
 
+def _protected(name):
+    upper = name.upper()
+    return upper in _PROTECTED_NAMES or upper.startswith(PROTECTED_PREFIXES)
+
+
 def _apply_project_env(path):
     """Export the project .env's allowed values; return protected ones it tried.
 
     Values are read literally, so none can embed a key loaded from elsewhere,
     and a protected value is never written, not even briefly. Names that are
-    not plain identifiers are skipped.
+    not plain identifiers are skipped. The exported names are recorded so
+    path settings never expand them (see ``filmot.environment``).
     """
     ignored = []
+    exported = []
     for name, value in dotenv_values(path, interpolate=False).items():
         if value is None or not _ENV_NAME.fullmatch(name) or name in os.environ:
             continue
-        if name.upper() not in _PROTECTED_NAMES:
+        if not _protected(name):
             os.environ[name] = value
+            exported.append(name)
             continue
         default = ENDPOINT_OVERRIDES.get(name.upper())
         # The documented default endpoint is harmless; anything else is not.
         if default is None or _endpoint(value, default) != default:
             ignored.append(name.upper())
+    record_project_env_names(exported)
     return tuple(dict.fromkeys(ignored))
 
 

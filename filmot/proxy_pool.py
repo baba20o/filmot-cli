@@ -50,6 +50,7 @@ from .paths import (
     restrict_private_file,
     secure_copy,
 )
+from .environment import env_number, expand_trusted
 from .redaction import redact_sensitive_text
 
 
@@ -1502,7 +1503,7 @@ def _resolve_session_file() -> Path:
     legacy = legacy_proxy_session_file()
     target = default_proxy_session_file()
     if configured:
-        candidate = Path(os.path.expandvars(configured)).expanduser()
+        candidate = Path(expand_trusted(configured)).expanduser()
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
         candidate = candidate.resolve(strict=False)
@@ -1536,28 +1537,25 @@ def get_pool(*, force_new: bool = False) -> Optional[WebshareProxyPool]:
     with _pool_lock:
         if _pool is not None and not force_new:
             return _pool
-        max_sessions = int(os.getenv("FILMOT_PROXY_MAX_SESSIONS", DEFAULT_MAX_SESSIONS))
+        max_sessions = env_number("FILMOT_PROXY_MAX_SESSIONS", DEFAULT_MAX_SESSIONS, minimum=1)
         token = os.getenv("WEBSHARE_API_TOKEN")
         if token:
             try:
                 _pool = WebshareProxyPool(
                     token,
                     countries=_parse_countries(os.getenv("FILMOT_PROXY_COUNTRIES")),
-                    refresh_hours=float(
-                        os.getenv("FILMOT_PROXY_REFRESH_HOURS", DEFAULT_REFRESH_HOURS)
+                    refresh_hours=env_number(
+                        "FILMOT_PROXY_REFRESH_HOURS", float(DEFAULT_REFRESH_HOURS),
+                        cast=float, minimum=0,
                     ),
                     max_sessions=max_sessions,
-                    recent_success_hours=float(
-                        os.getenv(
-                            "FILMOT_PROXY_HEALTH_HOURS",
-                            DEFAULT_RECENT_SUCCESS_HOURS,
-                        )
+                    recent_success_hours=env_number(
+                        "FILMOT_PROXY_HEALTH_HOURS", float(DEFAULT_RECENT_SUCCESS_HOURS),
+                        cast=float, minimum=0,
                     ),
-                    lease_seconds=float(
-                        os.getenv(
-                            "FILMOT_PROXY_LEASE_SECONDS",
-                            DEFAULT_LEASE_SECONDS,
-                        )
+                    lease_seconds=env_number(
+                        "FILMOT_PROXY_LEASE_SECONDS", DEFAULT_LEASE_SECONDS,
+                        cast=float, minimum=1,
                     ),
                 )
             except (WebshareProxyError, OSError, sqlite3.Error):
@@ -1575,17 +1573,13 @@ def get_pool(*, force_new: bool = False) -> Optional[WebshareProxyPool]:
                     sessions,
                     session_file_path=session_file,
                     max_sessions=max_sessions,
-                    recent_success_hours=float(
-                        os.getenv(
-                            "FILMOT_PROXY_HEALTH_HOURS",
-                            DEFAULT_RECENT_SUCCESS_HOURS,
-                        )
+                    recent_success_hours=env_number(
+                        "FILMOT_PROXY_HEALTH_HOURS", float(DEFAULT_RECENT_SUCCESS_HOURS),
+                        cast=float, minimum=0,
                     ),
-                    lease_seconds=float(
-                        os.getenv(
-                            "FILMOT_PROXY_LEASE_SECONDS",
-                            DEFAULT_LEASE_SECONDS,
-                        )
+                    lease_seconds=env_number(
+                        "FILMOT_PROXY_LEASE_SECONDS", DEFAULT_LEASE_SECONDS,
+                        cast=float, minimum=1,
                     ),
                 )
                 return _pool

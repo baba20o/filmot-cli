@@ -223,6 +223,11 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Changed
 
+- The AWS Transcribe fallback reads `FILMOT_S3_BUCKET` (required),
+  `FILMOT_AWS_PROFILE` (default: boto3's default credentials), and
+  `FILMOT_AWS_REGION` (default `us-east-1`) instead of a built-in profile and
+  bucket. There is no default bucket, because S3 bucket names are global.
+  Without one, `--fallback` stops before downloading any audio.
 - Planning and reference documents moved from the repository root into
   `docs/`: `AGENTS_RESEARCH_GUIDE.md`, `AGENT_FEATURES_PLAN.md`,
   `FIELD_TEST_LOG.md`, `NEXT-SLICE.md`, `YOUTUBE_API.md`, and
@@ -311,6 +316,25 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- The transcript helper process imported modules from the current directory,
+  so a planted `json.py` or package there could replace one it uses. It now
+  starts without that directory on its import path.
+- A project `.env` could set `PYTHON*` variables, such as `PYTHONPATH`, that
+  every Python child process honors. It no longer can.
+- A project `.env` variable could complete a trusted path setting, such as
+  `WEBSHARE_SESSION_FILE=$PROXY_DIR/sessions.txt`. Path settings now expand only
+  variables the project did not add; the names it added are recorded in
+  `FILMOT_PROJECT_ENV_NAMES` for child processes.
+- The response cache deleted any JSON file in `FILMOT_CACHE_DIR` that lacked a
+  fresh timestamp, and a JSON file that wasn't an object broke every API
+  command. It now touches only files named like its entries (32 hexadecimal
+  digits) and treats unreadable ones as misses.
+- The shared rate-limit database grew without bound in short-lived processes,
+  and concurrent processes could burst together. Old rows are now pruned at
+  startup, and each request reserves its slot in one transaction.
+- An unusable numeric setting, such as `FILMOT_PROXY_RETRY_LIMIT=four`, stopped
+  Filmot with a traceback. It now falls back to the default with one warning.
+- Downloading a finished AWS transcript had no timeout. It now has one.
 - A project `.env` could send your Filmot keys elsewhere, for example when
   Filmot ran inside a cloned repository.
   - It could set `FILMOT_API_BASE_URL` or `RAPIDAPI_HOST`.

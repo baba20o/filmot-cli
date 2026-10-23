@@ -14,6 +14,7 @@ from filmot.aws_transcribe import (
     fetch_transcript_text,
     cleanup_job,
     cleanup_s3_file,
+    transcribe_video,
     AWSTranscribeError,
 )
 
@@ -368,3 +369,58 @@ class TestCleanup:
         mock_s3.delete_object.side_effect = Exception("oops")
         # Should not raise
         cleanup_s3_file(mock_s3, "bucket", "file.mp3")
+
+
+# ── settings (no built-in profile or bucket) ─────────────────────
+
+
+class TestSettings:
+
+    def test_no_bucket_fails_before_any_audio_is_downloaded(self, monkeypatch):
+        monkeypatch.delenv("FILMOT_S3_BUCKET", raising=False)
+        with (
+            patch("filmot.aws_transcribe.download_audio", side_effect=AssertionError("no download")),
+            patch("filmot.aws_transcribe.check_dependencies", side_effect=AssertionError("no checks")),
+        ):
+            with pytest.raises(AWSTranscribeError, match="FILMOT_S3_BUCKET"):
+                transcribe_video("abc12345678")
+
+    def test_settings_come_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("FILMOT_S3_BUCKET", "my-bucket")
+        monkeypatch.setenv("FILMOT_AWS_PROFILE", "my-profile")
+        monkeypatch.setenv("FILMOT_AWS_REGION", "eu-west-1")
+        session = MagicMock()
+        with (
+            patch("filmot.aws_transcribe.check_dependencies", return_value=(True, "")),
+            patch("filmot.aws_transcribe.boto3", create=True) as boto3,
+            patch("filmot.aws_transcribe.download_audio", side_effect=AWSTranscribeError("stop here")),
+        ):
+            boto3.Session.return_value = session
+            with pytest.raises(AWSTranscribeError, match="stop here"):
+                transcribe_video("abc12345678")
+
+        boto3.Session.assert_called_once_with(profile_name="my-profile")
+        session.client.assert_any_call("s3", region_name="eu-west-1")
+
+    def test_without_a_profile_boto3_uses_its_default_credentials(self, monkeypatch):
+        monkeypatch.setenv("FILMOT_S3_BUCKET", "my-bucket")
+        monkeypatch.delenv("FILMOT_AWS_PROFILE", raising=False)
+        monkeypatch.delenv("FILMOT_AWS_REGION", raising=False)
+        with (
+            patch("filmot.aws_transcribe.check_dependencies", return_value=(True, "")),
+            patch("filmot.aws_transcribe.boto3", create=True) as boto3,
+            patch("filmot.aws_transcribe.download_audio", side_effect=AWSTranscribeError("stop here")),
+        ):
+            with pytest.raises(AWSTranscribeError):
+                transcribe_video("abc12345678")
+
+        boto3.Session.assert_called_once_with(profile_name=None)
+        boto3.Session.return_value.client.assert_any_call("s3", region_name="us-east-1")
+
+    @patch("filmot.aws_transcribe.requests.get")
+    def test_the_transcript_download_has_a_timeout(self, mock_get):
+        mock_get.return_value.json.return_value = {"results": {"transcripts": [{"transcript": "x"}]}}
+
+        fetch_transcript_text("https://aws.example.com/t.json")
+
+        assert mock_get.call_args.kwargs["timeout"] == (10, 60)
