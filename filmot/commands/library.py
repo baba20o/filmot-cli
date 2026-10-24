@@ -10,6 +10,7 @@ from typing import Optional
 import click
 from rich.markup import escape
 from rich.panel import Panel
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
@@ -149,18 +150,14 @@ def _render_library_search(
         details = row.get("match_details") or []
         if details:
             for match in details[:2]:
-                locator = ""
+                # Built as Text: a link target inside markup is parsed too.
+                line = Text("  ", style="dim")
                 if match.get("timestamp") and match.get("url"):
-                    locator = "[[link={url}]{timestamp}[/link]] ".format(
-                        url=match["url"],
-                        timestamp=match["timestamp"],
-                    )
-                console.print(
-                    "  [dim]{}{}[/dim]".format(
-                        locator,
-                        escape(str(match.get("excerpt", ""))),
-                    )
-                )
+                    line.append("[")
+                    line.append(str(match["timestamp"]), style=Style(link=str(match["url"])))
+                    line.append("] ")
+                line.append(str(match.get("excerpt", "")))
+                console.print(line)
         else:
             for match in row.get("matches", [])[:2]:
                 console.print(f"  [dim]...{escape(str(match))}[/dim]")
@@ -2201,15 +2198,13 @@ def _render_library_compare(
                     {query, query.lower(), query.upper(), query.capitalize()},
                     style="bold yellow",
                 )
-            locator = ""
+            line = Text("  ", style="dim")
             if match.get("timestamp") and match.get("url"):
-                locator = "[[link={url}]{timestamp}[/link]] ".format(
-                    url=match["url"],
-                    timestamp=match["timestamp"],
-                )
-            console.print(Text.assemble(
-                "  ", Text.from_markup(locator, style="dim"), highlighted,
-            ))
+                line.append("[")
+                line.append(str(match["timestamp"]), style=Style(link=str(match["url"])))
+                line.append("] ")
+            line.append_text(highlighted)
+            console.print(line)
 
     console.print(
         f"\n[dim]Sources sorted by {summary.get('sort_label')} "
@@ -2470,7 +2465,7 @@ def _render_library_echoes(
         "lineage; it does not establish copying, independence, credibility, "
         "falsity, or truth. Method: {name}/v{version}, {ngram}-grams, "
         "threshold {threshold}.[/dim]".format(
-            name=method.get("name", ""),
+            name=escape(str(method.get("name", ""))),
             version=method.get("version", ""),
             ngram=method.get("ngram", ""),
             threshold=method.get("threshold", ""),
