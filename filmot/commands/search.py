@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
@@ -536,13 +537,13 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
 
         if (sort == "density" or min_matches is not None) and \
                 scope["api_total"] > scope["candidates_fetched"]:
-            scope_message = (
+            scope_summary = (
                 f"Client-side {'sorting/filtering' if sort == 'density' and min_matches is not None else 'sorting' if sort == 'density' else 'filtering'} "
                 f"covered {scope['candidates_fetched']} fetched candidate(s) across "
                 f"{scope['pages_fetched']} page(s), not all {scope['api_total']:,} API results. "
                 "Increase --pages/--candidate-pool for a wider ranking scope."
             )
-            diagnostics.append(f"[yellow]Scope:[/yellow] {scope_message}")
+            diagnostics.append(f"[yellow]Scope:[/yellow] {scope_summary}")
 
         # Hint if --title filter produced no results
         videos_list = _result_videos(results)
@@ -671,8 +672,8 @@ def search(query: str, lang: str, page: int, pages: int, candidate_pool: int,
 
         # Rendering can encounter EPIPE. The durable event above is already on
         # disk before any of these human diagnostics are emitted.
-        for message in diagnostics:
-            _diagnostic(message, raw=raw)
+        for markup in diagnostics:
+            _diagnostic(markup, raw=raw)
 
         if raw:
             _emit_raw_result(outcome, indent=2)
@@ -862,7 +863,8 @@ def _display_hit(hit: dict, video_id: str, context_chars: int = 50):
                 highlighted.highlight_words(
                     {token, token.capitalize(), token.upper()}, style="bold yellow"
                 )
-            console.print(f"      [[link={line_link}]{line_ts}[/link]]", highlighted)
+            # Links are styles on a Text: a target inside markup is parsed too.
+            console.print(Text.assemble("      [", (line_ts, Style(link=line_link)), "]"), highlighted)
     else:
         # Hit format 0: Context snippets
         ctx_before = hit.get("ctx_before", "")
@@ -872,10 +874,10 @@ def _display_hit(hit: dict, video_id: str, context_chars: int = 50):
         ctx_before = ctx_before[-context_chars:] if len(ctx_before) > context_chars else ctx_before
         ctx_after = ctx_after[:context_chars] if len(ctx_after) > context_chars else ctx_after
 
-        console.print(
-            f"      [[link={link}]{timestamp}[/link]] ...{escape(ctx_before)} "
-            f"[bold yellow]{escape(token)}[/bold yellow] {escape(ctx_after)}..."
-        )
+        console.print(Text.assemble(
+            "      [", (timestamp, Style(link=link)), "] ...", str(ctx_before), " ",
+            (str(token), "bold yellow"), " ", str(ctx_after), "...",
+        ))
 
 
 def _hit_fingerprint_text(video: dict) -> str:
@@ -1063,23 +1065,20 @@ def _render_transcript_grep(outcome: CommandResult[dict]) -> None:
         )
         console.print(f"[red]Error:[/red] {escape(str(message))}")
         return
-    query = escape(str(outcome.data.get("query", "")))
+    query_markup = escape(str(outcome.data.get("query", "")))
     rows = outcome.data.get("matches", [])
     if not rows:
-        console.print(f"[dim]No matches for '{query}' in transcript.[/dim]")
+        console.print(f"[dim]No matches for '{query_markup}' in transcript.[/dim]")
         return
-    console.print(f"[bold]{len(rows)} match(es) for '{query}':[/bold]\n")
+    console.print(f"[bold]{len(rows)} match(es) for '{query_markup}':[/bold]\n")
     for row in rows:
-        timestamp = row["timestamp"]
         link = row["deep_link"]
-        excerpt = escape(str(row["excerpt"]))
+        line = Text.assemble("  [", (str(row["timestamp"]), "cyan"), "] ")
         if link:
-            console.print(
-                f"  [[cyan]{timestamp}[/cyan]] "
-                f"[link={link}]{link}[/link] {excerpt}\n"
-            )
-        else:
-            console.print(f"  [[cyan]{timestamp}[/cyan]] {excerpt}\n")
+            line.append(str(link), style=Style(link=str(link)))
+            line.append(" ")
+        line.append(str(row["excerpt"]) + "\n")
+        console.print(line)
 
 
 def _grep_transcript(result: dict, query: str, context_chars: int = 160) -> bool:
@@ -1275,7 +1274,7 @@ def _bulk_download_transcripts(
                 status="skipped", reason="already_exists", source="bulk_download",
             )
             skip_count += 1
-            console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {video_id} - already in library")
+            console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {escape(str(video_id))} - already in library")
             continue
 
         try:
@@ -1290,7 +1289,7 @@ def _bulk_download_transcripts(
                 lang=lang,
             )
             console.print(
-                f"  [{i}/{len(videos_to_download)}] [dim]Fetching {video_id} "
+                f"  [{i}/{len(videos_to_download)}] [dim]Fetching {escape(str(video_id))} "
                 f"(transcript route ladder)...[/dim]"
             )
             route_progress = _route_progress_for(video_id)
@@ -1339,7 +1338,7 @@ def _bulk_download_transcripts(
                 fail_count += 1
                 console.print(
                     f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] "
-                    f"{video_id} - "
+                    f"{escape(str(video_id))} - "
                     f"{escape(_transcript_failure_detail(result, verbose=False))}"
                 )
                 continue
@@ -1355,7 +1354,7 @@ def _bulk_download_transcripts(
                         status="skipped", reason="duplicate", source="bulk_download",
                     )
                     dedupe_count += 1
-                    console.print(f"  [{i}/{len(videos_to_download)}] [magenta]Dedupe[/magenta] {video_id} - duplicate content")
+                    console.print(f"  [{i}/{len(videos_to_download)}] [magenta]Dedupe[/magenta] {escape(str(video_id))} - duplicate content")
                     continue
                 seen_hashes.add(text_hash)
 
@@ -1364,7 +1363,7 @@ def _bulk_download_transcripts(
                     "transcript_save", topic=topic, video_id=video_id,
                     status="skipped", reason="empty_transcript", source="bulk_download",
                 )
-                console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {video_id} - empty transcript")
+                console.print(f"  [{i}/{len(videos_to_download)}] [yellow]Skip[/yellow] {escape(str(video_id))} - empty transcript")
                 continue
 
             # Save to library
@@ -1443,7 +1442,7 @@ def _bulk_download_transcripts(
                     console.print(
                         "  [yellow]Metadata lifecycle registration failed; "
                         "run `filmot yt-data refresh --video {}` later.[/yellow]".format(
-                            video_id
+                            escape(str(video_id))
                         )
                     )
             log_event(
@@ -1455,7 +1454,7 @@ def _bulk_download_transcripts(
             )
             success_count += 1
             saved_records.append((topic, video_id))
-            console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {video_id} - {escape(str(title)[:50])}...")
+            console.print(f"  [{i}/{len(videos_to_download)}] [green]✓[/green] {escape(str(video_id))} - {escape(str(title)[:50])}...")
 
         except Exception as e:
             log_event(
@@ -1468,7 +1467,7 @@ def _bulk_download_transcripts(
             fail_count += 1
             console.print(
                 f"  [{i}/{len(videos_to_download)}] [red]Fail[/red] "
-                f"{video_id} - "
+                f"{escape(str(video_id))} - "
                 f"{escape(f'{type(e).__name__}: {_whole_word_summary(e)}')}"
             )
 
@@ -1547,13 +1546,13 @@ def _display_subtitle_results(
     scope = results.get("scope", {})
     fetched = scope.get("candidates_fetched", len(all_videos))
     pages = scope.get("pages_fetched", results.get("pages_fetched", 1))
-    panel_text = f"[bold]Found {total:,} API results for: {escape(str(query))}[/bold]"
+    panel_markup = f"[bold]Found {total:,} API results for: {escape(str(query))}[/bold]"
     if fetched != total or len(videos) != fetched or pages > 1:
-        panel_text += (
+        panel_markup += (
             f"\n[dim]Fetched {fetched:,} candidate(s) across {pages} page(s); "
             f"displaying {len(videos):,}.[/dim]"
         )
-    console.print(Panel(panel_text))
+    console.print(Panel(panel_markup))
 
     # Echo detection: flag results that share near-identical phrasing (research
     # guide §3 — convergence vs echo). Computed across the whole result set.
@@ -2578,7 +2577,7 @@ def _render_yt_search_result(
     ):
         if filters.get(key):
             filter_labels.append(f"{label}: {escape(str(filters[key]))}")
-    filter_text = " | ".join(filter_labels)
+    filter_markup = " | ".join(filter_labels)
 
     published_after = request.get("published_after")
     published_before = request.get("published_before")
@@ -2604,14 +2603,14 @@ def _render_yt_search_result(
     console.print(
         Panel(
             f"[bold]Found {len(videos)} videos for:[/bold] {escape(query)}\n"
-            f"[bold]UTC period:[/bold] {period} | "
+            f"[bold]UTC period:[/bold] {escape(period)} | "
             f"[bold]Order:[/bold] {order}\n"
             f"[bold]Coverage:[/bold] {scope_line}\n"
             f"[bold]Metadata:[/bold] "
             f"{enrichment.get('status', 'not recorded')}"
             + (
-                f"\n[bold]Filters:[/bold] {filter_text}"
-                if filter_text
+                f"\n[bold]Filters:[/bold] {filter_markup}"
+                if filter_markup
                 else ""
             ),
             title="YouTube Data API Search Results",
@@ -2639,7 +2638,7 @@ def _render_yt_search_result(
         video_url = video.get("url") or (
             f"https://youtube.com/watch?v={video.get('video_id', '')}"
         )
-        console.print(f"   [link={video_url}]{video_url}[/link]")
+        console.print(Text.assemble("   ", (str(video_url), Style(link=str(video_url)))))
 
         if video.get("metadata_status") not in (None, "observed"):
             console.print(
@@ -2667,7 +2666,7 @@ def _render_yt_search_result(
 
         if data.get("transcript"):
             transcript_result = video.get("transcript_search") or {}
-            search_term = escape(str(transcript_result.get("query") or (
+            search_term_markup = escape(str(transcript_result.get("query") or (
                 data.get("transcript_query") or query
             )))
             if transcript_result.get("status") == "failed":
@@ -2680,7 +2679,7 @@ def _render_yt_search_result(
                 console.print(
                     f"   [bold green]✓ Found "
                     f"{transcript_result['match_count']} transcript matches "
-                    f"for '{search_term}'[/bold green]"
+                    f"for '{search_term_markup}'[/bold green]"
                 )
                 for match in transcript_result.get("matches", [])[:3]:
                     console.print(
@@ -2690,7 +2689,7 @@ def _render_yt_search_result(
             else:
                 console.print(
                     f"   [dim]No transcript matches for "
-                    f"'{search_term}'[/dim]"
+                    f"'{search_term_markup}'[/dim]"
                 )
 
 
@@ -2716,7 +2715,7 @@ def _evaluate_yt_search_transcripts(
         }
         try:
             with _search_status(
-                f"Fetching transcript for {video_id}...",
+                f"Fetching transcript for {escape(str(video_id))}...",
                 raw=raw,
             ):
                 result = search_in_transcript(video_id, search_term)
@@ -3267,7 +3266,7 @@ def _render_yt_video_result(
         video_url = video.get("url") or "https://youtube.com/watch?v={}".format(
             video.get("video_id", "")
         )
-        console.print(f"   [link={video_url}]{video_url}[/link]")
+        console.print(Text.assemble("   ", (str(video_url), Style(link=str(video_url)))))
         disclosures = []
         if video.get("paid_product_placement_disclosure") == "declared":
             disclosures.append("paid promotion declared")

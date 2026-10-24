@@ -1,6 +1,7 @@
 """Machine-global proxy pool inspection, refresh, and probe commands."""
 
 import click
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -53,10 +54,10 @@ def _render_proxy_status(
         source_detail += f" ({snap['session_file']})"
     console.print(
         Panel(
-            f"[bold]Source:[/bold] {source_detail}\n"
-            f"[bold]Gateway:[/bold] {snap['gateway']}\n"
+            f"[bold]Source:[/bold] {escape(source_detail)}\n"
+            f"[bold]Gateway:[/bold] {escape(str(snap['gateway']))}\n"
             f"[bold]Countries:[/bold] "
-            f"{', '.join(snap['countries']) if snap['countries'] else 'all'}\n"
+            f"{escape(', '.join(snap['countries'])) if snap['countries'] else 'all'}\n"
             f"[bold]Sessions:[/bold] {snap['total']} total | "
             f"{snap['available']} available now | "
             f"{snap['recently_healthy']} recently healthy | "
@@ -128,10 +129,10 @@ def _render_proxy_status(
         if s["last_failure_at"]:
             history += f"\nlast fail: {_short_time(s['last_failure_at'])}"
         if s["last_error"]:
-            history += f"\n{_whole_word_summary(s['last_error'], 80)}"
+            history += f"\n{escape(_whole_word_summary(s['last_error'], 80))}"
         t.add_row(
             str(s["id"]),
-            s["country"] or "-",
+            escape(str(s["country"] or "-")),
             state,
             history,
         )
@@ -215,7 +216,7 @@ def proxy_refresh(full: bool):
             rotation_error = e
             console.print(
                 f"[red]Remote IP rotation failed: "
-                f"{_whole_word_summary(e)}[/red]"
+                f"{escape(_whole_word_summary(e))}[/red]"
             )
     try:
         action = (
@@ -338,7 +339,7 @@ def proxy_test(
     attempts = []
 
     console.print(
-        f"[bold]Probing up to {count} sessions against {video_id} "
+        f"[bold]Probing up to {count} sessions against {escape(str(video_id))} "
         f"(route {configured_route_timeout:g}s; total {total_timeout:g}s)[/bold]"
     )
     for index in range(1, count + 1):
@@ -361,7 +362,7 @@ def proxy_test(
         display_id = pool.redacted_session_id(sess)
         console.print(
             f"[dim][{index}/{count}] testing {display_id} "
-            f"({sess.country_code or 'unknown country'})...[/dim]"
+            f"({escape(str(sess.country_code or 'unknown country'))})...[/dim]"
         )
         result = probe_pool_session(
             pool,
@@ -391,7 +392,7 @@ def proxy_test(
             )
             console.print(
                 f"[green][{index}/{count}] {display_id}: transport OK[/green] "
-                f"({elapsed:.2f}s; {detail})"
+                f"({elapsed:.2f}s; {escape(str(detail))})"
             )
         else:
             failed += 1
@@ -401,7 +402,7 @@ def proxy_test(
                 or "transport failure"
             )
             console.print(
-                f"[red][{index}/{count}] {display_id}: {detail}[/red] "
+                f"[red][{index}/{count}] {display_id}: {escape(str(detail))}[/red] "
                 f"({elapsed:.2f}s)"
             )
     unattempted = count - attempted

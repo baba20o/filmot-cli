@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import click
 from rich.markup import escape
 from rich.panel import Panel
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
@@ -664,7 +665,7 @@ def _render_playlist(outcome: CommandResult[YouTubePlaylistResultData]) -> None:
         )
         if isinstance(video_id, str) and video_id:
             url = "https://youtube.com/watch?v={}".format(video_id)
-            console.print("   [link={0}]{0}[/link]".format(url))
+            console.print(Text.assemble("   ", (url, Style(link=url))))
         else:
             console.print("   [dim]No usable video ID was exposed.[/dim]")
         metadata_status = item.get("video_metadata_status")
@@ -886,7 +887,7 @@ def yt_playlist(
     }
     try:
         with _status(
-            "[bold green]Reading YouTube playlist {}...".format(playlist_id),
+            "[bold green]Reading YouTube playlist {}...".format(escape(str(playlist_id))),
             raw=raw,
         ):
             provider = get_playlist_detailed(
@@ -1095,7 +1096,7 @@ def yt_playlists(
     }
     try:
         with _status(
-            "[bold green]Reading public playlists for {}...".format(canonical),
+            "[bold green]Reading public playlists for {}...".format(escape(str(canonical))),
             raw=raw,
         ):
             provider = list_channel_playlists_detailed(

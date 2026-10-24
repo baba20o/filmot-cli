@@ -65,7 +65,7 @@ def config():
         # ``soft_wrap`` preserves long resolved paths instead of replacing
         # their distinguishing suffix with a table ellipsis.
         console.print(
-            f"[cyan]{label}:[/cyan] [green]{value}[/green]",
+            f"[cyan]{label}:[/cyan] [green]{escape(str(value))}[/green]",
             soft_wrap=True,
         )
 
@@ -208,7 +208,7 @@ def batch(file: str, output: str, fmt: str):
 
         def on_progress(current, total, result):
             status = "✓" if result.success else "✗"
-            progress.update(task, advance=1, description=f"[{current}/{total}] {status} {result.query.query[:30]}...")
+            progress.update(task, advance=1, description=f"[{current}/{total}] {status} {escape(result.query.query[:30])}...")
 
         try:
             processor.process_queries(queries, on_progress)
@@ -352,7 +352,7 @@ def _render_watchlist_list(outcome: CommandResult) -> None:
             escape(str(item.get("channel_name", ""))[:20]),
             "✓" if item.get("watched") else "",
             item.get("added_at", "")[:10],
-            item.get("video_id", ""),
+            escape(str(item.get("video_id", ""))),
         )
     console.print(table)
     stats = data["stats"]

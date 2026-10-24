@@ -154,6 +154,134 @@ def test_watchlist_prints_titles_literally():
     assert title in result.output and "C [i]" in result.output
 
 
+def test_saving_under_a_bracketed_topic_reports_it_literally():
+    transcript = {
+        "video_id": "abcdefghijk", "language": "en", "full_text": "Plain words.",
+        "segments": [{"start": 0.0, "duration": 2.0, "text": "Plain words."}],
+        "duration_seconds": 2.0, "segment_count": 1,
+    }
+    runner = CliRunner()
+    with patch("filmot.transcript.get_transcript", return_value=transcript), patch(
+        "filmot.commands.transcript.FilmotClient"
+    ) as client:
+        client.return_value.get_videos.return_value = [{"title": "Plain"}]
+        saved = runner.invoke(cli, ["transcript", "abcdefghijk", "--save-to", "zoo [/bold]"])
+        again = runner.invoke(cli, ["transcript", "abcdefghijk", "--save-to", "zoo [/bold]"])
+
+    assert saved.exit_code == 0, saved.output
+    assert "Saved to library: zoo [/bold]/abcdefghijk" in saved.output
+    assert again.exit_code == 0, again.output
+    assert "Already in library: zoo [/bold]/abcdefghijk" in again.output
+
+
+def test_proxy_status_prints_configured_countries_literally(tmp_path, monkeypatch):
+    from filmot import proxy_pool
+
+    sessions = tmp_path / "sessions.txt"
+    sessions.write_text("gateway.test:9000:user-1:pass-1\n", encoding="utf-8")
+    monkeypatch.setenv("WEBSHARE_SESSION_FILE", str(sessions))
+    proxy_pool.reset_pool()
+    proxy_pool.get_pool().countries = ["US", "[/bold]"]  # FILMOT_PROXY_COUNTRIES
+
+    result = CliRunner().invoke(cli, ["proxy", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "US, [/bold]" in result.output
+
+
+def test_a_failed_rotation_is_reported_literally_and_still_refreshes():
+    from unittest.mock import MagicMock
+
+    pool = MagicMock(source="webshare")
+    pool.request_full_refresh.side_effect = RuntimeError("HTTP 500: [/bold] broke")
+    pool.refresh.return_value = 3
+    pool.available_count.return_value = 3
+    pool.recently_healthy_count.return_value = 1
+    with patch("filmot.commands.proxy._require_pool", return_value=pool):
+        result = CliRunner().invoke(cli, ["proxy", "refresh", "--full"])
+
+    assert "Remote IP rotation failed: HTTP 500: [/bold] broke" in result.output
+    pool.refresh.assert_called_once_with(force=True)
+    assert result.exit_code == 1  # the session list refreshed, the rotation did not
+
+
+def test_proxy_test_prints_the_video_input_and_country_literally(tmp_path, monkeypatch):
+    from filmot import proxy_pool
+
+    sessions = tmp_path / "sessions.txt"
+    sessions.write_text("gateway.test:9000:user-1:pass-1\n", encoding="utf-8")
+    monkeypatch.setenv("WEBSHARE_SESSION_FILE", str(sessions))
+    proxy_pool.reset_pool()
+    proxy_pool.get_pool()._sessions[0].country_code = "[/dim]"  # as a provider could send
+    probe = {"transport_ok": True, "segment_count": 3, "route_elapsed_seconds": 0.1}
+    url = "https://youtu.be/abcdefghijk?label=[/bold]"
+
+    with patch("filmot.transcript.probe_pool_session", return_value=probe):
+        result = CliRunner().invoke(cli, ["proxy", "test", "--video-id", url, "--count", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert url in result.output
+    assert "([/dim])" in result.output
+
+
+def test_hit_links_survive_a_bracketed_video_id():
+    # Deep links embed the provider's ID; inside a [link=...] tag it was parsed.
+    video = dict(_video(
+        {"start": 5, "ctx_before": "before", "token": "pandas", "ctx_after": "after"},
+        {"start": 9, "token": "pandas", "lines": [{"start": 9, "text": "pandas line"}]},
+    ), id="abc[/bold]")
+    with patch("filmot.commands.search.FilmotClient") as client_type:
+        client = client_type.return_value
+        client.last_cache_hit = False
+        client.last_query_rewrite = None
+        client.search_subtitles.return_value = {"result": [video], "totalresultcount": 1}
+        result = CliRunner().invoke(cli, ["search", "pandas"])
+
+    assert result.exit_code == 0, result.output
+    assert "before pandas after" in result.output and "pandas line" in result.output
+
+
+def test_link_renderers_print_bracketed_urls_literally(monkeypatch):
+    import io
+
+    from rich.console import Console
+
+    from filmot.commands import search as search_module
+    from filmot.schemas import CommandResult, ResultStatus
+
+    output = io.StringIO()
+    monkeypatch.setattr(search_module, "console", Console(file=output, width=200))
+    url = "https://youtube.com/watch?v=abc[/bold]"
+    search_module._render_yt_search_result(CommandResult(
+        command="yt-search", status=ResultStatus.COMPLETED,
+        data={"query": "q", "days": 7, "videos": [{"title": "T", "url": url}]},
+    ))
+    search_module._render_transcript_grep(CommandResult(
+        command="transcript", status=ResultStatus.COMPLETED,
+        data={"query": "q", "matches": [{"timestamp": "0:05", "deep_link": url + "&t=5", "excerpt": "said q"}]},
+    ))
+
+    assert url in output.getvalue()
+    assert url + "&t=5 said q" in output.getvalue()
+
+
+def test_library_locators_survive_a_bracketed_video_id(tmp_path, monkeypatch):
+    library = TranscriptLibrary(tmp_path / ".filmot_data")
+    video_id = "abc[x]defgh"  # a legal file name; its deep link holds the brackets
+    library.save(video_id, "zoo", "the pandas arrived", segments=[
+        {"start": 5.0, "duration": 2.0, "text": "the pandas arrived"},
+    ])
+    monkeypatch.setattr("filmot.library.get_library", lambda: library)
+    runner = CliRunner()
+
+    searched = runner.invoke(cli, ["library", "search", "pandas"])
+    compared = runner.invoke(cli, ["library", "compare", "pandas"])
+
+    for result in (searched, compared):
+        assert result.exit_code == 0, result.output
+        assert "pandas arrived" in result.output
+
+
 def test_transcript_search_highlights_without_parsing_the_caption():
     found = {
         "video_id": "abcdefghijk", "query": "hello", "match_count": 1,

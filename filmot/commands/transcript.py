@@ -563,7 +563,7 @@ def _render_transcript(
     data = outcome.data
     if full:
         console.print(Panel(
-            f"[bold]Video ID:[/bold] {data['video_id']}\n"
+            f"[bold]Video ID:[/bold] {escape(str(data['video_id']))}\n"
             f"[bold]Language:[/bold] {escape(str(data['language']))} "
             f"{'(auto-generated)' if data.get('is_generated') else '(manual)'}\n"
             f"[bold]Duration:[/bold] "
@@ -583,7 +583,7 @@ def _render_transcript(
 
     if chunk and "chunks" in data:
         console.print(Panel(
-            f"[bold]Video ID:[/bold] {data['video_id']}\n"
+            f"[bold]Video ID:[/bold] {escape(str(data['video_id']))}\n"
             f"[bold]Language:[/bold] {escape(str(data['language']))}\n"
             f"[bold]Chunks:[/bold] {len(data['chunks'])} × "
             f"{data['chunk_minutes']} min",
@@ -599,7 +599,7 @@ def _render_transcript(
 
     if timestamps and "segments" in data:
         console.print(Panel(
-            f"[bold]Video ID:[/bold] {data['video_id']}\n"
+            f"[bold]Video ID:[/bold] {escape(str(data['video_id']))}\n"
             f"[bold]Language:[/bold] {escape(str(data['language']))} "
             f"{'(auto-generated)' if data.get('is_generated') else '(manual)'}\n"
             f"[bold]Duration:[/bold] "
@@ -613,7 +613,7 @@ def _render_transcript(
         return
 
     console.print(Panel(
-        f"[bold]Video ID:[/bold] {data['video_id']}\n"
+        f"[bold]Video ID:[/bold] {escape(str(data['video_id']))}\n"
         f"[bold]Language:[/bold] {escape(str(data['language']))} "
         f"{'(auto-generated)' if data.get('is_generated') else '(manual)'}\n"
         f"[bold]Duration:[/bold] "
@@ -633,7 +633,7 @@ def _render_transcript_search(outcome: CommandResult[dict]) -> None:
     """Render transcript-search matches from the logged result payload."""
     data = outcome.data
     console.print(Panel(
-        f"[bold]Video ID:[/bold] {data['video_id']}\n"
+        f"[bold]Video ID:[/bold] {escape(str(data['video_id']))}\n"
         f"[bold]Query:[/bold] {escape(str(data['query']))}\n"
         f"[bold]Matches:[/bold] {data['match_count']}",
         title="Transcript Search",
@@ -951,18 +951,18 @@ def _render_channel_search(outcome: CommandResult[dict]) -> None:
 
     data = outcome.data
     results = data.get("results") or []
-    display_query = escape(str(data["display_query"]))
+    query_markup = escape(str(data["display_query"]))
     slug = escape(str(data["slug"]))
     if not results:
         console.print(
-            f"[dim]No matches for '{display_query}' in {slug}.[/dim]"
+            f"[dim]No matches for '{query_markup}' in {slug}.[/dim]"
         )
         return
 
     summary = data["summary"]
     console.print(
         f"\n[bold]Found {summary['videos']} videos matching "
-        f"'{display_query}' ({summary['hits']} total hits)[/bold]\n"
+        f"'{query_markup}' ({summary['hits']} total hits)[/bold]\n"
     )
     query_kind = data["query_kind"]
     terms = data["highlight_terms"]
@@ -1020,8 +1020,8 @@ class _DownloadProgressConsole:
 
 def _render_download(outcome: CommandResult[dict]) -> None:
     """Render final pipeline-download messages captured in the outcome."""
-    for message in outcome.data.get("human_messages") or []:
-        console.print(message)
+    for markup in outcome.data.get("human_messages") or []:
+        console.print(markup)
 
 
 @click.command("transcript")
@@ -1403,7 +1403,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
     if source == 'aws_transcribe':
         deferred_diagnostics.append(
             f"[cyan]Transcribed via AWS Transcribe "
-            f"(language: {transcript_data.get('language', 'unknown')})[/cyan]"
+            f"(language: {escape(str(transcript_data.get('language', 'unknown')))})[/cyan]"
         )
         if timestamps:
             deferred_diagnostics.append(
@@ -1487,8 +1487,8 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
         if raw:
             _emit_raw_result(grep_outcome, indent=2)
             return
-        for message in deferred_diagnostics:
-            _diagnostic(message, raw=raw)
+        for markup in deferred_diagnostics:
+            _diagnostic(markup, raw=raw)
         _render_transcript_grep(grep_outcome)
         if not grep_outcome.ok:
             raise click.exceptions.Exit(2)
@@ -1549,7 +1549,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                         )
                         outcome.warnings.append(message)
                         deferred_diagnostics.append(
-                            "[yellow]{}[/yellow]".format(message)
+                            "[yellow]{}[/yellow]".format(escape(message))
                         )
                         log_event(
                             "metadata_enrichment",
@@ -1561,7 +1561,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                         )
                 deferred_diagnostics.append(
                     f"[yellow]Already in library: "
-                    f"{save_to}/{transcript_data['video_id']}[/yellow]"
+                    f"{escape(save_to)}/{escape(str(transcript_data['video_id']))}[/yellow]"
                 )
                 log_event(
                     "transcript_save",
@@ -1605,7 +1605,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                         )
                         outcome.warnings.append(message)
                         deferred_diagnostics.append(
-                            "[yellow]{}[/yellow]".format(message)
+                            "[yellow]{}[/yellow]".format(escape(message))
                         )
                         log_event(
                             "metadata_lookup",
@@ -1686,7 +1686,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                         ).format(_whole_word_summary(metadata_error, 500))
                         outcome.warnings.append(message)
                         deferred_diagnostics.append(
-                            "[yellow]{}[/yellow]".format(message)
+                            "[yellow]{}[/yellow]".format(escape(message))
                         )
                         log_event(
                             "metadata_enrichment",
@@ -1732,7 +1732,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                 )
                 deferred_diagnostics.append(
                     f"[green]✓ Saved to library: "
-                    f"{save_to}/{transcript_data['video_id']}[/green]"
+                    f"{escape(save_to)}/{escape(str(transcript_data['video_id']))}[/green]"
                 )
         except Exception as error:
             detail = str(
@@ -1765,7 +1765,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             raise click.ClickException(message)
 
     # Save to file
-    output_message = None
+    output_markup = None
     if output:
         try:
             with open(output, 'w', encoding='utf-8') as f:
@@ -1787,7 +1787,7 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
                             f.write(f"[{ts}] {seg['text']}\n")
                     else:
                         f.write(transcript_data['full_text'])
-            output_message = f"[green]✓ Saved transcript to: {escape(str(output))}[/green]"
+            output_markup = f"[green]✓ Saved transcript to: {escape(str(output))}[/green]"
         except Exception as e:
             message = str(_redact_diagnostic(f"Error saving file: {e}"))
             failed_outcome = CommandResult.failed(
@@ -1803,16 +1803,16 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
             raise click.ClickException(message)
 
     log_final(outcome)
-    for message in deferred_diagnostics:
-        _diagnostic(message, raw=raw)
+    for markup in deferred_diagnostics:
+        _diagnostic(markup, raw=raw)
 
     # Raw JSON output
     if raw:
         _emit_raw_result(outcome, indent=2)
         return
 
-    if output_message:
-        console.print(output_message)
+    if output_markup:
+        console.print(output_markup)
         return
 
     _render_transcript(
@@ -2402,8 +2402,8 @@ def channel_download(
             for i, v in enumerate(to_download):
                 if _interrupted.is_set():
                     break
-                title = escape(v['title'][:50])
-                progress.update(task, description=f"[cyan]{title}...")
+                title_markup = escape(v['title'][:50])
+                progress.update(task, description=f"[cyan]{title_markup}...")
                 try:
                     _download_one(v)
                     progress.advance(task)

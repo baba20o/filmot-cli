@@ -335,6 +335,16 @@ recorded in `docs/FIELD_TEST_LOG.md`.
   `[music]` vanished from search hits and transcripts, and a stray `[/bold]`
   failed the command. Search, library, transcript, channel, research, claims,
   watchlist, and REPL output now print them as written.
+- A few more values reached Rich markup unescaped: batch-search progress
+  queries, proxy session paths, configured countries, rotation and probe
+  errors, provider country codes, pool error history, research probe
+  queries, user-supplied video and playlist IDs, configuration paths, and the
+  topic and error lines printed after a transcript is saved. Hyperlinks to
+  timestamps and videos embedded provider video IDs in markup tags; they are
+  now drawn as styled text. A new heuristic test scans Filmot's output calls
+  and fails when a common provider-text expression (titles, channels,
+  queries, captions, errors, IDs) or any link target reaches markup without
+  escaping.
 - The credential check on export ZIPs decided what to open with
   `zipfile.is_zipfile`, which newer Pythons apply more strictly than the ZIP
   reader, so an archive with mismatched disk numbers could skip it. Every

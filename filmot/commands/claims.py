@@ -123,22 +123,22 @@ def _render_mutation(outcome: CommandResult[ClaimResultData]) -> None:
     claim_id = data.get("claim_id", "")
     created = bool(data.get("created"))
     if action == "add":
-        message = "Created" if created else "Already present"
-        console.print("[green]{} claim {}[/green]".format(message, escape(str(claim_id))))
+        verb = "Created" if created else "Already present"
+        console.print("[green]{} claim {}[/green]".format(verb, escape(str(claim_id))))
     elif action == "cite":
-        message = "Added" if created else "Already attached"
+        verb = "Added" if created else "Already attached"
         console.print(
             "[green]{} {} evidence for {}[/green]".format(
-                message,
+                verb,
                 escape(str(summary.get("relation", ""))),
                 escape(str(claim_id)),
             )
         )
     elif action == "assess":
-        message = "Updated" if created else "Assessment unchanged for"
+        verb = "Updated" if created else "Assessment unchanged for"
         console.print(
             "[green]{} {}: {} / {}[/green]".format(
-                message,
+                verb,
                 escape(str(claim_id)),
                 escape(str(summary.get("verdict", "open"))),
                 escape(str(summary.get("confidence", "unknown"))),

@@ -743,9 +743,9 @@ def _research_candidate_preview(videos: list, count: int = 8) -> None:
         lexical = selection.get("lexical_admission", {})
         from_scout = bool(video.get("_from_scout"))
         origin = "scout" if from_scout else video.get("_fallback_stage", "filmot")
-        lexical_detail = ""
+        lexical_spans = ""
         if from_scout:
-            lexical_detail = (
+            lexical_spans = (
                 f"; scout-lexical-spans=t{lexical.get('title_spans', 0)}"
                 f"/d{lexical.get('description_spans', 0)}"
                 f"/h{lexical.get('hit_spans', 0)}"
@@ -756,7 +756,7 @@ def _research_candidate_preview(videos: list, count: int = 8) -> None:
             f"     [dim]stage={origin}; relevance={selection.get('passage_coverage', 0):.2f}; "
             f"source-prior={selection.get('source_signal', 0):.2f}; "
             f"density={selection.get('density', 0):.2f}/min"
-            f"{lexical_detail}"
+            f"{lexical_spans}"
             f"{'; echo=' + str(selection['echo_cluster']) if selection.get('echo_cluster') else ''}[/dim]"
         )
 
@@ -803,24 +803,24 @@ def _render_research_result(
                 f"({escape(str(item.get('channel', 'Unknown')))})"
             )
     console.print("\n[dim]Next steps:[/dim]")
-    topic = escape(str(data["topic"]))
+    topic_markup = escape(str(data["topic"]))
     console.print(
-        f'  filmot library search "your query" --topic {topic}'
+        f'  filmot library search "your query" --topic {topic_markup}'
     )
     console.print(
-        f'  filmot library compare "claim" --topic {topic}'
+        f'  filmot library compare "claim" --topic {topic_markup}'
     )
     console.print(
-        f'  filmot library echoes {topic}'
+        f'  filmot library echoes {topic_markup}'
     )
     console.print(
-        f'  filmot claims add {topic} "exact claim statement"'
+        f'  filmot claims add {topic_markup} "exact claim statement"'
     )
     console.print(
         f'  filmot sessions {escape(shlex.quote(current_session() or data["topic"]))} --summary'
     )
     console.print(
-        f'  filmot library context {topic} -o context.txt'
+        f'  filmot library context {topic_markup} -o context.txt'
     )
 
 
@@ -2345,7 +2345,7 @@ def research(
                         console.print(
                             "  [dim]Stopping the lower-ranked automatic tail "
                             f"at the {broad_threshold:,}-result budget. Exact "
-                            f"manual query: {manual_query}[/dim]"
+                            f"manual query: {escape(str(manual_query))}[/dim]"
                         )
                         deferred = defer_probe_tail(
                             index,
