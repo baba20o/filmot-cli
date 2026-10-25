@@ -285,8 +285,8 @@ No semantic verifier or credibility score is proposed as a substitute for source
 
 These captures are ignored local research artifacts, not Git-tracked fixtures. This document includes the key findings so another checkout can understand the scope without them. Create minimal sanitized fixtures for implementation tests rather than committing entire research corpora.
 
-- [Insight investigation: CLI experience](../Insights/astra-insight-understanding-2026-09-06/CLI-EXPERIENCE.md) and [manifest](../Insights/astra-insight-understanding-2026-09-06/MANIFEST.json).
-- [Freshness investigation: observations](../Insights/astra-fresh-reactions-2026-09-06/FRESHNESS-AND-REACTIONS.md) and [manifest with exact video-ID metadata joins](../Insights/astra-fresh-reactions-2026-09-06/MANIFEST.json).
+- Local-only insight investigation: `Insights/astra-insight-understanding-2026-09-06/CLI-EXPERIENCE.md` and its `MANIFEST.json`.
+- Local-only freshness investigation: `Insights/astra-fresh-reactions-2026-09-06/FRESHNESS-AND-REACTIONS.md` and its `MANIFEST.json` with exact video-ID metadata joins.
 - Concrete metadata examples: `fEvXSrHPzb4`, `KM_AIwCT5Dc`, `Spuza-KwTJ4`, and `vm_R4uT8ntE` saved with unknown identity fields; direct discovery supplied their titles/channels. `GGzT7zVrRTU` retained metadata and is a useful contrasting case.
 - Freshness session: `astra-fresh-reactions-2026-09-06`; insight session: `astra-insight-understanding-2026-09-06`. The live session summaries are preserved under each artifact folder's `runs/` directory.
 - Playlist session: `curated-active-inference-2026-09-12`. Its bounded shelf

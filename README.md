@@ -96,6 +96,9 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 
 ## Installation
 
+For development setup, local-file conventions, and distribution checks, see
+[Contributing](CONTRIBUTING.md).
+
 ### Option 1: Install as CLI tool (Recommended)
 
 ```bash

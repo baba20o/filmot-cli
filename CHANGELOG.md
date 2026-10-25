@@ -337,6 +337,10 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- Repository hygiene now ignores local environment variants, audit notes,
+  exports, databases and common development caches while allowing reviewed test
+  fixtures. Source distributions include linked public docs, nested test helpers,
+  and the documented direct-Python entry point and requirements file.
 - Selected-column metadata and channel responses no longer require omitted
   base fields; malformed present fields and nested subtitle tracks are checked.
 - Later malformed export pages preserve earlier pages and the failed-page

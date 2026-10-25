@@ -51,6 +51,9 @@ jobs:
       - name: Run test suite
         run: python -m pytest -q
 
+      - name: Check documentation links
+        run: python scripts/check_doc_links.py
+
   windows:
     name: Windows / Python 3.14 latest
     runs-on: windows-latest

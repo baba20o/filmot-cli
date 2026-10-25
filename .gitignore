@@ -1,7 +1,7 @@
-# Environment variables
-.env
-.env.local
-.env.*.local
+# Local environment files; only placeholder examples belong in Git
+.env*
+!.env.example
+!.env.*.example
 
 # Python
 __pycache__/
@@ -45,15 +45,34 @@ Thumbs.db
 # Testing
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
 
 # Logs
 *.log
 
-# Output files
+# Generated research/export files (public fixtures are allowed below)
 *.json
+*.jsonl
+*.ndjson
 *.csv
+*.srt
+*.vtt
+*.zip
 !package.json
+!/tests/fixtures/**/*.json
+!/tests/fixtures/**/*.jsonl
+!/tests/fixtures/**/*.ndjson
+!/tests/fixtures/**/*.csv
+!/tests/fixtures/**/*.srt
+!/tests/fixtures/**/*.vtt
+!/tests/fixtures/**/*.zip
 
 # Dev/reference files
 reference.txt
@@ -63,15 +82,27 @@ queries_template.*
 # Filmot user data
 .filmot_cache/
 .filmot_data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
 
 # Proxy/credential files
 proxies.txt
 *proxies*.txt
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Research & Insights (private local research)
 Insights/
 custom_searches/
 context/
+/findings/
+/exports/
 
 # Scratch / dev files
 _q.py
@@ -81,3 +112,26 @@ nul
 
 # Claude Code settings (local)
 .claude/
+
+# UAF local-only operating surface
+# UAF-GITIGNORE-START
+/AGENTS.md
+/CLAUDE.md
+/checkpoint.md
+/.uaf/
+/templates/
+.uaf/.lock
+.uaf/.lock.reclaim
+.uaf/cache/
+.uaf/exports/
+.uaf/.tmp/
+.uaf/runtime/
+.uaf/inbox/
+.uaf/workflows/
+.uaf/conversations/
+.uaf/contacts/
+.uaf/context/
+.uaf/observers/
+.uaf/quarantine/
+.uaf/uaf.local.json
+# UAF-GITIGNORE-END

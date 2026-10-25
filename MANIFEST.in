@@ -1,7 +1,10 @@
 include .env.example
 include AGENTS_README.md
 include CHANGELOG.md
-include docs/YOUTUBE_API.md
-include docs/YOUTUBE_ROADMAP.md
+include CONTRIBUTING.md
+include main.py
+include requirements.txt
+recursive-include docs *.md
 recursive-include scripts *.py
-recursive-include tests/fixtures/filmot_api *.json *.md
+recursive-include tests *.py
+recursive-include tests/fixtures *.json *.jsonl *.ndjson *.csv *.srt *.vtt *.zip *.md
