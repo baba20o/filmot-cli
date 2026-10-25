@@ -1,0 +1,2005 @@
+# Filmot CLI reference
+
+[Quick start](../README.md#quick-start) · [Configuration](CONFIGURATION.md) · [Official Filmot API](https://filmot.com/api-documentation)
+
+Browse this reference:
+
+- [Research](#research-a-topic-one-command), [subtitle search](#search-subtitles), [query syntax](#query-syntax-full-text-operators), [search options](#search-options-reference)
+- [YouTube discovery](#search-recent-youtube-uploads), [video metadata](#get-filmot-video-metadata), [transcripts](#download-transcripts), [pipeline downloads](#pipeline-download)
+- [Metadata maintenance](#saved-youtube-metadata-lifecycle), [library](#transcript-library), [claims](#claims-and-evidence), [sessions](#research-sessions)
+- [Channel analytics](#channel-profiles-and-analytics), [discovery and exports](#discovery-searches), [channel corpus](#channel-corpus-download--mine-channel-uploads)
+- [Advanced commands](#advanced-features), [agent workflows](#ai-agent-integration), [raw JSON](#raw-json-for-programmatic-access)
+
+## Usage
+
+> **Note:** If installed with `pip install -e .`, replace `python main.py` with `filmot` in all examples below.
+
+### Research a Topic (One Command)
+
+Search, qualify, and save transcripts with a bounded staged workflow:
+
+```bash
+# Scout, run staged searches, preview candidates, download, and checkpoint
+filmot research "nuclear fusion energy" --depth 12 --dedupe --min-matches 2
+
+# Options:
+#   --depth N                  Maximum selected transcripts to download (default: 10)
+#   --candidate-pages N        Pages per Filmot search stage (default: 3; max: 20)
+#   --candidate-pool N         Candidates per Filmot search stage (default: 150)
+#   --sort MODE                balanced (default), density, source-prior, or viewcount
+#   --channel/--channel-id     Constrain sources; fuzzy names resolve and fail closed
+#   --accept-broad             Explicitly allow a high-cardinality loose fallback
+#   --verbose                  Show full transcript failure details
+#   --fallback                 Use AWS Transcribe when captions are unavailable
+```
+
+`research` accumulates unique qualified candidates from title+transcript, then
+exact-phrase and `NEAR/N` stages until it reaches `--depth` or exhausts that
+relationship-preserving ladder. `--depth` is a maximum, not a promise: a
+duplicate keeps its first, stronger-stage origin, and a nonempty safe pool is
+kept even when it underfills the target. Filmot does not enter the loose
+transcript-wide fallback merely to fill the remaining slots; it reports the
+underfill and recommends inspecting the pool, refining TOPIC, or running a
+targeted exact/`NEAR/N` `filmot search`. Increasing `--depth` alone does not
+widen an exhausted safe pool. `--depth 0` skips Filmot ladder expansion beyond
+the initial title+transcript stage and downloads no selected candidates; an
+enabled scout can still join the preview, and an explicit `--probe` remains a
+separate phase over existing eligible library seeds.
+
+`--candidate-pages` (1–20) and `--candidate-pool` (at least 1) bound each Filmot
+search stage, not the whole research run. Several stages may each spend that budget;
+qualified candidates are then deduplicated and ranked together. Scout and
+probe work have their own bounds, and `--depth` caps the final selected
+transcript candidates rather than the number of API requests.
+
+That probe independence applies at every depth. If the current discovery is
+legitimately empty, Filmot records an empty selection and an explicit
+`--probe` still continues from eligible transcripts already saved in the topic
+library, including terminal zero-query accounting when its frontier is empty.
+This does not bypass safety failures: a fatal broad-scope gate still fails the
+research run closed instead of continuing into probe work.
+
+Exact/`NEAR/N` candidates must cover at least 75% of the topic tokens in one
+visible passage. These are lexical qualification and navigation signals, not
+semantic relevance, credibility, or truth judgments. At a positive depth,
+Filmot measures the loose fallback only when every safe stage returns zero
+candidates. A loose result set above `--broad-threshold` is blocked unless you
+explicitly pass `--accept-broad`, and accepted broad candidates must still pass a
+passage-level relevance gate. The default balanced rank shows relevance,
+density, echo risk, and a separate `source-prior`; that prior is only an
+audience/engagement heuristic, not a credibility or truth score.
+
+Fresh scout metadata passes a field-aware lexical admission gate before
+selection: the bounded ordered topic span must occur once in the title, or at
+least twice in total across the description and/or de-duplicated visible hit
+passages.
+This is inspectable lexical evidence, not a semantic relevance or truth
+judgment. Admitted scouts and Filmot candidates share one global rank, and
+selection follows that order exactly: `--depth` takes its first N entries with
+no reserved scout slot or hidden origin quota.
+
+With `--probe`, only selected or manually saved transcripts seed automatic
+expansion; prior automatic scout/probe discoveries stay readable but cannot
+recursively seed it. Filmot requires two eligible seeds and ranks
+cross-source pairs with source-length-normalized TF-IDF-style salience plus
+co-window and source support. It stops the lower-ranked automatic query tail
+after collecting its three-candidate capacity. It also stops when a query over
+`--broad-threshold` returns a bounded sample with zero new scoped candidates,
+labels that result `broad_sampled` rather than a global zero, and prints the
+exact constrained `filmot search` follow-up for manual inspection.
+
+If eligible seeds yield no sufficiently specific terms or no pair with the
+required cross-source/co-window support, probe runs zero queries and records a
+terminal empty outcome with reason `no_candidate_terms` or
+`no_cross_source_pairs`. This distinguishes an exhausted probe frontier from a
+search/API failure without implying that no semantic relationship exists.
+
+The scout request is persisted with its query, days, maximum results, order,
+and channel scope. Resume through `filmot sessions TOPIC --summary`: the scout
+table shows the request and prints a copyable `yt-search` inspection command
+with the recorded query, relative `--days` window, result budget, order,
+descriptions, and `--raw` output. Running it later searches a fresh relative
+window; it does not replay the original UTC interval. For a fixed interval,
+use explicit `--published-after` and `--published-before` bounds from the
+effective request when available. A single upstream channel is included in
+the inspection command; any multi-channel local filter remains explicit in
+raw provenance.
+
+### Search Subtitles
+
+Search for videos containing specific text in their transcripts:
+
+```bash
+# Basic search
+filmot search "hello world"
+
+# Search in specific language
+filmot search "machine learning" --lang en
+
+# Filter by views and sort by popularity
+filmot search "recipe" --min-views 10000 --sort viewcount --order desc
+
+# Sort by relevance density (matches per minute)
+filmot search "fusion energy" --sort density --min-matches 3
+
+# Filter by minimum subtitle matches (cuts noise)
+filmot search "quantum computing" --min-matches 2 --full
+
+# Search within specific channels
+filmot search "tutorial" --channel "programming" --channel-count 5
+
+# Fetch three candidate pages, display 20 videos, at most 5 hits each
+filmot search "AI" --pages 3 --sort density --limit 20 --max-hits 5
+
+# Route this follow-up query to a named investigation
+filmot search '"AMD" NEAR/15 "drug discovery"' --session robin-ai-scientist
+
+# Bulk download with deduplication
+filmot search "deep sea mining" --bulk-download deep-sea:10 --dedupe
+
+# Export the processed search response as JSON
+filmot search "AI" --raw > results.json
+```
+
+Fuzzy `--channel` names are resolved to displayed channel IDs before searching. If no channel resolves—or Filmot returns a result outside the resolved ID set—the command fails closed instead of silently widening the search.
+
+### Search Recent YouTube Uploads
+
+Use the YouTube Data API directly for uploads Filmot may not have indexed yet:
+
+```bash
+# Match the research scout request (research uses relevance, n=10)
+filmot yt-search "nuclear fusion energy" --days 7 --max-results 10 \
+  --order relevance --show-description --raw
+
+# Attach a case-insensitive transcript substring search to every video
+filmot yt-search "fusion news" --transcript \
+  --transcript-query "tritium" --raw
+
+# Fetch at most three pages and 120 distinct videos
+filmot yt-search "battery recycling" --pages 3 --max-results 120 --raw
+
+# Replay an exact UTC window and skip the optional videos.list enrichment call
+filmot yt-search "battery recycling" \
+  --published-after 2026-09-10T14:30:00Z \
+  --published-before 2026-09-12T14:30:00Z --no-enrich --raw
+```
+
+`yt-search` defaults to the last 7 days, `--order date --max-results 25
+--pages 1 --enrich`; an explicit `--published-after` replaces that relative
+lower bound. The research scout deliberately records and uses relevance order
+with a 10-result budget. `--max-results` is the distinct-result budget across pages,
+not a claim about all matches. Each requested page is another `search.list`
+call. `--page-token` resumes from an opaque `nextPageToken`, while
+`--published-after` and `--published-before` accept either a date or an exact
+RFC3339 timestamp. Because YouTube's upper bound is exclusive, a date-only
+`--published-before` includes that UTC date by sending the next UTC midnight.
+Replay a continuation token with the exact bounds and filters recorded beside
+it.
+
+With `--raw`, the command emits one `filmot.result/v1` object with `videos`, the
+credential-free effective `request`, token-based `coverage`, and `enrichment`
+accounting. Coverage records pages/calls, fetched and distinct counts,
+duplicates/malformed items, the approximate API total, continuation token, and
+whether the stop was exhaustion, the page budget, the result budget, or a
+later-page failure. A failure before any usable search page fails the command;
+a later-page failure preserves earlier rows and makes the result `partial`.
+Optional `videos.list` failure or missing IDs likewise preserve discovery rows,
+mark their metadata state, and make the aggregate partial rather than erasing
+the search.
+
+Enrichment batches up to 50 IDs per call and retains public snippet,
+statistics, content/status, live-stream, topic, regional/content-rating,
+made-for-kids, synthetic-media, and `paid_product_placement` disclosure fields
+when YouTube returns them. Missing counters remain `null`, distinct from an observed zero. Each
+metadata observation has UTC `metadata_observed_at` and
+`metadata_expires_at`. Exported raw artifacts are not maintained
+automatically. API-owned fields in saved transcript records can be inspected,
+refreshed, or purged explicitly with `yt-data`; see
+[Saved YouTube Metadata Lifecycle](#saved-youtube-metadata-lifecycle) and the
+[30-day storage guidance](YOUTUBE_API.md#storage-and-the-30-day-rule).
+
+The request defaults to 5-second connect and 20-second read timeouts with two
+bounded retries for transient network, timeout, server, or rate-limit errors.
+Use `--connect-timeout`, `--read-timeout`, and `--retries` to tighten those
+per-request limits. Authentication, invalid-request, and ordinary quota
+failures are not retried.
+
+With `--transcript`, each video has the same per-video
+`transcript_search` object used by human rendering: `query`, `status`,
+`match_count`, and `matches` (plus language/generation metadata when
+available). `--transcript-query` is a case-insensitive segment substring, not
+the `NEAR/N` grammar. A per-video transcript failure preserves the YouTube
+results, marks that nested result `failed`, adds a typed `transcript-search`
+error, and makes the top-level outcome `partial`.
+
+For one exact known channel, use `channel-download` rather than a
+`search.list(order=date)` crawl: it resolves the channel's uploads playlist and
+enumerates it with `playlistItems.list`, which is the documented upload path.
+
+### Fetch Exact YouTube Video Metadata
+
+Use `yt-video` when you already know the video identities and want current
+public `videos.list` metadata without a search call or caption request:
+
+```bash
+# Bare IDs, public URLs, repeated arguments, and comma-separated values work
+filmot yt-video dQw4w9WgXcQ \
+  https://www.youtube.com/shorts/aqz-KE-bpKQ --show-description
+
+# One pipeline-compatible result with request and per-ID coverage
+filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw > exact-videos.json
+
+# Fetch metadata, acquire the transcripts separately, and register lifecycle data
+filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw \
+  | filmot download -t exact-sources -n 2
+```
+
+Input is validated and deduplicated before quota is spent, then requested in
+batches of at most 50. The raw result retains request order and includes
+credential-free `request`, `coverage`, `id_outcomes`, observation/expiry times,
+warnings, and typed errors. `observed` means YouTube returned the resource;
+`not_returned` means a completed batch omitted it and does not establish why;
+`unprocessed` means its batch did not complete. Earlier successful batches are
+preserved if a later batch fails. Counts preserve observed zero separately
+from missing values.
+
+### Inspect Public YouTube Comments and Replies
+
+Use `yt-comments` for a bounded thread cursor on one exact video, then use the
+top-level comment ID printed inside a thread—not the outer thread ID—with
+`yt-replies` when you need that comment's independently paginated replies:
+
+```bash
+# Exact 11-character video ID or supported HTTPS YouTube video URL
+filmot yt-comments VIDEO_ID
+
+# Ask YouTube for relevance order, filter displayed comments, and include its
+# possibly incomplete embedded reply preview
+filmot yt-comments VIDEO_ID --order relevance \
+  --search "open question" --replies preview --raw
+
+# Retrieve replies through their own cursor; --video adds canonical source URLs
+filmot yt-replies TOP_LEVEL_COMMENT_ID --video VIDEO_ID --raw
+
+# A supported watch URL containing both v= and lc= supplies both identities
+filmot yt-replies \
+  "https://www.youtube.com/watch?v=VIDEO_ID&lc=TOP_LEVEL_COMMENT_ID"
+```
+
+Both commands default to one page, 25 rows, a 5-second connect timeout, a
+20-second read timeout, and two transient retries. `--pages` accepts 1–10,
+`--max-results`/`-n` accepts 1–500, and `--page-token` resumes the matching
+cursor. `yt-comments` additionally accepts `--order time|relevance` (default
+`time`), `--search`/`--search-terms`, and `--replies none|preview` (default
+`none`). `yt-replies --video` is optional video context for canonical links;
+it does not widen the parent-comment request. Replay a continuation with the
+same identity, filters, and bounds. Human output prints a copyable continuation
+command, while raw output records the token and argument vector in
+`continuation`. Generated continuations and the human reply drill-down preserve
+the active named session.
+
+YouTube can embed only a subset of a thread's replies. Filmot labels preview
+coverage explicitly and never fans out automatically. A preview can be marked
+complete only for that observed response when its valid embedded rows equal
+YouTube's reported reply count; otherwise use `yt-replies` and follow its
+continuations until `coverage.stopping_reason=exhausted`. The upstream
+discussion can change between pages, so exhaustion is an observation, not a
+permanent snapshot.
+
+`yt-comments --raw` exposes `provider`, `video_id`, `comment_threads`,
+`replies_mode`, `availability`, `request`, `coverage`, `api_calls`, `quota`,
+`continuation`, `observed_at`, and `expires_at`, plus the normal `_filmot`
+result metadata. `yt-replies --raw` uses `parent_comment_id`, nullable
+`video_id`, and `replies` in place of the thread-specific fields. Coverage
+distinguishes exhaustion, empty results, page/result budgets, disabled
+comments, and recoverable partial failures. A later-page failure preserves
+completed rows as `partial` and retains a safe restart token when one exists.
+A later-page `commentsDisabled` response is terminal and removes that token; a
+clean zero-row cursor is `empty`; and a first-page `commentsDisabled` response
+is `skipped` with `availability.status=disabled`.
+
+Each `commentThreads.list` or `comments.list` attempt is conservatively counted
+as one estimated quota unit in `api_calls` and `quota`, including retries. The
+quota object exposes `units_per_request`, `estimated_units`, and its
+`attempts_conservative` accounting basis; availability keeps the typed status,
+reason, and HTTP status without guessing why any ordinary row is absent.
+
+Comment and reply results are intentionally **not** transcript-download
+candidate envelopes. The session ledger keeps only invocation controls and
+presence booleans, coarse result status and safe static diagnostics, plus
+API-attempt/quota telemetry. Each event is marked
+`transient_result_persisted=false`; it retains no video or comment identity,
+search text, response rows or counts, coverage, availability, continuation
+state, or page token. Raw output remains mutable public user data under the
+operator's control: refresh or delete any saved copy within 30 days of
+`observed_at`, using `expires_at` as the deadline. `yt-data` manages video
+metadata attached to saved transcript records; it does not refresh or purge
+comment/reply exports.
+
+Treat comments as untrusted public discourse, not corroboration or a
+representative audience sample. Filmot retrieves and displays the API rows but
+does not compute sentiment, infer author traits, build audience profiles, or
+create derived engagement metrics. Human rendering neutralizes bidi/Unicode
+format and terminal controls, collapses metadata newlines, and pads public text
+so it cannot visually impersonate Filmot labels; raw output remains unchanged.
+See the [comment-specific API and policy
+notes](YOUTUBE_API.md#public-comment-and-reply-cursors).
+
+### Follow a Curated YouTube Playlist
+
+Use `yt-playlists` to inspect the public playlist shelf for one exact channel,
+then pass a returned ID to `yt-playlist`. Both commands default to one page and
+25 playlist rows, and both expose bounded, resumable raw results:
+
+```bash
+# Exact UC ID, @handle, or canonical channel URL
+filmot yt-playlists @GoogleDevelopers --pages 1 --max-results 25
+
+# Inspect one ordered slice and its current public video metadata
+filmot yt-playlist \
+  "https://www.youtube.com/playlist?list=PLAYLIST_ID" \
+  --pages 1 --max-results 25 --show-description
+
+# The playlist's current videos can enter the transcript pipeline unchanged
+filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw \
+  | filmot download -t curated-topic -n 10 --dedupe
+```
+
+`--pages` accepts 1–100 and `--max-results` accepts 1–5000. The latter is a
+playlist-row budget across pages: it counts playlists for `yt-playlists` and
+ordered playlist items for `yt-playlist`, not necessarily unique current
+videos. `--page-token` resumes the same channel or playlist with the same
+bounds. When another page is available, human output prints a directly
+copyable command and raw output includes the same argument vector under
+`continuation.argv`.
+
+The `yt-playlist --raw` result contains both the full ordered
+`playlist_items` slice and a pipeline-compatible `videos` array. Repeated
+videos remain visible at each playlist position but are enriched once; items
+without a usable video ID remain item evidence; and `videos` includes only
+resources returned by completed `videos.list` calls. Consequently the three
+counts can differ. An ID-less or omitted resource is neutral—it does not prove
+deletion, privacy, or unavailability. `yt-playlists --raw` is a shelf of
+playlist metadata, not a video-candidate pipeline.
+
+The CLI defaults to 5-second connect and 20-second read timeouts with two
+transient retries. Before retries, a one-page shelf costs one `channels.list`
+plus one `playlists.list` request. A one-page playlist costs one
+`playlists.list`, one `playlistItems.list`, and at most one `videos.list` call
+for up to 25 distinct IDs. Wider slices add at most one list call per page and
+one detail call per 50 distinct IDs; inspect `api_calls` for actual attempts.
+All returned metadata is a 30-day observation, including raw files saved
+outside Filmot's managed transcript library.
+
+Python integrations can use the same provider layer directly:
+
+```python
+from filmot.youtube_resources import (
+    get_playlist_detailed,
+    list_channel_playlists_detailed,
+)
+
+playlist = get_playlist_detailed(
+    "https://www.youtube.com/playlist?list=PLAYLIST_ID",
+    max_pages=2,
+    max_results=75,
+)
+
+shelf = list_channel_playlists_detailed(
+    "@exact_handle",
+    max_pages=2,
+    max_results=75,
+)
+```
+
+`get_playlist_detailed()` preserves ordered playlist-item evidence, looks up
+each distinct usable video ID once, and exposes only videos returned by a
+completed metadata request in its pipeline-safe `videos` projection.
+`list_channel_playlists_detailed()` resolves an exact channel ID or handle and
+enumerates its public playlist shelf. Both results record independent page and
+row budgets, API attempts, stopping reason, opaque continuation, partial
+failures, and 30-day observation/expiry timestamps. Supplied playlist URLs are
+reduced to a public ID and canonical URL before request metadata is returned;
+extra query parameters are never retained, and Google API-key-shaped values
+are rejected as playlist identities before quota use or logging. The Python
+provider defaults remain two pages and 100 rows; callers should always pass
+deliberate bounds.
+
+### Query Syntax (Full-Text Operators)
+
+Filmot uses [Manticore Search](https://manticoresearch.com/) under the hood. The following operators are supported in your search queries:
+
+#### Basic Operators
+
+| Operator | Syntax | Description | Example |
+|----------|--------|-------------|---------|
+| **AND** | `word1 word2` | Both words must appear somewhere in the same transcript; adjacency or a relationship is not implied | `python tutorial` |
+| **OR** | `word1 \| word2` | Either word can match | `"9 11" \| "nine eleven"` |
+| **Phrase** | `"exact phrase"` | Words must appear adjacent, in order | `"machine learning"` |
+| **Grouping** | `(expr1 \| expr2)` | Group expressions for complex queries | `python ("tutorial" \| "course")` |
+
+#### Advanced Operators
+
+| Operator | Syntax | Description | Example |
+|----------|--------|-------------|---------|
+| **Proximity** | `"words here"~N` | Words within N words of each other | `"cat dog"~5` |
+| **NEAR** | `word1 NEAR/N word2` | Words within N words, any order (max 500) | `hello NEAR/3 world` |
+| **NOTNEAR** | `word1 NOTNEAR/N word2` | word1 NOT within N words of word2 (max 500) | `python NOTNEAR/10 beginner` |
+| **NOT** | `-word` | Exclude videos containing word (global) | `python -beginner` |
+| **Wildcard** | `"word * word"` | Match exactly one word in between | `"sentiment * shared"` |
+
+> **Not Supported:** Prefix wildcards (`thermo*`), Quorum (`"words"/N`), and Strict Order (`<<`) are not currently supported by the Filmot API.
+
+> **NOTNEAR vs NOT:** The NOT operator (`-word`) excludes the **entire video** if the excluded word appears **anywhere** in the transcript. NOTNEAR is usually more practical — it only excludes matches where the terms appear close together. For example, `python NOTNEAR/10 beginner` finds "python" mentions that aren't in a beginner context (max distance: 500 words).
+
+> **Recall tip:** Exact phrases and `NEAR/N` stay literal. A low count is not evidence that a subject is rare: try singular/plural, inflection, spelling, and likely auto-caption variants before drawing that conclusion.
+
+#### OR with Phrases (Handling Transcription Variations)
+
+YouTube auto-captions transcribe words inconsistently. Use OR (`|`) with phrases to catch all variations:
+
+```bash
+# Find all mentions of "9/11" regardless of how it was transcribed
+filmot search '"9 11" | "nine eleven" | "september 11" | "9/11"'
+
+# Find references to "AI" with variations
+filmot search '"artificial intelligence" | "A.I." | "AI"'
+
+# Brand name variations
+filmot search '"iPhone" | "i phone" | "i-phone"'
+```
+
+> **Proximity syntax caveat:** Do not put `|` inside a quoted phrase when using `NEAR/N` or `NOTNEAR/N`. This backend form is invalid: `"memory|context" NEAR/20 "production"`. Use grouped OR instead: `("memory" | "context") NEAR/20 "production"`. Filmot now rewrites the invalid form automatically, but the grouped form is the correct syntax to write.
+
+#### Combining Operators with Grouping
+
+Use parentheses `()` to build complex queries combining multiple operators:
+
+```bash
+# Python AND (tutorial OR course)
+filmot search 'python ("tutorial" | "course")'
+
+# Find "machine learning" near "neural network" within 10 words
+filmot search '"machine learning" NEAR/10 "neural network"'
+
+# Proximity - words within 5 words of each other
+filmot search '"deep learning tensorflow"~5'
+
+# Find Python content that's NOT in a beginner context
+filmot search 'python NOTNEAR/10 beginner'
+
+# Complex: Find Filmot mentions near YouTube-related terms (with spelling variations)
+filmot search '("filmot" | "philmot" | "filmont") NEAR/50 ("youtube" | "transcript" | "subtitle")'
+
+# Correct way to use OR inside proximity queries
+filmot search '("memory" | "context") NEAR/20 "production"'
+filmot search '"agent memory" NEAR/20 ("vector" | "graph" | "database")'
+
+# Find advanced Python discussions (exclude videos with "beginner" anywhere)
+filmot search 'python "advanced" -beginner'
+```
+
+> **Note:** When using `|` (OR) in PowerShell, wrap your query in single quotes to prevent shell interpretation.
+
+#### `--title` Supports Operators Too
+
+The `--title` filter also supports Manticore operators, not just plain text:
+
+```bash
+# Implicit AND: title must contain "deep" AND "sea" AND "mining" (in any order)
+filmot search "cobalt" --title "deep sea mining"
+
+# Exact phrase: title must contain "deep sea mining" as a phrase
+filmot search "cobalt" --title '"deep sea mining"'
+
+# OR: title has "deep sea" AND (mining OR extraction)
+filmot search "cobalt" --title 'deep sea (mining | extraction)'
+```
+
+> **Tip:** Avoid `AND` as a keyword in `--title` — it's treated as a literal word, not an operator. Use implicit AND (just space-separate words) instead.
+
+### Search Options Reference
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--lang, -l` | Language code | `--lang en` |
+| `--page, -p` | Page number (50 results/page) | `--page 2` |
+| `--pages` | Fetch N pages before client-side filtering/ranking | `--pages 3` |
+| `--candidate-pool` | Cap candidates fetched across `--pages` | `--candidate-pool 120` |
+| `--category, -c` | Video category | `--category "Education"` |
+| `--exclude` | Exclude categories (comma-separated) | `--exclude "Music,Gaming"` |
+| `--channel-id` | Limit to specific channel ID(s), comma-delimited | `--channel-id UCxyz...,UCabc...` |
+| `--channel` | Resolve channel text to displayed IDs; fail closed on no match | `--channel "tech"` |
+| `--channel-count` | Max channels for `--channel` (default 10) | `--channel-count 5` |
+| `--title` | Filter by video title — supports operators | `--title "deep sea mining"` |
+| `--min-views` | Minimum view count | `--min-views 10000` |
+| `--max-views` | Maximum view count | `--max-views 1000000` |
+| `--min-likes` | Minimum like count | `--min-likes 500` |
+| `--max-likes` | Maximum like count | `--max-likes 50000` |
+| `--min-duration` | Minimum duration (seconds) | `--min-duration 600` |
+| `--max-duration` | Maximum duration (seconds) | `--max-duration 3600` |
+| `--start-date` | Videos after date (yyyy-mm-dd) | `--start-date 2024-01-01` |
+| `--end-date` | Videos before date (yyyy-mm-dd) | `--end-date 2024-12-31` |
+| `--country` | Country code (see table below) | `--country 217` |
+| `--license` | 1=Standard, 2=Creative Commons | `--license 2` |
+| `--sort` | Sort by: `viewcount`, `likecount`, `uploaddate`, `duration`, `chanrank`, `id`, `density` | `--sort viewcount` |
+| `--order` | Order: `asc` or `desc` | `--order desc` |
+| `--manual-subs` | Search manual subtitles only (default: auto subs) | `--manual-subs` |
+| `--max-query-time` | Max query time (4-15000 ms) | `--max-query-time 5000` |
+| `--hit-format` | 0=context snippets, 1=full lines | `--hit-format 1` |
+| `--full` | Show all non-duplicate hit snippets returned for displayed videos on fetched candidate pages; duplicate segments may be collapsed and no extra pages are fetched | `--full` |
+| `--limit`, `--top` | Maximum video results to display/output | `--limit 20` |
+| `--max-hits` | Maximum hit details displayed per video | `--max-hits 5` |
+| `--context` | Characters of context per side in snippets (default 50; minimum 0) | `--context 200` |
+| `--raw` | Emit one JSON value after parsing on normal completion, including runtime/API errors | `--raw` |
+| `--min-matches` | Only show videos with N+ subtitle matches | `--min-matches 3` |
+| `--bulk-download` | Download top N transcripts to TOPIC | `--bulk-download topic:10` |
+| `--session` | Log this search to a named research session; overrides `FILMOT_SESSION` and bulk-topic inference | `--session topic-investigation` |
+| `--fallback` | Use AWS Transcribe fallback for bulk download | `--fallback` |
+| `--dedupe` | Skip matching first-500-character transcript fingerprints during bulk download | `--dedupe` |
+| `--no-proxy` | Bypass proxies during bulk transcript download | `--bulk-download topic:10 --no-proxy` |
+| `--source` | Transcript source for bulk download: `auto`, `youtube`, or `filmot`; defaults to `FILMOT_TRANSCRIPT_SOURCE`, then `auto` | `--bulk-download topic:10 --source filmot` |
+
+### Multilingual Search
+
+Filmot searches indexed automatic and manual captions in many scripts,
+including Devanagari, Cyrillic, CJK, Arabic, and Hebrew. Coverage and language
+tags depend on the indexed tracks and the API endpoint/provider.
+
+| Language | Script | `--lang` code | Notes |
+|----------|--------|---------------|-------|
+| English | Latin | `en` | Language-code example |
+| Spanish | Latin | `es` | Language-code example |
+| German | Latin | `de` | Handles umlauts |
+| Hindi | Devanagari | `hi` | Language-code example |
+| Russian | Cyrillic | `ru` | Language-code example |
+| Japanese | CJK | `ja` | Language-code example |
+| Korean | Hangul | `ko` | Language-code example |
+| Arabic | Arabic | `ar` | RTL supported |
+| Hebrew | Hebrew | `iw` | Legacy-code troubleshooting example |
+| Chinese | CJK | omit `--lang` | Unfiltered troubleshooting example |
+
+Earlier project observations on some provider routes favored `iw` for Hebrew
+and an unfiltered query for Chinese. Those historical observations do not
+establish that `he`, `zh`, or `zh-Hans` fail on every current endpoint/provider.
+Compare the response with and without a language filter when diagnosing a miss.
+
+```bash
+# Latin-script languages — use standard codes
+filmot search "inteligencia artificial" --lang es --full
+
+# Japanese and Korean language-code examples
+filmot search "人工知能" --lang ja --full
+filmot search "인공지능" --lang ko --full
+
+# Hebrew — try the legacy code observed on some provider routes
+filmot search "בינה מלאכותית" --lang iw --full
+
+# Chinese — compare an unfiltered query when language filtering misses results
+filmot search "人工智能" --full
+
+# Hindi and Russian language-code examples
+filmot search "कृत्रिम बुद्धिमत्ता" --lang hi --full
+filmot search "нейросеть" --lang ru --full
+```
+
+> **Tip:** If a language-filtered query returns nothing, compare it with the same query without `--lang`. A tag mismatch and missing indexed captions are different explanations for an empty result.
+
+### Get Filmot Video Metadata
+
+Retrieve Filmot-index metadata for up to 200 YouTube videos at once. Use
+[`yt-video`](#fetch-exact-youtube-video-metadata) for a current public YouTube
+Data API observation:
+
+```bash
+# Single video
+filmot video dQw4w9WgXcQ
+
+# Multiple videos (comma-separated)
+filmot video "dQw4w9WgXcQ,aqz-KE-bpKQ,M7lc1UVf-VE"
+
+# Title, channel, duration, and upload date only
+filmot video dQw4w9WgXcQ --basic
+
+# Raw JSON output
+filmot video dQw4w9WgXcQ --raw
+```
+
+By default `video` also shows the description, view and like counts, category,
+automatic and manual caption languages, license (Creative Commons or standard),
+unlisted and livestream flags, channel subscribers and country, and the date of
+Filmot's snapshot. These come from Filmot's index, which may lag YouTube; the
+snapshot date says how old they are. Both providers serve the full lookup. On
+the direct API it costs 2 credits per call, and `--basic` costs 1. Raw output
+marks the lookup with `"detail": "full"` or `"basic"`.
+
+### Download Transcripts
+
+Fetch full YouTube transcripts for deep content analysis. This goes beyond search snippets — get the **complete** video content:
+
+```bash
+# Get transcript summary (shows excerpt)
+filmot transcript VIDEO_ID
+
+# Get FULL transcript (for AI processing)
+filmot transcript VIDEO_ID --full
+
+# Chunk transcript into 10-minute segments (easier to navigate)
+filmot transcript VIDEO_ID --chunk 10
+
+# Include timestamps for each segment
+filmot transcript VIDEO_ID --timestamps
+
+# Save to file
+filmot transcript VIDEO_ID -o transcript.txt
+
+# Export as JSON
+filmot transcript VIDEO_ID --raw > data.json
+
+# Search exact moments with proximity syntax and citation-ready links
+filmot transcript VIDEO_ID --grep '"expected free energy" NEAR/30 "policies"'
+
+# Works with YouTube URLs too
+filmot transcript "https://youtube.com/watch?v=VIDEO_ID" --full
+
+# Save directly to library under a topic
+filmot transcript VIDEO_ID --full --save-to my-topic
+
+# Save with the exact matching row from an earlier discovery artifact
+filmot yt-search "fresh topic" --raw > discovery.json
+filmot transcript VIDEO_ID --save-to my-topic --discovery discovery.json
+
+# Use AWS Transcribe fallback when YouTube captions unavailable
+filmot transcript VIDEO_ID --fallback --full
+
+# Take the transcript from Filmot's subtitle index, without contacting YouTube
+filmot transcript VIDEO_ID --source filmot
+```
+
+#### Transcripts from Filmot's index
+
+Filmot keeps the caption tracks it indexed, including tracks for videos that
+YouTube has since made unavailable. When YouTube can't deliver a transcript,
+Filmot falls back to that index, before any AWS fallback. That covers a blocked
+IP or proxy, captions that are now disabled, and a video that has been removed.
+This applies to `transcript`, `download`, `search --bulk-download`,
+`research`, and `channel-download`. Each fallback is one `/getvideos` lookup:
+it costs 2 credits on the official API. Under `auto`, a configured legacy
+RapidAPI key takes precedence for this shared route. The lookup is skipped
+when no Filmot key is configured.
+
+| `--source` | Behavior |
+| --- | --- |
+| `auto` (default) | YouTube first, then Filmot's index |
+| `youtube` | YouTube only, as before |
+| `filmot` | Filmot's index only; YouTube is never contacted |
+
+Set the default with `FILMOT_TRANSCRIPT_SOURCE`. `channel-download` follows
+that variable. `--fallback` downloads audio from YouTube, so it is refused in
+index-only mode. Filmot waits at most `FILMOT_TRANSCRIPT_ROUTE_TIMEOUT` (30
+seconds by default) for an index lookup, the same deadline as a YouTube route,
+and reports a slower lookup as `IndexTimeout`. An abandoned lookup starts no
+new requests, though one already sent may still be charged.
+
+Index transcripts are marked `source: filmot_index` and record a
+`transcript_index` block: the track's language, whether it was automatic,
+Filmot's snapshot date, the API provider, and, after a fallback, the YouTube
+error type. That block is also stored with library saves, including
+`channel-download` saves, whose manifest records each video's `source`. Filmot
+prefers a manual track over an automatic one in the first requested language it
+has. It cannot translate, so `--lang` must match a language Filmot indexed.
+Index lines carry start times only, so each segment ends where the next begins,
+and the last ends within 10 seconds. The captions are Filmot's snapshot and can
+be older than the video's current captions.
+
+#### AWS Transcribe fallback
+
+`--fallback` downloads a video's audio, uploads it to an S3 bucket you
+control, and transcribes it with AWS Transcribe when no captions are
+available. See [AWS Transcribe setup](CONFIGURATION.md#aws-transcribe-fallback)
+for the `yt-dlp`/`boto3` dependencies, AWS credentials, bucket, and region
+settings. `FILMOT_S3_BUCKET` must name a bucket you control; there is no default.
+Without it, `--fallback` stops before downloading any audio.
+
+Library saves retain the complete text plus any source caption segments and
+their timestamps. Filmot also normalizes citation-ready source metadata such
+as the video ID, URL, title, channel, publication date, views, and acquisition
+source when those fields are available. Older text-only records are normalized
+to the current read shape in memory, with an empty segment list; they are not
+rewritten merely because they were read. For `transcript --grep`, Filmot reuses
+one unambiguous language-compatible local record before configuring external
+routes, but only when its finite, monotonic timestamp segments reproduce the
+stored full text exactly. Equivalent copies saved under multiple topics
+collapse to one candidate; distinct usable copies, language mismatches,
+text-only records, or invalid timing fall back explicitly to the normal fetch.
+Blank or malformed proximity grep syntax fails preflight before library lookup,
+route setup, or network access. `--grep` is intentionally exclusive of
+`--save-to`, `--output`, `--full`, `--timestamps`, `--chunk`, and `--fallback`.
+Each human match includes its readable timestamp and literal timestamped
+YouTube URL. Raw grep returns `query`, `match_count`, and stable `matches` rows
+with `seconds`, `timestamp`, `deep_link`, and `excerpt`; no matches are typed
+`empty`, while bad syntax is a typed `InvalidGrepQuery` at `parse-query`. When
+`--chunk` and `--timestamps` are
+combined, `--chunk` takes precedence for human presentation and plain-text
+export. The original caption segments remain present in raw/JSON output and
+are what `--save-to`, bulk download, pipeline download, and research preserve.
+
+`--discovery FILE` requires `--save-to`. It accepts provider-neutral Filmot or
+direct YouTube candidate arrays and `result`/`videos`/`items` envelopes,
+normalizes common aliases, validates the entire artifact, and selects exactly
+one row by the requested video ID. Missing, malformed, conflicting, absent, or
+duplicate matching IDs fail before transcript acquisition or library mutation.
+For a new record, explicitly supplied discovery metadata wins. Missing title
+or channel triggers an initial Filmot lookup, which can also fill other
+missing returned metadata, such as channel ID, publication date, and duration.
+The separate save-time enrichment lookup is described below. The artifact's
+bytes receive a `sha256:` discovery reference in save/enrichment provenance;
+Filmot never guesses metadata from the most recent query or a nearby session
+event.
+
+Provider ownership determines how an existing record is updated. A direct
+YouTube candidate is registered under `metadata_lifecycle.youtube`: Filmot
+removes the previous YouTube-owned path set before applying the new
+observation, so a field omitted upstream cannot survive as stale API data.
+Values outside that owned set remain untouched; a colliding manual or
+other-provider value is preserved and reported as a conflict. A Filmot-shaped
+candidate retains the earlier atomic fill-only behavior: missing values and
+recognized `Unknown` placeholders can be filled, while known values and
+observed zeroes are not replaced. Both paths preserve transcript text, source
+segments, original `saved_at`, acquisition metadata, citations, and unrelated
+record fields.
+
+The manual `transcript ... --save-to ... --discovery ...` path still acquires
+the transcript before reaching its existing-record check. For current YouTube
+metadata without caption acquisition, use
+`filmot yt-data refresh --video VIDEO_ID`; it updates every saved topic copy of
+that ID unless `--topic` narrows the selection.
+
+Library saves validate the record and segments before publication, serialize
+strict JSON to a unique same-directory temporary file, flush and `fsync` that
+file, and then atomically replace the destination. A validation,
+serialization, write, or pre-replace failure therefore leaves an existing
+record intact; leftover temporary files are cleaned up best-effort.
+
+### Search Within Transcripts
+
+Find specific terms within a video's transcript with context:
+
+```bash
+# Find all mentions of "fusion" in a video
+filmot transcript-search VIDEO_ID "fusion"
+
+# Get more context around matches
+filmot transcript-search VIDEO_ID "reactor" --context 3
+```
+
+This is perfect for navigating long videos — jump directly to the relevant timestamps!
+
+### Pipeline Download
+
+Download transcripts from piped Filmot or direct YouTube discovery results for
+custom workflows:
+
+`download --count N` (or `-n N`) selects the first N input candidates, with a
+default of 50. It slices the input before skipping existing records, duplicate
+transcripts, or failed acquisitions, so N is not a target number of new saves.
+Rerunning the same input does not automatically advance beyond that slice.
+Increase the count or supply a different candidate slice to continue. Existing
+records are skipped rather than refreshed; use metadata maintenance commands
+or the explicit `transcript --save-to ... --discovery ...` path to update them.
+
+```bash
+# Search with raw output, pipe to download
+filmot search "deep sea mining" --title "deep sea mining" --raw | filmot download -t deep-sea --dedupe
+
+# Export a multi-page search, then feed the JSON file to download
+filmot search-all "AI safety" --pages 5 --output results.json --format json
+# Bash:
+filmot download -t ai-safety --dedupe -n 20 < results.json
+# PowerShell:
+Get-Content -Raw results.json | filmot download -t ai-safety --dedupe -n 20
+
+# Unchanged direct YouTube raw output uses the same pipeline
+filmot yt-search "fresh AI safety" --pages 2 --max-results 75 --raw \
+  | filmot download -t ai-safety -n 20
+
+# Exact-ID YouTube metadata uses the same candidate envelope
+filmot yt-video dQw4w9WgXcQ,aqz-KE-bpKQ --raw \
+  | filmot download -t exact-sources -n 2
+
+# A curated playlist exposes a safe current-video projection
+filmot yt-playlist PLAYLIST_ID --pages 1 --max-results 25 --raw \
+  | filmot download -t curated-sources -n 10 --dedupe
+```
+
+The download boundary normalizes the complete candidate batch before opening
+transcript routes or mutating the library. It understands Filmot's
+`id`/`channelname`/`uploaddate`/`viewcount` spellings and direct YouTube's
+`video_id`/`channel_title`/`published_at`/`views` spellings. A valid zero is
+preserved; missing metadata remains unknown. Unknown provider fields are kept
+in a bounded, credential-scrubbed `provider_fields` object; freshness,
+disclosure, status, and topic provenance is prioritized ahead of bulky native
+extras. Any invalid or conflicting identity rejects the whole preflight, so a
+bad later row cannot leave a partially downloaded batch.
+
+`download` hashes the exact decoded stdin text as a `sha256:`
+`discovery_ref`. For each successfully saved direct-YouTube candidate it also
+registers the provider-owned metadata lifecycle. A lifecycle-registration
+failure does not discard the transcript; the command reports a partial result,
+and the explicitly recorded YouTube provenance makes the record eligible for
+later adoption by `yt-data refresh`.
+
+`download` checks a versioned input's `_filmot.status` before acquisition.
+Failed or interrupted discovery cannot become a successful empty download.
+Partial discovery can supply usable candidates, but its errors and continuation
+remain in the download outcome, which exits nonzero after processing them.
+Bare arrays and legacy envelopes remain supported. In unattended scripts,
+retain the discovery artifact so its continuation can be resumed separately.
+
+### Saved YouTube Metadata Lifecycle
+
+Maintain API-derived fields in saved transcript records without reacquiring
+captions:
+
+```bash
+# Offline, read-only inventory across every topic
+filmot yt-data status
+filmot yt-data status --expired --raw
+filmot yt-data status --topic ai-safety --video dQw4w9WgXcQ
+
+# Preview the default expired-only refresh, then perform it
+filmot yt-data refresh --dry-run --raw
+filmot yt-data refresh
+
+# Refresh every saved topic copy of exact IDs; each unique ID is fetched once
+filmot yt-data refresh --video dQw4w9WgXcQ,aqz-KE-bpKQ
+
+# Explicitly include current and unmanaged records, within a quota budget
+filmot yt-data refresh --all --max-videos 250
+
+# Preview or confirm removal of expired API-owned fields only
+filmot yt-data purge --dry-run --raw
+filmot yt-data purge --yes
+filmot yt-data purge --all --max-records 1000 --yes
+```
+
+`status` uses no API key, makes no network request, and classifies each saved
+copy as `current`, `expired`, or `unmanaged` while surfacing invalid records
+separately and retaining more specific lifecycle states such as
+`not_returned` and `purged`. Legacy records
+with explicit YouTube provenance are marked adoptable. `refresh` defaults to
+expired copies; `--video` explicitly selects every saved copy of the supplied
+ID (optionally restricted by `--topic`), while `--all` widens the default scope
+to current and unmanaged copies. `--video` and `--all` are mutually exclusive.
+`--max-videos` bounds unique IDs, not topic copies. `--dry-run` performs neither
+API calls nor writes.
+
+A successful `videos.list` observation replaces only the record paths owned by
+the prior YouTube observation and records exact JSON Pointer ownership,
+observation/expiry times, a bounded audit trail, and a `sha256:` reference to
+the credential-free effective request. An observed `0` or `false` is data, not
+absence. If a completed batch does not return an ID, Filmot records the neutral
+`not_returned` state and removes its previous API-owned values; it does not
+infer deletion, privacy, or invalidity. If a failed batch leaves an ID
+`unprocessed`, the old record and expiry are not advanced.
+
+`purge` is offline and defaults to expired copies. It requires confirmation
+unless `--yes` is supplied; `--dry-run` never prompts or writes. Purge removes
+only the lifecycle's owned API paths and retains transcript text, segments,
+manual or other-provider metadata, citations, acquisition details, and the
+lifecycle audit record. Mutations are guarded and atomic per record, but a
+multi-record refresh or purge is not one cross-record transaction.
+
+### Filmot Metadata in the Library
+
+Every library save (`transcript --save-to`, `search --bulk-download`,
+`download`, and `research`) looks up the videos it just saved in Filmot's index.
+It makes one call per 200 videos and fills in missing fields: title and channel
+when they were unknown, description, view and like counts, category, caption
+languages, license, flags, video duration, and channel details. Metadata-search
+discoveries also retain dislike counts when supplied. Known values are never
+overwritten. Counts filled this way carry Filmot's snapshot date in
+`views_observed_at`, and the record keeps a `filmot_enrichment` block saying
+what was filled, when, and through which provider. The lookup is best effort:
+if it fails, the transcript is still saved and the command reports the failure.
+It is skipped silently when no Filmot key is configured. To turn it off, set
+`FILMOT_ENRICH_ON_SAVE=0`.
+
+Records saved before this feature, or while it was off, can be repaired in
+batches:
+
+```bash
+# Preview: records needing a complete metadata lookup, and their call budget
+filmot library enrich --dry-run
+
+# Enrich one topic, or exact videos in every topic
+filmot library enrich ufo-research
+filmot library enrich --video dQw4w9WgXcQ,aqz-KE-bpKQ --raw
+
+# Recheck records Filmot already enriched, within a video budget
+filmot library enrich --all --max-videos 400
+```
+
+`--max-videos` defaults to 1,000 unique IDs and accepts 1–10,000. The budget
+also applies to `--all`; copies of a selected ID in several topics share one
+lookup. Truncation adds a warning and `summary.truncated_videos`, the number of
+omitted unique IDs. A truncated `--dry-run` stays `completed`; on a real run,
+truncation makes an otherwise completed result `partial`. `--dry-run` previews
+selection and calls without API access or writes.
+
+Filmot discovery metadata already supplied to `download` or
+`transcript --discovery` is preserved even with automatic lookup disabled.
+Its license and flags keep Filmot semantics, and its counts retain the index
+snapshot date. `video_duration_seconds` describes the video; transcript
+`duration_seconds` still describes acquired captions. The enrichment marker
+tracks its schema, cumulative filled fields and per-field observation dates.
+Default backfill includes missing/older schemas and discovery-only imports that
+have not had a complete-column lookup. A completed lookup with no returned video
+records `lookup_status: not_returned` and is skipped on later default runs.
+Provider failures do not create or advance a completed lookup receipt; records
+without one remain eligible, while an earlier completed receipt stays intact.
+`--all` or `--video` explicitly rechecks completed lookups, including partial
+or missing observations, without
+overwriting known values. Lookup time is distinct from the index snapshot date:
+`lookup_at` advances on completed full lookups even when no metadata changes;
+the stored field observation dates remain intact. `lookup_status` describes
+the last full lookup, even if a later discovery import adds metadata.
+Imported canonical fields receive the same validation as raw
+Filmot fields; invalid durations, dates, flags and counts remain unknown.
+
+On a record with YouTube Data API metadata (a YouTube discovery, or any
+`yt-data` lifecycle), Filmot fills its separately named index fields: category,
+caption languages, license, flags, channel details, `video_duration_seconds`,
+and metadata-search `dislikes` when supplied. Shared title, description, view
+and like counts, and the other YouTube-owned fields stay with `yt-data refresh`
+and `purge`. The reverse also holds: on a record Filmot enriched first, a later
+`yt-data refresh` keeps Filmot's title, description,
+and counts. It reports them under `conflict_paths` instead of replacing them,
+like any value another source filled.
+
+### Transcript Library
+
+Manage a local library of transcripts organized by topic for building curated knowledge bases:
+
+```bash
+# List all topics
+filmot library list
+
+# List transcripts in a topic
+filmot library list deep-sea-mining
+
+# Machine-readable topic inventory
+filmot library list deep-sea-mining --raw
+
+# Search across all saved transcripts (word-boundary matching by default)
+filmot library search "dark oxygen"
+
+# Raw search rows include citation-ready excerpt details when timestamps exist
+filmot library search "dark oxygen" --topic deep-sea-mining --raw
+
+# Read a saved passage locally, selecting the topic copy explicitly
+filmot library read VIDEO_ID --topic deep-sea-mining --from 1:30 --to 3:00
+filmot library read VIDEO_ID --topic deep-sea-mining --from 90 --to 180 --raw
+
+# Force substring matching (catches plurals automatically via fallback)
+filmot library search "patent" --substring
+
+# Find passages where different sources use the same term or phrase
+filmot library compare "cobalt" --sort density
+filmot library compare "moratorium" --context 200 --topic deep-sea-mining
+filmot library compare "moratorium" --topic deep-sea-mining --raw
+
+# Compare full saved transcripts for shared phrasing (read-only by default)
+filmot library echoes deep-sea-mining
+filmot library echoes deep-sea-mining --ngram 5 --threshold 0.5 --raw
+
+# Persist the same deterministic analysis as a content-addressed artifact
+filmot library echoes deep-sea-mining --persist
+
+# Get combined text for LLM context
+filmot library context deep-sea-mining
+
+# Structured markdown with metadata headers (auto-saves to file)
+filmot library context deep-sea-mining --format structured
+
+# Get combined text limited to 50K chars
+filmot library context deep-sea-mining --max-chars 50000
+
+# Create missing parent directories for an explicit artifact path
+filmot library context deep-sea-mining --output exports/deep-sea/context.txt
+
+# Show library statistics
+filmot library stats
+
+# Fill missing metadata from Filmot's index (see "Filmot Metadata in the Library")
+filmot library enrich deep-sea-mining
+
+# Explicitly assign an ambiguous pre-Unicode topic directory
+filmot library migrate-topic "AI 人工知能"
+
+# Delete a transcript or entire topic
+filmot library delete VIDEO_ID
+filmot library delete topic-name --all
+```
+
+`library read VIDEO --from TIME --to TIME` reads saved caption segments only;
+it never fetches on a miss or ambiguous selection. Multiple topic copies require
+`--topic`. Defaults cap returned text at 6,000 characters and 80 segments, with
+explicit truncation, provenance, language, and timing in human and raw output.
+See [Local passage reading](LOCAL_PASSAGES.md) for window semantics, JSON fields,
+text-only records, and separate acquisition/refresh guidance.
+
+`library list`, `read`, `search`, `compare`, and `stats` are read-only and never append
+session events. `library context` is also read-only when it prints to stdout;
+writing context to a file, including the auto-save performed by structured
+format, logs the write. An explicit `--output` creates missing parent
+directories. Parent-creation and file-write failures use the same typed
+`write-output` failure, exit nonzero, and log the failed delivery rather than
+claiming an artifact was saved. Raw `search` and `compare` rows include
+excerpt text,
+character offsets, and, for records with saved caption segments, timestamps
+and YouTube deep links. Legacy records remain searchable but cannot acquire a
+source timestamp that was never stored. Missing, invalid, incomplete, or
+text-misaligned segment timing stays explicitly untimed.
+
+`library echoes` computes Unicode-normalized word n-gram Jaccard similarity
+over each source's **full saved transcript**. Defaults are `--ngram 5` and
+`--threshold 0.5`. Pair scores and deterministic single-linkage clusters are
+advisory evidence of possible reuse or common lineage—not proof of copying,
+dependence, credibility, falsity, or truth. Method metadata records the runtime
+Unicode database version. Method v2 also pins the extended Han, Kana,
+Bopomofo, and Hangul character ranges used for script-aware tokenization, so
+those ranges do not depend on the runtime regex tables. Corpus loading fails
+closed if any record is unreadable, malformed, or missing required
+identity/text. The command never logs. Without `--persist` it is entirely
+read-only; with `--persist` it writes a reproducible, content-addressed artifact to
+`.filmot_data/analysis/TOPIC/echoes-HASH.json`. The SHA-256 digest covers the
+canonical stored payload, including its normalized topic and excluding only
+the self-describing hash field. Existing artifacts are content-verified and
+never overwritten.
+
+Human output shows at most the 25 strongest threshold-matching pairs to keep a
+large corpus readable. `--raw` and persisted artifacts retain every pair.
+
+`migrate-topic` moves an entire legacy directory; it cannot infer which files
+belong to which original topic or partition a directory that old versions
+merged. Review the displayed source and destination paths, and confirm only
+when every source file belongs to the requested topic. Existing destination
+conflicts remain in the legacy directory rather than being overwritten.
+
+Topic slug v1 uses Python's bundled Unicode database for NFKC normalization,
+case folding, and character categories. Pin the Python minor version for one
+shared data directory and inspect topic routing before upgrading it: Unicode
+table changes can move unusual or newly assigned code points. Filmot preserves
+this behavior to avoid silently relocating existing topic directories; the
+legacy migration command does not repair Unicode-version drift.
+
+### Claims and Evidence
+
+Claims are exact, human-authored statements. Citations record an explicit
+relationship to the statement; Filmot does not infer stance, independence,
+confidence, or truth.
+
+```bash
+# Declare an atomic claim; omit --id for a stable text-derived ID
+filmot claims add robin-ai-scientist \
+  "Robin nominated ripasudil for testing in an AMD model"
+
+# Attach timestamped video evidence
+filmot claims cite robin-ai-scientist c-CLAIMID \
+  --video VIDEO_ID --at 5:12 --relation supports \
+  --excerpt "short exact source passage" --secondary
+
+# Attach a primary document with a precise locator and separate analyst note
+filmot claims cite robin-ai-scientist c-CLAIMID \
+  --source "https://example.org/paper" --source-kind paper \
+  --relation qualifies --locator "Figure 2" \
+  --excerpt "short exact source passage" --note "Limits the model claim" \
+  --primary --independence independent
+
+# Append a human assessment; it supersedes the prior assessment
+filmot claims assess robin-ai-scientist c-CLAIMID \
+  --verdict mixed --confidence medium --note "Preclinical evidence only"
+
+# Show the topic register or one claim
+filmot claims show robin-ai-scientist
+filmot claims show robin-ai-scientist c-CLAIMID --raw
+```
+
+Every `claims add`, `cite`, `assess`, and `show` command supports `--raw`.
+Evidence relations are `supports`, `contradicts`, `qualifies`, `context`,
+`origin`, and `mentions`. Verdicts are `open`, `supported`, `contradicted`, and
+`mixed`; confidence is `unknown`, `low`, `medium`, or `high`. Evidence can
+also be marked `--independence independent|echo` and assigned a
+`--lineage-group`. `--at` accepts finite, non-negative seconds or the displayed
+`M:SS`/`H:MM:SS` form and persists canonical numeric seconds; it cannot be
+attached to a non-video source. Likewise, `--video` requires source kind
+`video`; `--source` and `--video` are mutually exclusive because one evidence
+event represents one source. `--video` accepts only an exact 11-character
+YouTube ID matching `[A-Za-z0-9_-]{11}` (not a URL) and supplies its canonical
+YouTube URL; malformed values are rejected before persistence.
+
+Omitted claim IDs use `utf8-ascii-whitespace/v1`: SHA-256 over exact UTF-8 code
+points after folding only ASCII whitespace. Case and all non-ASCII code points
+are preserved, so IDs do not drift with Python's Unicode database. The method
+is stored with each declaration; explicit IDs record `explicit`. Evidence and
+assessment IDs use `canonical-json-array/v2`, hashing unambiguous canonical
+JSON field vectors rather than delimiter-joined text. A v2 evidence ID covers
+all persisted identity and provenance inputs—including the claim/relation,
+source and source kind, video/timestamp or document locator, excerpt, note,
+primary/independence/lineage classifications, title, channel, and research run.
+The video deep link is derived from and checked against the video/timestamp.
+Strict reads validate IDs and require each assessment to supersede the actual
+current one.
+
+Claim data is strict, append-only project data under
+`.filmot_data/claims/TOPIC/*.json`: a persistence error fails the command, and
+new assessments do not erase earlier events. Per-topic OS locks serialize the
+whole read/check/append transaction, preventing concurrent assessment forks;
+complete events are schema-validated before publication. Every newly written
+event uses `filmot.claim/v2` and a contiguous per-topic sequence. A successful
+publication normally removes that append's temporary source. If publication
+succeeds but unlinking that source fails, Filmot surfaces both the durable
+destination and exact retained temporary; the visible event is not rolled back.
+If publication fails and cleanup also fails, the error reports both failures,
+names the exact retained temporary, and says the destination was not confirmed.
+Reads and writes do not scan for or delete historical or unrelated `.tmp`
+leftovers. Mutation content IDs make exact retries idempotent, but recovery
+should inspect the reported durable/not-confirmed outcome instead of guessing.
+Legacy
+`filmot.claim/v1` histories without stored sequences remain readable: replay
+assigns their order in memory, never rewrites those v1 files, and can continue
+the history by appending v2 events beginning after the legacy count. Thus v1
+records themselves are read-only compatibility data, while a valid v1 history
+remains appendable through new v2 events. The three mutation commands add
+compact session events containing identifiers and classifications, not claim
+text or excerpts. `claims show` is read-only and does not log.
+
+### Research Sessions
+
+```bash
+# Keep a compound run, follow-up searches, saves, and claims in one history.
+export FILMOT_SESSION=agent-continuity
+filmot research "long horizon agents" --depth 5 --raw > research.json
+filmot search '"memory" NEAR/25 "dreaming"' --title agent --raw
+filmot transcript VIDEO_ID --save-to agent-memory
+filmot claims add agent-memory "A claim to investigate" --id claim-1
+filmot sessions agent-continuity --summary
+
+# Override just one command, keeping its corpus topic unchanged.
+filmot research "agent memory" --session another-investigation --depth 2
+
+# Replay events or derive a non-conflating summary
+filmot sessions robin-ai-scientist
+filmot sessions robin-ai-scientist --summary
+filmot sessions robin-ai-scientist --summary --raw
+```
+
+The summary keeps standalone search universes, each staged research-search
+universe, direct YouTube search universes, selected-download outcomes, probe
+outcomes, unique saved transcripts, failed attempts, and claim mutations
+distinct. Direct YouTube rows are never added to Filmot search totals; their
+bounded table records the actual UTC publication window, order, result cap,
+filters, pages/fetched/returned counts, enrichment state, partial state,
+stopping reason, and whether a continuation token was available. Each
+standalone Filmot search includes
+its recorded title, channel, language, date, subtitle, and numeric restrictions,
+so identical query text with different filters stays distinguishable. Missing
+legacy filters are explicitly unknown. Long filter values and channel lists
+are bounded with truncation notices; full replay retains the original values.
+Explicitly routed events include `data.session`, while topic metadata keeps its
+existing meaning. Selecting a session does not combine prior topic histories.
+The existing Unicode-name migration can still move safely attributable legacy
+records into their canonical session file. Use a distinctive investigation name
+to avoid sharing a ledger with an older topic or a legacy fallback such as
+`session` or `uncategorized`.
+The summary also shows bounded scout and
+probe provenance plus each saved source's discovery stage/query, so compound
+runs can be resumed without replaying the raw ledger. Missing links in older
+probe events are labeled `query not recorded` rather than inferred. Successful
+manual `transcript --save-to` events also appear in saved-source provenance as
+origin `manual`. The human summary says `query not recorded (manual save)`;
+raw provenance leaves `origin_query` null and sets `provenance_status` to
+`query_not_recorded`, never guessing from nearby searches. New successful
+manual-save events carry best-effort title and channel for that provenance row;
+legacy manual events without those recorded fields remain honestly `Unknown`
+rather than being reconstructed. Scout rows
+retain the effective query, days, result cap, relevance order, channel request,
+gate counts, and a copyable exact `yt-search ... --show-description --raw`
+command. Bounded probe-run outcomes retain terminal status/reason plus seed,
+term, executed/planned/deferred query, failure, and saved counts, including
+zero-query `no_candidate_terms` and `no_cross_source_pairs` runs. Probe-query
+rows preserve operational `broad_sampled`, `deferred`, and
+`failed_closed` states rather than hiding them behind normalized completion
+labels, alongside their API/returned/scoped counts when recorded. Each
+provenance section shows its 25 newest rows and reports omissions.
+Listing, replaying, and summarizing sessions are read-only and do not log the
+inspection. A malformed ledger line makes a summary `partial` (or `failed`
+when nothing is readable),
+with line-level diagnostics rather than a silently reduced event count. A
+Ctrl-C before a search result is logged records an `interrupted` breadcrumb in
+the resolved named/date session so the investigation remains resumable.
+
+### Search Channels
+
+Find YouTube channels by name or handle:
+
+```bash
+# Search by name
+python main.py channels mrbeast
+
+# Search by phrase
+python main.py channels "Linus Tech Tips"
+
+# Raw JSON output
+python main.py channels mrbeast --raw
+```
+
+### Channel Profiles and Analytics
+
+`channel` shows Filmot's profile for up to 20 channels: name, handle, country,
+subscribers, total views, join date, the range of indexed videos, and recent
+upload counts. Each argument is a UC channel ID, an `@handle`, or a channel
+URL, and arguments may be comma-separated. An `@handle` costs one channel
+search, which must return that exact handle. `channel` and `channel-videos`
+use the direct Filmot API, so they need `FILMOT_API_KEY`.
+
+```bash
+filmot channel @LinusTechTips
+filmot channel UCXuqSBlHAE6Xw-yeJA0Tunw --growth --words
+filmot channel @LinusTechTips --stats --monthly --since 2026-01-01
+filmot channel @LinusTechTips --all --raw
+```
+
+| Option | Adds | Credits |
+| --- | --- | --- |
+| _(none)_ | Profile, counts, and recent uploads | 1 |
+| `--about` | Description and biography | 1 |
+| `--growth` | View and subscriber change over 28, 90, 180, and 365 days, and the subscriber series | 1 |
+| `--words` | The most weighted caption terms | 1 |
+| `--history` | Previous names, handles, countries, and descriptions | 3 |
+| `--stats` | Video types, durations, view, like, and duration distributions, and caption languages | 3 |
+| `--monthly` | Video statistics by upload month | 3 |
+| `--all` | Everything above | 3 |
+
+Combined options cost the highest price among them. `--since` and `--until`
+(YYYY-MM-DD) bound the upload dates that video statistics cover (three years
+to today by default) and the subscriber series (five years by default).
+`--include-archive` also counts archived videos in video statistics. Statistics
+cover at most the 10,000 newest videos in range. Counts are Filmot snapshots
+and may differ from what YouTube shows now. Raw output lists the `requested`
+references with their resolved IDs, the returned `channels`, and any `missing`
+IDs that Filmot doesn't know.
+
+### List a Channel's Videos from Filmot's Index
+
+`channel-videos` lists up to 10 channels' videos from Filmot's index, newest
+first. The index also holds videos YouTube has since removed. Each page costs
+3 credits.
+
+```bash
+filmot channel-videos @LinusTechTips
+filmot channel-videos UCXuqSBlHAE6Xw-yeJA0Tunw --count 100 --pages 3
+filmot channel-videos @LinusTechTips --with-subtitles --page 4
+filmot channel-videos @LinusTechTips --count 50 --raw | filmot download -t ltt
+```
+
+`--count` sets the videos per channel on each page (20 by default); channels
+times `--count` may not exceed 200. `--pages` accepts 1–50 and defaults to 1;
+it fetches consecutive pages starting at `--page` (default 1), stopping at the
+first empty page, which is the only end-of-listing
+signal Filmot gives. Raw output reports `exhausted` and the `next_page` to
+continue from. `--with-subtitles` keeps only videos Filmot knows have
+subtitles. If a later page fails, the earlier pages are kept and the result is
+`partial`. Raw output keeps a `videos` array in `/getvideos` shape, so it pipes
+into `download`; transcripts for removed videos then come from
+[Filmot's subtitle index](#transcripts-from-filmots-index).
+
+Listings request all non-subtitle metadata by default. `--columns` selects
+fields, while `--all` (or `--columns all`) also requests complete subtitle
+tracks. `--lang en` filters those tracks by base language. With raw subtitles,
+channels times `--count` may not exceed 10; an omitted count is reduced to fit
+the selected channels, while an excessive explicit count is rejected.
+
+### Discovery Searches
+
+Three more searches use the direct Filmot API, so they need `FILMOT_API_KEY`.
+Their channel filters, `--channel-id` and `--exclude-channels`, take
+comma-separated UC IDs, `@handles`, or channel URLs; each handle costs one
+channel search. Scoping a title search or export to one to five channels
+lowers its price to 1 credit per page.
+
+All three commands default to `--page 1 --pages 1`; `--pages` accepts 1–20 per
+invocation. Their row budgets differ:
+
+| Command | Default `--per-page` | Maximum `--per-page` |
+| --- | --- | --- |
+| `titles` | 50 | 200 |
+| `titles` with raw subtitle columns | 10 | 10 |
+| `find-channels` | 25 | 300 |
+| `subtitle-export` | 100 | 500 |
+
+#### Search Titles and Metadata
+
+`titles` searches video titles and metadata in Filmot's index. The query uses
+Filmot's search syntax (implicit AND, `|`, `"exact phrases"`, grouping, and
+`-exclusion`) or lists video IDs separated by spaces. Filters alone also work.
+Each page costs 3 credits, or 1 when scoped to one to five channels.
+
+```bash
+filmot titles '"sqlite" wal' --min-views 10000 --sort viewcount --order desc
+filmot titles --channel-id @LinusTechTips --start-date 2026-01-01 --pages 2
+filmot titles "fusion" --caption-lang en --only-caption-langs --complete
+filmot titles "fusion reactor" --raw | filmot download -t fusion
+```
+
+The filters match `search`: `--min-views`, `--max-views`, `--min-likes`,
+`--max-likes`, `--min-duration`, `--max-duration`, `--start-date`, `--end-date`,
+`--category`, `--exclude`, and `--license`. `titles` adds `--country` (Filmot
+country IDs), `--caption-lang` with `--only-caption-langs`, `--detected-lang`
+with `--detected-in-captions`, `--unlisted`/`--listed`, `--live`/`--not-live`,
+and `--partial`/`--complete` for index records. `--sort` accepts `id` (when
+Filmot indexed the video), `viewcount`, `likecount`, `dislikecount`,
+`uploaddate`, `duration`, `avg_ratio` (vocabulary ease), and
+`videofetcheddate`. A page holds up to 200 videos (`--per-page`, 50 by default),
+and Filmot serves pages up to 500. Paging stops at the first empty page. Raw
+output keeps a `videos` array that pipes into `download`.
+
+All non-subtitle metadata, including descriptions and dislike counts, is
+requested by default. `--columns` selects fields while retaining video identity
+fields. `--all` also includes raw subtitle tracks: this changes the default and
+maximum page size to 10 and permits pages through 5000. Raw output preserves
+the tracks; library discovery handoff keeps metadata and acquires transcripts
+through the transcript routes separately.
+
+Use `--output FILE` to write a server export; `--format json|jsonl|csv|zip`
+overrides the extension. For example, `filmot titles sqlite --all -o sqlite.zip`
+includes subtitles, and `filmot titles sqlite -o sqlite.jsonl` exports metadata.
+With `--output --raw`, stdout describes the written file rather than emitting
+download candidates. JSON/JSONL retain structured subtitle tracks; ZIP carries
+subtitle files, while CSV preserves the server's serialized field values.
+
+One-page export files preserve the response bytes. Multi-page exports combine
+records; JSON uses a `result` array and, when the provider supplies envelope
+metadata, a `pages` array of those per-page fields. For channel searches this
+retains each page's `page`, `perpagecount` and `maxresults`. An aggregate file
+is not a single API response page.
+
+#### Find Notable Channels
+
+`find-channels` filters Filmot's index of notable channels by
+size, growth, age, country, caption languages, and the words in their names,
+descriptions, or topics. Each page costs 1 credit; only the first 10,000
+matches of a search can be paged to.
+
+```bash
+filmot find-channels --topics "database internals" --min-subscribers 10000
+filmot find-channels --country Canada --sort gainedsubcount --subs-window 90
+filmot find-channels --description sqlite --auto-lang en --min-avg-duration 600 --raw
+```
+
+Filters: `--description`, `--topics`, `--min-`/`--max-subscribers`, `--min-`/`--max-views`
+(total channel views), `--min-`/`--max-videos`, `--min-`/`--max-avg-duration`
+(seconds), `--created-after`/`--created-before`,
+`--first-video-after`/`--first-video-before`, gained views or subscribers
+(`--min-`/`--max-gained-views` with `--views-window`, `--min-`/`--max-gained-subs`
+with `--subs-window`; windows are 28, 90, 180, or 365 days), `--country`
+(repeatable country names), and `--auto-lang` (repeatable automatic-caption
+codes, all required). A window option or `--order` without a filter or sort it
+affects is refused. Pass the channel IDs it finds to `channel` or
+`channel-videos`.
+
+`--columns` selects response fields (retaining `channelid`); `--all` requests
+every field, including descriptions and topic clouds even without corresponding
+text filters. `--output channels.jsonl` exports JSON Lines; JSON is also
+supported through `--format json`. Description/topic expressions accept at
+most 500 characters, and `--auto-lang` accepts at most 100 tokens of 20
+characters each. Search uses text mode; the schema marks semantic modes as
+unavailable.
+
+#### Export Subtitle-Search Matches
+
+`subtitle-export` has Filmot build a CSV, JSON, JSON Lines, or ZIP export of
+subtitle-search matches, up to 500 per page. The format comes from `--format`,
+else the output file's extension, else JSON Lines. Pages are merged into one
+file: CSV keeps one header, JSON merges the `result` arrays, and ZIP merges
+`metadata.jsonl` and the subtitle files. The file is written after fetching
+finishes; if a later page fails, the valid earlier pages can still be written
+as a partial export. Each page costs 5 credits, or 1 when scoped to one to
+five channels.
+
+```bash
+filmot subtitle-export '"sqlite wal"' -o matches.csv
+filmot subtitle-export "fusion" --channel-id @Veritasium -o fusion.zip --subtitles
+filmot subtitle-export "gpu" --lang en --pages 3 --per-page 500 -o gpu.jsonl
+```
+
+`--subtitles` adds each matching video's full subtitles: one `.srt` file per
+video in a ZIP, or a `subtitles` field in structured exports. CSV retains
+server-serialized fields, including quoted multiline values. `--no-snippets`
+leaves out the matched-text `hits`, and `--columns` picks
+fields from `category`, `channelid`, `channelname`, `id`, `title`, `uploaddate`,
+`autosubs`, `manualsubs`, `duration`, `viewcount`, `likecount`, `isunlisted`,
+`license`, `channelsubcount`, `channelcountryname`, `lang`, `hits`,
+`subtitles`, and `description`; `--columns all` selects everything, including
+subtitles. The filters match `search` (`--lang`, `--title`,
+`--manual-subs`, `--country`, `--detected-lang`, the view, like, duration, and
+date ranges, `--category`, `--exclude`, and `--license`), with `--sort`
+including `bm25match` (text relevance) and `channelvariety`. Those two use their
+own order, so `--order` is refused with them. A page with fewer matches than
+`--per-page` ends the export. Every page is checked against its format before
+anything is written. A CSV must start with a header row of column names that
+includes known export columns. JSON Lines rows must not be error objects. A ZIP
+must hold `metadata.jsonl`, with every entry readable. A page that fails these
+checks on the first page, such as an HTML error page, fails the export and leaves
+the output file untouched. An export with no matches writes nothing
+and reports `written: false`. If a later page fails, the pages before it are
+still written and the result is `partial`. Its `next_page` says where to
+continue, which should go to a different file. Filmot's compact CSV format is
+not offered, because its rows inherit values from earlier rows.
+
+CSV page headers must agree before their rows are admitted; long and multiline
+subtitle fields are parsed without the default small CSV field limit. A ZIP
+page must contain exactly one `metadata.jsonl` and readable entries. Invalid
+later pages preserve the valid prefix and its continuation.
+
+For manual captions, `--no-guess-video-language` includes matches regardless
+of whether the caption language probably matches the spoken language;
+`--guess-video-language` explicitly requires that match. Omitting both keeps
+the server default. `--lang` accepts at most 20 characters.
+
+The [Filmot API coverage audit](FILMOT_API_COVERAGE.md) maps all seven
+documented endpoints, request parameters, enrichment fields, and intentional
+format restrictions to these commands and the Python client.
+
+### Channel Corpus: Download & Mine Channel Uploads
+
+Enumerate a channel's uploads playlist and download the available transcripts
+to build a local corpus that can be searched offline with full-text and
+proximity operators. Private/deleted videos, missing captions, malformed
+playlist rows, and later upstream changes can make the local corpus incomplete.
+
+#### Download a Channel
+
+```bash
+# Exact canonical channel ID
+filmot channel-download UCdnzT5Tl6pAkATOiDsPhqcg
+
+# Exact @handle or canonical URL
+filmot channel-download @GoogleDevelopers --workers 4
+filmot channel-download https://www.youtube.com/@GoogleDevelopers
+filmot channel-download \
+  https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw
+
+# Enumerate a bounded slice, then select its first 50 new transcript candidates
+filmot channel-download @GoogleDevelopers --limit 50
+
+# Tighten the API work to two pages and at most 75 distinct uploads
+filmot channel-download @GoogleDevelopers --pages 2 --max-results 75
+
+# Continue from the exact token printed by the preceding slice
+filmot channel-download @GoogleDevelopers --page-token PAGE_TOKEN \
+  --pages 2 --max-results 75
+
+# Resume interrupted transcript work within the same slice
+filmot channel-download @GoogleDevelopers --workers 4
+
+# Bypass proxy and connect directly
+filmot channel-download @GoogleDevelopers --workers 4 --no-proxy
+
+# Force re-download (ignore cached manifest)
+filmot channel-download @GoogleDevelopers --fresh
+```
+
+`channel-download` deliberately does not guess from arbitrary channel names.
+It accepts only an exact 24-character `UC...` ID, an exact `@handle`, or a
+canonical `https://[www.]youtube.com/channel/UC...` or
+`https://[www.]youtube.com/@handle` URL. Legacy
+`/c/` and `/user/` URLs and URLs with query/fragment components are rejected.
+Use `filmot channels "display name"` first when you need to discover the exact
+identity. The supplied reference and resolved canonical channel ID are
+recorded separately.
+
+Channel resolution retrieves public description, upload-playlist identity,
+statistics, locale, publication, and topic metadata. Unknown/hidden counters
+remain unknown rather than becoming zero. Upload enumeration retains playlist
+position/ownership, video-owner, publication, and privacy metadata where
+available and guards against repeated page tokens. The command defaults to at
+most 10 pages and 500 distinct uploads; `--pages` accepts 1–100 and
+`--max-results` accepts 1–5000. `--limit` only caps transcript selection after
+that bounded enumeration and is not an API page/result budget.
+
+When another page exists, the typed/logged outcome includes a continuation
+object and human output prints a copyable command with the opaque
+`--page-token` plus the same page/result budgets. A later-page failure preserves
+usable earlier rows, marks enumeration partial, continues to their transcript
+downloads, and retains the failed page token for a retry. The final aggregate
+also accounts for transcript failures or interruption. A first-page failure writes no new checkpoint
+and starts no transcript downloads; an explicitly destructive `--fresh` reset,
+if requested, has already happened by then. `--fresh` cannot be combined with
+`--page-token`. Re-running the same slice resumes pending transcript work from
+the manifest, while a continuation slice adds new video identities to that
+same corpus.
+
+Ctrl-C stops a parallel download promptly. Queued videos never start, and
+running ones begin no further route, so none falls back to Filmot's subtitle
+index (which costs credits). A fetch the interrupt cut short records no
+failure, and the next run retries it.
+
+The manifest's latest compact `upload_enumeration` checkpoint uses
+`filmot.youtube-upload-enumeration/v1` and stores the provider,
+`observed_at`/`expires_at`, credential-free effective request, and coverage:
+page/API/item counts, row-quality counters, approximate total, next token,
+stopping reason, and partial state. Both channel resolution and every completed
+enumeration observation use a 30-day window. There is no automatic
+manifest-refresh/purge scheduler; see [YouTube Data API
+behavior](YOUTUBE_API.md).
+
+Python integrations should prefer the bounded, resumable control-plane API:
+
+```python
+from filmot.channel_dl import enumerate_uploads_detailed
+
+page = enumerate_uploads_detailed(
+    uploads_playlist_id,
+    max_pages=3,
+    max_items=120,
+    page_token=None,
+)
+next_token = page["coverage"]["next_page_token"]
+```
+
+It returns normalized `videos`, top-level observation/expiry times, the
+credential-free effective `request`, page, item, duplicate, malformed, and
+ID-less-row `coverage`, a stopping reason, continuation token, API-call counts,
+warnings, and typed errors. A first-page failure raises; a later failure
+preserves earlier rows and marks the envelope partial. `cancel_check` can
+cooperatively stop before the next page while retaining its token. The legacy
+`list_all_video_ids()` wrapper remains available only for callers that
+deliberately need its historical unbounded, fail-fast list contract.
+
+#### Check Download Status
+
+```bash
+# List all downloaded channels
+filmot channel-status
+
+# Detailed stats for a specific channel
+filmot channel-status chat-with-traders
+```
+
+#### Search Within a Channel Corpus
+
+Search locally across all downloaded transcripts. Supports plain text, NEAR/N proximity, and tilde proximity — the same operators available in `filmot search` (API), but running entirely offline against your local corpus.
+
+```bash
+# Plain substring search
+filmot channel-search chat-with-traders "Sharpe ratio"
+
+# NEAR/N — find two phrases within N words of each other
+filmot channel-search chat-with-traders '"risk management" NEAR/10 "position sizing"'
+
+# NEAR/N with grouped OR on either side
+filmot channel-search chat-with-traders '("risk" | "drawdown") NEAR/10 ("position" | "sizing")'
+
+# ~N (tilde) — find words within N words of each other
+filmot channel-search chat-with-traders '"blew up account"~5'
+
+# Limit results
+filmot channel-search excess-returns "diversification" --limit 10
+```
+
+| Operator | Syntax | Example |
+|----------|--------|---------|
+| **Plain** | `"text"` | `"Sharpe ratio"` |
+| **NEAR/N** | `"phrase1" NEAR/N "phrase2"` or `("a" \| "b") NEAR/N ("c" \| "d")` | `'"risk management" NEAR/10 "position sizing"'` |
+| **Tilde** | `"word1 word2"~N` | `'"blew up account"~5'` |
+
+> **Important:** For proximity queries, use grouped OR like `("risk" | "drawdown") NEAR/10 "position"`. Do not use quoted pipes like `"risk|drawdown" NEAR/10 "position"`.
+
+> **Whole-word matching:** Proximity operators match whole words — `"account"` will not match "accounts" or "accountability". For plurals and inflections, add explicit alternatives: `("account" | "accounts")`. Terms must be double-quoted; unquoted operands (e.g. `risk NEAR/10 position`) are rejected with an error.
+
+> **Note:** `channel-search` runs entirely offline against your downloaded
+> corpus, with no API calls or quota use. Repeat local searches freely, and
+> refresh the corpus when you need newer upstream state.
+
+### View Configuration
+
+Check your current API configuration:
+
+```bash
+filmot config
+```
+
+The inventory reports Filmot and YouTube API keys separately as only
+`configured` or `not configured`; it never prints credential fragments.
+
+## Country Codes
+
+| Code | Country | Code | Country | Code | Country |
+|------|---------|------|---------|------|---------|
+| 217 | United States | 153 | United Kingdom | 95 | Germany |
+| 88 | France | 188 | Spain | 110 | Italy |
+| 234 | Nigeria | 109 | India | 27 | Brazil |
+| 35 | Canada | 13 | Australia | 116 | Japan |
+| 189 | South Korea | 166 | Russia | 155 | Mexico |
+
+> See the [official Filmot API documentation](https://filmot.com/api-documentation) for supported country codes.
+
+## Advanced Features
+
+### Export Results
+
+Export search results to JSON or CSV files for analysis:
+
+```bash
+# Export to JSON
+python main.py export "machine learning" -o results.json
+
+# Export to CSV
+python main.py export "python tutorial" -o results.csv --format csv
+
+# Export multiple pages
+python main.py export "AI" -o data.json --pages 5
+
+# Export with detailed hits (one row per subtitle match)
+python main.py export "pandas" -o hits.csv --format csv --detailed
+```
+
+### Paginated Search
+
+Automatically fetch multiple pages of results:
+
+```bash
+# Fetch up to 10 pages of results
+python main.py search-all "machine learning" --pages 10
+
+# Limit total results and export
+python main.py search-all "tutorial" --max-results 200 -o results.json
+
+# With filters
+python main.py search-all "python" --pages 5 --lang en --min-views 10000
+```
+
+### Cache Management
+
+View and manage the response cache:
+
+```bash
+# View cache statistics
+python main.py cache
+
+# Clear all cached responses
+python main.py cache --clear
+
+# Clear only expired entries
+python main.py cache --clear-expired
+```
+
+### Watchlist
+
+Save videos for later viewing:
+
+```bash
+# List watchlist
+python main.py watchlist list
+
+# Add a video by ID
+python main.py watchlist add dQw4w9WgXcQ --notes "Great tutorial"
+
+# Show only unwatched videos
+python main.py watchlist list --unwatched
+
+# Mark as watched
+python main.py watchlist watched dQw4w9WgXcQ
+
+# Remove from watchlist
+python main.py watchlist remove dQw4w9WgXcQ
+
+# Clear entire watchlist
+python main.py watchlist clear
+```
+
+### Batch Processing
+
+Process multiple queries from a file:
+
+```bash
+# Create a template file
+python main.py batch-template --format json -o queries.json
+
+# Process queries from file
+python main.py batch queries.txt -o results.json
+
+# Export batch results as CSV
+python main.py batch queries.json -o results.csv --format csv
+```
+
+**Supported file formats:**
+- `.txt` — One query per line
+- `.json` — Array of queries with optional parameters
+- `.csv` — Query column with optional lang, min_views columns
+
+**Example `queries.json`:**
+```json
+[
+  {"query": "python tutorial", "lang": "en"},
+  {"query": "javascript basics", "min_views": 10000},
+  {"query": "machine learning", "category": "Education"}
+]
+```
+
+### Interactive Mode
+
+Start an interactive REPL for exploratory searching:
+
+```bash
+python main.py interactive
+```
+
+**Available REPL commands:**
+```
+filmot> help              # Show all commands
+filmot> search pandas     # Quick search
+filmot> search pandas --lang en --sort viewcount --order desc
+filmot> show 1            # Show details of result #1
+filmot> save 1            # Save result to watchlist
+filmot> watchlist         # View watchlist
+filmot> export results.json  # Export last search results
+filmot> defaults lang en  # Set default search options
+filmot> cache stats       # View cache statistics
+filmot> history           # View search history
+filmot> quit              # Exit REPL
+```
+
+Search filters take `filmot search` option names, such as `--lang`,
+`--min-views`, `--sort`, `--order`, `--exclude`, `--min-duration`, and
+`--manual-subs`, and `defaults` accepts the same names. An unknown option or a
+bad value is reported without spending a search, and a failed search leaves the
+REPL running. `--sort density` sorts on the client, so it is available only in
+`filmot search`.
+
+---
+
+## Example Output
+
+### Subtitle Search
+```
+╭─────────────────────────────────────────────────────────╮
+│ Found 356,432 results for: python                       │
+╰─────────────────────────────────────────────────────────╯
+
+1. Python Full Course for free
+   Channel: Bro Code | Views: 20,213,163 | Likes: 958,283
+   Duration: 12h 0m | Category: Science & Technology | Uploaded: 2021-02-15
+   URL: https://youtube.com/watch?v=XKHEtdqhLK8
+   Matches (11): Density: 0.02/min
+      [8:56] ...re it's not necessary but it's common practice for python and...
+      [2:04:31] ...so that is the return statement functions can send python values...
+      [2:05:20] ...been working with positional arguments already and python knows...
+      ... and 8 more matches
+```
+
+### Channel Search
+```
+╭─────────────────────────────────────────────╮
+│ Channels matching: mrbeast                  │
+╰─────────────────────────────────────────────╯
+┏━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ # ┃ Channel Name         ┃ Handle          ┃ Subscribers  ┃ Views   ┃
+┡━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━┩
+│ 1 │ MrBeast              │ @MrBeast        │ 463M         │ 52.3B   │
+│ 2 │ MrBeast Gaming       │ @MrBeastGaming  │ 53.7M        │ 7.8B    │
+│ 3 │ MrBeast 2            │ @MrBeast2       │ 55.3M        │ 7.3B    │
+└───┴──────────────────────┴─────────────────┴──────────────┴─────────┘
+```
+
+## AI Agent Integration
+
+This CLI is designed to work seamlessly with AI agents and LLMs. See [AGENTS_README.md](../AGENTS_README.md) for the full agent-focused guide.
+
+### Recommended Agent Workflow
+
+```bash
+# 1. Research a topic with staged fallbacks and balanced candidate ranking
+filmot research "your topic" --depth 12 --dedupe --min-matches 2
+
+# 2. Navigate matching passages across sources, then verify the claims
+filmot library compare "specific claim" --sort density
+
+# 3. Audit possible source-lineage echoes in full saved transcripts
+filmot library echoes your-topic --raw
+
+# 4. Record exact evidence relationships and a human assessment
+filmot claims add your-topic "One exact, falsifiable statement"
+filmot claims cite your-topic c-CLAIMID --video VIDEO_ID --at 90 --relation supports
+filmot claims assess your-topic c-CLAIMID --verdict supported --confidence medium
+
+# 5. Export structured context for deep analysis
+filmot library context your-topic --format structured
+
+# 6. Resume from a summary that keeps unlike count universes separate
+filmot sessions your-topic --summary
+```
+
+### Key Agent Features
+
+- **`filmot research`** — Single compound command that orchestrates search → filter → download → summary
+- **`filmot library compare`** — Lexical cross-source concordance for locating matching passages
+- **`filmot library echoes`** — Reproducible full-transcript similarity analysis for advisory lineage review
+- **`filmot claims`** — Append-only claims, classified evidence, and explicit human assessments
+- **`filmot sessions NAME --summary`** — Derived investigation totals without conflating candidate, source, and failure universes
+- **`filmot --session NAME COMMAND`** — Keep compound research and follow-up activity in one investigation
+- **`filmot yt-video IDS... --raw`** — Get ordered, exact-ID YouTube metadata with per-ID coverage and no caption request
+- **`filmot yt-playlists CHANNEL` / `filmot yt-playlist PLAYLIST`** — Follow a
+  channel-curated path with explicit row/page budgets and pipeline-ready video
+  output
+- **`filmot yt-comments VIDEO` / `filmot yt-replies TOP_COMMENT`** — Inspect
+  transient public discussion with separate bounded thread and reply cursors;
+  these rows are not transcript candidates or audience evidence
+- **`filmot yt-data status|refresh|purge`** — Audit and maintain API-owned fields in saved transcript records
+- **`--sort density`** — Sort fetched candidates by matches-per-minute to find focused text coverage; this is not a credibility score
+- **`--min-matches N`** — Filter out videos with only passing mentions
+- **`--dedupe`** — Skip matching first-500-character transcript fingerprints during bulk download
+- **`--format structured`** — Markdown export with metadata headers, auto-saved to file
+- **`--full`** — Expand non-duplicate hit snippets for displayed videos on fetched candidate pages; it does not widen the page scope
+- **`--pages` / `--candidate-pool`** — Widen the candidates considered by client-side ranking
+- **`--limit` / `--max-hits`** — Bound video and per-video hit output separately
+- **`--raw`** — One JSON value after parsing and normal completion
+- **Word-boundary search** — Library search prevents false positives, auto-falls back to substring for plurals
+
+### Expanded Hit Output
+
+Use `--full` to remove the normal per-video hit cap for displayed videos on
+the candidate pages already fetched. Repeated duplicate segments may still be
+collapsed, and the option does not fetch additional result pages:
+
+```bash
+# Get complete transcript matches for AI processing
+filmot search "machine learning tutorial" --full --hit-format 1
+
+# Combine with filters for targeted results
+filmot search "python basics" --full --min-views 100000 --lang en
+```
+
+### Raw JSON for Programmatic Access
+
+```bash
+# Pipe to file for processing
+filmot search "data science" --raw > results.json
+
+# Use with jq for filtering; keep the status beside the rows, because failed,
+# interrupted, and zero-match searches all have no first hit
+filmot search "tutorial" --raw | jq '{status: ._filmot.status, hits: .result[0].hits}'
+
+# Run the compound workflow with one final JSON result.
+filmot research "agent memory" --depth 5 --raw > research.json
+```
+
+Raw mode suppresses interactive progress and keeps any remaining diagnostics
+off stdout. Once Click accepts the command line, stdout contains one JSON value
+on success and one JSON error value with a nonzero exit status on operational
+failure. Parser-detected invalid syntax, options, and values, plus explicit
+Click usage errors, use Click's normal text usage response and exit status 2
+before raw mode runs. Semantic validation after parsing uses the versioned JSON
+error result. An external user interrupt or broken stdout pipe can terminate
+the process before a complete value is written; those process-control events
+are outside the result contract.
+
+For commands that write a session event, raw serialization is preflighted
+before logging, so stdout and the durable event cannot disagree about success.
+Raw serialization rejects non-standard values such as `NaN`/`Infinity` and
+uses ASCII JSON escaping; non-ASCII content appears as JSON Unicode escapes and
+decodes back to the original text. `main.py` raises `SystemExit(main())`, so the
+status returned by the CLI reaches shell scripts instead of being discarded.
+
+Every raw command result uses the `filmot.result/v1` contract. Mapping payloads
+retain their useful top-level domain keys and add `_filmot` metadata containing
+`schema`, `command`, `status`, `errors`, and `warnings`. For `search`, the
+payload is the processed response after channel validation, client-side
+filtering/ranking, `--limit`, and `--max-hits`, with explicit scope metadata; it is not an
+untouched copy of the upstream API payload. `video` uses `videos`, `channels`
+uses `channels`, `channel` uses `requested`, `channels`, and `missing`,
+`channel-videos` uses `channels`, paging fields, and a `videos` array that
+`download` accepts, `titles` uses `query`, `filters`, paging fields, and a
+`videos` array that `download` accepts, `find-channels` uses `filters`, paging
+fields, `max_results`, and `channels`. With `--output`, `titles` and
+`find-channels` instead summarize the written file, as `subtitle-export` does
+(`output`, `format`, `rows`, `bytes`, and paging fields), and `yt-search`
+uses `videos` plus effective `request`,
+`coverage`, and `enrichment` objects. `yt-playlists` uses `channel`,
+`playlists`, `request`, `coverage`, `api_calls`, and `continuation`;
+`yt-playlist` adds ordered `playlist_items`, current `videos`, and per-ID
+outcomes, and only its `videos` array is a download candidate envelope.
+`yt-comments` uses `video_id`, `comment_threads`, `replies_mode`,
+`availability`, request/coverage/call/quota data, and a continuation;
+`yt-replies` uses `parent_comment_id`, nullable `video_id`, `replies`, and the
+same cursor accounting. Neither comment envelope is accepted by the transcript
+download pipeline. A later
+YouTube page or optional metadata
+failure preserves discovered videos and produces a typed top-level `partial`;
+`--transcript` adds the same per-video `transcript_search` result rendered in
+human mode, and any per-video failure is partial too. `transcript --grep --raw` uses
+stable timestamp/link match rows and typed `empty` or parse failures. Library
+inspection commands use `rows`. `library echoes`
+also exposes `clusters`, `method`, and `artifact_hash`. Local library search
+and compare rows include citation details, with timestamps and deep links when
+saved segments make them available. Claim commands use `rows`, and all four
+claim subcommands support `--raw`. `filmot sessions NAME --raw` uses `events`,
+while `filmot sessions NAME --summary --raw` uses `summary`. Every replayed
+session entry is itself a `filmot.event/v1` record with the same
+command/status/data/errors/warnings vocabulary. Raw mode does not change a
+command's persistence or logging behavior.
+
+`research --raw` returns the run ID, topic, selected/downloaded/skipped/failed
+counts, probe counts, source inventory, and routing plan, plus `_filmot` status
+and errors. Progress and nested diagnostics go to stderr. Clean no-candidate
+runs report `empty`; recoverable scout/search/item failures report `partial`;
+total selected-download or operational failure reports `failed` with a nonzero
+exit code. Its final ledger outcome uses the same prepared result as stdout,
+including serialization failures. Existing topic sources remain in the source
+inventory; use run counters and checkpoints to distinguish new work.
+
+### Example Agent Workflow (Python)
+
+Check the exit code and `_filmot` metadata before reading rows. A failed or
+interrupted result can still carry an empty domain array. Most discovery
+commands exit 0 for `partial`; `download` exits nonzero when its input discovery
+was incomplete. Status rules differ by command: `search` reports a clean zero-match search
+as `completed` with an empty `result`, while commands such as `yt-search`,
+`yt-video`, and `library list` use `empty`.
+
+```python
+import subprocess
+import json
+import sys
+
+# Search for relevant content
+proc = subprocess.run(
+    ["filmot", "search", "python tutorial", "--raw"],
+    capture_output=True, text=True
+)
+
+# Click usage errors (exit 2) print text, and an interrupted process may not
+# write a complete value. Neither is an empty search.
+try:
+    data = json.loads(proc.stdout)
+except json.JSONDecodeError:
+    raise RuntimeError(
+        f"filmot exited {proc.returncode} without a JSON result: "
+        f"{proc.stderr.strip()}"
+    )
+
+meta = data.get("_filmot") if isinstance(data, dict) else None
+if (not isinstance(meta, dict)
+        or meta.get("schema") != "filmot.result/v1"
+        or meta.get("command") != "search"):
+    raise RuntimeError("Unexpected filmot output; not treating it as results")
+
+status = meta.get("status")
+if proc.returncode != 0 or status not in ("completed", "partial"):
+    # failed/interrupted: any rows present are not a search result
+    raise RuntimeError(
+        f"filmot search {status} (exit {proc.returncode}): {meta.get('errors')}"
+    )
+if status == "partial":
+    # Earlier pages were kept, but a later page failed.
+    print(f"Incomplete search: {meta['errors']}", file=sys.stderr)
+
+# "completed" covers the pages fetched (one by default), not every API match.
+scope = data["scope"]
+if scope["api_total"] > scope["candidates_fetched"]:
+    print(
+        f"Fetched {scope['candidates_fetched']} of {scope['api_total']} matches; "
+        "raise --pages for more",
+        file=sys.stderr,
+    )
+
+# Process results in your agent. After "completed", an empty list means no
+# fetched candidate survived the query, client-side filters, and --limit.
+for video in data["result"]:
+    title = video["title"]
+    hits = video["hits"]
+    # Feed to LLM for analysis...
+```

@@ -337,6 +337,9 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- Documentation now separates a concise quick-start README from the command and
+  configuration references, clarifies request/selection budgets and metadata
+  behavior, and documents optional AWS audio-tool prerequisites.
 - API onboarding and public guides now link to Filmot's official API
   documentation and identify RapidAPI as legacy compatibility.
 - Repository hygiene now ignores local environment variants, audit notes,

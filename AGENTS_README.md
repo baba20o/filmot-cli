@@ -1,5 +1,7 @@
 # Filmot CLI: Agent Usage Guide
 
+[Quick start](README.md#quick-start) · [CLI reference](docs/CLI_REFERENCE.md) · [Configuration](docs/CONFIGURATION.md)
+
 **A practical guide for AI agents using Filmot CLI to research YouTube content**
 
 *Written by an agent, for agents, based on real-world research sessions.*
@@ -82,7 +84,7 @@ This runs the **Scout → Staged Search → Preview → Download** pipeline:
 5. **Download and checkpoint** — Saves selected transcripts and per-item outcomes under the Unicode-safe topic name.
 6. **Probe (optional)** — Extracts cross-source entities, reports co-occurrence-window and source support, and runs transparent `NEAR/N` follow-ups.
 
-**Why this matters:** Filmot indexes transcripts ~24-48 hours after upload. For breaking news, the scout phase finds videos that Filmot can't see yet. Without it, you'd miss same-day developments entirely.
+**Why this matters:** Filmot's transcript index can lag recent uploads; the delay varies by video and provider coverage. The scout phase can discover recent public YouTube videos before their transcripts appear in the index.
 
 The source prior is an unverified popularity/engagement heuristic, not a credibility or truth score. Treat every automatically selected transcript as candidate material until you inspect the passage and verify important claims.
 
@@ -152,8 +154,8 @@ filmot research "your topic" [OPTIONS]
 | `--dedupe` | Skip transcripts with the same first-500-character fingerprint | Off |
 | `--min-matches N` | Only download videos with N+ subtitle matches (0 to disable) | 2 |
 | `--sort [balanced\|density\|source-prior\|viewcount]` | Rank fetched candidates; source-prior is an unverified audience/engagement heuristic | balanced |
-| `--candidate-pages N` | Filmot pages fetched before client-side ranking | 3 |
-| `--candidate-pool N` | Maximum Filmot candidates scored | 150 |
+| `--candidate-pages N` | Maximum Filmot pages fetched per search stage | 3 |
+| `--candidate-pool N` | Maximum Filmot candidates scored per search stage | 150 |
 | `--accept-broad` | Permit a high-cardinality loose fallback after preview/gating | Off |
 | `--broad-threshold N` | Loose-result cardinality requiring explicit acceptance | 1000 |
 | `--channel` / `--channel-id` | Restrict candidates to resolved or exact channel IDs; fail closed on resolution errors | None |
@@ -161,6 +163,12 @@ filmot research "your topic" [OPTIONS]
 | `--scout-days N` | How far back the scout looks | 7 |
 | `--probe` | Auto-extract entities from transcripts and run NEAR/N probes to discover related content | Off |
 | `--verbose` | Show full transcript failure details | Off |
+
+`--candidate-pages` accepts 1–20 and `--candidate-pool` accepts at least 1.
+These budgets apply to each Filmot search stage; several stages may each spend
+that budget before the qualified candidates are deduplicated and ranked
+together. Scout and probe work have separate bounds. `--depth` caps selected
+transcript candidates, not API requests.
 
 ### Recommended Settings
 
@@ -267,7 +275,7 @@ Every result surfaces navigation and heuristic signals inline, so you can triage
 - **Timestamped deep links** — the `Video:` URL and every match link jump straight to the moment (`&t=312s`), not 0:00. Click the hit, land on the sentence.
 - **Engagement ratio** — `Engagement: 0.7%` (likes/views) next to the view count. It can help prioritize inspection, but does not establish expertise, independence, credibility, or truth.
 - **Echo warning** — if result snippets share near-identical phrasing, they're tagged `[echo#N]` and a warning prints up top. This is an advisory reuse/common-lineage signal, not proof of copying, dependence, credibility, falsity, or truth. Use `library echoes` on the full saved transcripts before making an independence judgment.
-- **Freshness note** — when your date window reaches the last few days, the tool reminds you Filmot lags ~24-48h and prints the exact `yt-search` command to catch launch-day coverage (guide Trap 5/7).
+- **Freshness note** — when your date window reaches the last few days, the tool prints a `yt-search` follow-up. Treat its index-delay estimate as a heuristic, not a guaranteed indexing schedule (guide Trap 5/7).
 
 ### Density Scoring
 
@@ -389,14 +397,19 @@ replace preserves any existing record.
 After saving, every save path looks up the new records in Filmot's index, one
 `/getvideos` call per 200 videos (2 direct-API credits per call). It fills only
 missing fields: unknown title and channel, description, view and like counts,
-category, caption languages, license, flags, and channel details. Counts filled
-this way get Filmot's snapshot date in `views_observed_at`. `caption_languages`
+category, caption languages, license, flags, video duration, and channel details.
+Metadata-search discoveries also preserve dislike counts when supplied.
+`video_duration_seconds` describes the video; transcript `duration_seconds`
+describes the acquired captions. Counts filled this way get Filmot's snapshot
+date in `views_observed_at`. `caption_languages`
 holds `automatic` and `manual` lists. An empty list means the video has none of
 that kind. A missing part means Filmot's record did not say, and a later lookup
 can still fill it. Partial index records (`partial_metadata: true`) often lack a
 title, description, or like count, so they fill fewer fields. Each enriched record
-carries a `filmot_enrichment` block (`provider`, `enriched_at`, `observed_at`,
-`api_provider`, `filled_fields`). On records with YouTube Data API metadata,
+carries a `filmot_enrichment` block with its schema, provider, cumulative filled
+fields, per-field observation dates, and full-lookup receipt when available.
+Filmot discovery metadata is preserved even with automatic lookup disabled.
+On records with YouTube Data API metadata,
 Filmot leaves the YouTube-owned fields to `yt-data`. On a record Filmot enriched
 first, a later `yt-data refresh` keeps those Filmot values and lists them in
 `conflict_paths`. A failed lookup never fails
@@ -485,15 +498,28 @@ directories; parent-creation or file-write errors return the same typed
 these rules.
 
 `library enrich [TOPIC]` repairs records saved before save-time lookups existed,
-or while they were off. By default it selects records with no
-`filmot_enrichment` block. `--video ID` (repeatable or comma-separated) selects
-exact IDs in every topic, `--all` rechecks enriched records, and
-`--max-videos` (default 1000) bounds unique IDs. `--dry-run` makes no request,
+or while they were off. Default selection includes missing/older enrichment
+schemas and discovery-only imports without a completed full-column lookup.
+A completed lookup returning no video records `lookup_status: not_returned`
+and is skipped on later default runs. Provider failures do not create or
+advance a completed lookup receipt: records without one remain eligible,
+while an earlier completed receipt stays intact. `lookup_at` advances on
+completed full lookups even if no fields change; field observation dates
+remain intact. A later discovery import does not change the last full lookup's
+`lookup_status`.
+
+`--video ID` (repeatable or comma-separated) selects exact IDs in every topic,
+and `--all` rechecks completed lookups, including missing or partial
+observations, without overwriting known values. `--max-videos` defaults to
+1,000 unique IDs and accepts 1–10,000, including with `--all`; topic copies of
+one selected ID share a lookup. `--dry-run` makes no request,
 writes nothing, and logs nothing. Its `summary` reports `selected_records`,
-`selected_videos`, `planned_calls`, and `unreadable_records`. A real run adds
+`selected_videos`, `planned_calls`, `truncated_videos`, and `unreadable_records`. A real run adds
 the outcome counts, returns one row per record (`status` is `updated`,
 `unchanged`, `not_returned`, or `failed`, with `filled_fields`), and is `failed`
-only when every selected record failed. A truncated selection is `partial`.
+only when every selected record failed. Truncation adds a warning and the
+omitted-ID count; it makes an otherwise completed real run `partial`, while
+a truncated dry run stays `completed`.
 
 ### Library Search: Word-Boundary Matching
 
@@ -699,9 +725,12 @@ filmot yt-search "TOPIC" --days 7 --max-results 10 \
 ```
 
 The actual query, days, maximum results, order, and request channel are taken
-from that run rather than reconstructed from current defaults. The command
-reproduces the upstream request; a multi-channel local post-filter remains
-visible in raw provenance because one YouTube request cannot express it.
+from that run rather than reconstructed from current defaults. Rerunning the
+command searches a fresh relative `--days` window; it does not replay the
+original UTC interval. For a fixed interval, use explicit `--published-after`
+and `--published-before` bounds from the effective request when available.
+A multi-channel local post-filter remains visible in raw provenance because
+one YouTube request cannot express it.
 
 `research <topic>` logs a run ID, `research_start`, phase checkpoints, every
 selected/downloaded item, and `research_end` with completed, failed, or
@@ -773,6 +802,13 @@ therefore deliberately absent from this project ledger.
 
 For advanced workflows, pipe Filmot or direct YouTube discovery results into
 the same download command:
+
+`download --count N` (or `-n N`) selects the first N input candidates, with a
+default of 50. It slices before skipping existing records, duplicates, or
+failed acquisitions, so N is not a target number of new saves. Rerunning the
+same input does not advance beyond that slice; increase the count or supply a
+different candidate slice to continue. Existing records are skipped rather
+than refreshed.
 
 ```bash
 # Search with raw output, pipe to download
@@ -1185,40 +1221,42 @@ filmot search 'AI|robot|open source' --title "clawdbot" --full
 
 ## Multilingual Search
 
-Filmot searches transcripts in **any language** YouTube auto-generates captions for. This includes Latin, Devanagari, Cyrillic, CJK, Arabic, Hebrew, Hangul, and more.
+Filmot can search indexed transcripts across Latin, Devanagari, Cyrillic, CJK,
+Arabic, Hebrew, Hangul, and other scripts. Coverage and accepted language tags
+depend on the indexed captions and provider route.
 
 ### Language Compatibility
 
-| Language | Script | `--lang` code | Test Results |
+| Language | Script | `--lang` code | Notes |
 |----------|--------|---------------|--------------|
-| English | Latin | `en` | Full support |
-| Spanish | Latin | `es` | 1M+ results |
-| German | Latin | `de` | 75K+ results (handles umlauts) |
-| Hindi | Devanagari | `hi` | 10.5K+ results |
-| Russian | Cyrillic | `ru` | 339K+ results |
-| Japanese | CJK | `ja` | 6M+ results |
-| Korean | Hangul | `ko` | 277K+ results |
-| Arabic | Arabic | `ar` | 127K+ results (RTL) |
-| Hebrew | Hebrew | `iw` (not `he`) | 3.4K+ results (RTL) |
-| Chinese | CJK | omit `--lang` | 672K+ results |
+| English | Latin | `en` | Language-filter example |
+| Spanish | Latin | `es` | Language-filter example |
+| German | Latin | `de` | Queries can include umlauts |
+| Hindi | Devanagari | `hi` | Queries can mix scripts |
+| Russian | Cyrillic | `ru` | Language-filter example |
+| Japanese | CJK | `ja` | Language-filter example |
+| Korean | Hangul | `ko` | Language-filter example |
+| Arabic | Arabic | `ar` | Right-to-left text |
+| Hebrew | Hebrew | `iw` | Legacy-code troubleshooting example |
+| Chinese | CJK | omit `--lang` | Unfiltered troubleshooting example |
 
 ### Key Gotchas
 
-1. **Hebrew uses `iw`, not `he`**: YouTube internally uses the legacy ISO 639 code `iw`. The standard `he` returns zero results. Use `--lang iw` or omit the lang filter entirely.
+1. **Hebrew language tags**: Earlier project observations on some provider routes returned matches with the legacy `iw` code where `he` did not. If a filtered query misses expected results, compare `--lang iw` and an unfiltered query. This is a historical workaround, not a universal claim that `he` returns zero.
 
-2. **Chinese lang filter doesn't work**: `--lang zh` and `--lang zh-Hans` both return zero results. Omit the `--lang` flag and search Chinese characters directly — works perfectly.
+2. **Chinese language filters**: Earlier observations found Chinese queries with matches when unfiltered but none with `zh` or `zh-Hans`. Compare an unfiltered query when troubleshooting; current behavior depends on provider coverage and indexed tags.
 
-3. **CJK ASR tokenization**: YouTube's auto-captions for Chinese/Japanese insert spaces between individual characters. This doesn't affect search but makes raw transcripts less readable.
+3. **CJK ASR tokenization**: Some Chinese/Japanese auto-captions insert spaces between characters. Inspect the returned text when a phrase does not match as expected.
 
-4. **RTL scripts work correctly**: Arabic and Hebrew transcripts render and search correctly, including match context extraction.
+4. **RTL scripts**: Arabic and Hebrew queries are supported as text. Terminal rendering and excerpt readability depend on the terminal and returned caption text.
 
 5. **When in doubt, omit `--lang`**: If a language code isn't returning results, remove the `--lang` filter. The API will match your query characters in any transcript regardless of language tag.
 
-6. **Long Cyrillic queries + sort = 500 error**: `искусственный интеллект` (25 chars) with `--sort uploaddate` causes a server error due to URL-encoded length. Workaround: use shorter synonyms like `нейросеть` (77K results) or `ИИ` (66K results), which sort fine.
+6. **Cyrillic query troubleshooting**: Earlier sessions observed server errors for `искусственный интеллект` with `--sort uploaddate`. This does not establish a current limitation or its cause. Compare a shorter query such as `нейросеть` or `ИИ`, or omit sorting, to isolate a failing request.
 
 7. **Russian AI vocabulary**: Russians say `нейросеть` (neural network) as the everyday term for AI tools — not just the formal `искусственный интеллект`. Search both for comprehensive results.
 
-8. **Hindi uses English loanwords freely**: Hindi YouTube mixes Devanagari and English. Searching `कृत्रिम बुद्धिमत्ता` finds formal Hindi AI content; searching `"AI"` with `--lang hi` finds 41K+ results of Hindi speakers using the English term.
+8. **Hindi and English vocabulary**: Hindi captions can mix Devanagari and English. Compare `कृत्रिम बुद्धिमत्ता` with `"AI" --lang hi` to explore both vocabularies.
 
 ### Examples
 
@@ -1229,10 +1267,10 @@ filmot search "inteligencia artificial" --lang es --full
 # Japanese
 filmot search "人工知能" --lang ja --full
 
-# Hebrew (use "iw", NOT "he")
+# Hebrew: legacy-code workaround observed on some provider routes
 filmot search "בינה מלאכותית" --lang iw --full
 
-# Chinese (MUST omit --lang)
+# Chinese: compare an unfiltered query when language filtering misses results
 filmot search "人工智能" --full
 
 # Arabic
@@ -1288,7 +1326,11 @@ filmot search '"CES 2026"|"39C3"|"DEF CON"' --full --lang en
 Use `--manual-subs` for manually uploaded subtitles (higher quality, less coverage). Default searches auto-generated subtitles (wider coverage). Cannot search both in the same request.
 
 ### Tip 10: Non-English Language Codes
-Most languages use standard ISO codes (`es`, `de`, `ja`, `ko`, `ar`, `hi`, `ru`). Two exceptions: **Hebrew** uses `iw` (not `he`), and **Chinese** requires omitting `--lang` entirely. For Russian, use shorter queries like `нейросеть` instead of `искусственный интеллект` when sorting — long Cyrillic URLs cause 500 errors. When in doubt, drop the `--lang` flag — the API matches query characters in any transcript.
+Start with language codes such as `es`, `de`, `ja`, `ko`, `ar`, `hi`, or `ru`.
+Historical Hebrew/Chinese troubleshooting observations favored `iw` or an
+unfiltered query on some routes; they do not establish current universal
+restrictions. Compare filters and shorter query variants when a request
+fails. See [Multilingual search](#multilingual-search) for the caveats.
 
 ### Tip 11: Pipe to Select-Object for Long Output
 ```powershell
@@ -1301,7 +1343,7 @@ filmot transcript VIDEO_ID --full 2>&1 | Select-Object -First 200
 
 ### Pattern 1: Full Topic Research (Recommended)
 ```bash
-# One command does it all (density sort + min-matches 2 are defaults)
+# One command does it all (balanced sort + min-matches 2 are defaults)
 filmot research "brain-computer interfaces" --depth 15 --dedupe
 
 # Then explore
@@ -1322,7 +1364,10 @@ filmot search 'TOPIC' --start-date 2026-01-01 --end-date 2026-02-01 --full --lan
 filmot transcript VIDEO_ID --save-to TOPIC --discovery discovery.json
 ```
 
-**Key insight:** Filmot indexes transcripts ~24-48 hours after upload. For same-day events, `yt-search` (YouTube Data API) finds videos that Filmot can't see yet. The `research` command's `--scout` phase handles this automatically. If you're investigating something that happened today, always start with `yt-search` or use `--scout-days 1`.
+**Key insight:** Filmot indexing can lag new uploads. For same-day events,
+`yt-search` or the research scout can find recent public YouTube videos whose
+transcripts are not yet indexed. Use `--scout-days 1` to narrow that relative
+window; discovery does not guarantee transcript availability.
 
 Direct `yt-search` defaults to the last 7 days, date order, 25 distinct
 results, one page, and public metadata enrichment; an explicit
@@ -1594,10 +1639,10 @@ Use AWS Transcribe fallback:
 ```bash
 filmot transcript VIDEO_ID --fallback --full
 ```
-Requires `yt-dlp`, `boto3`, and `requests`, plus `FILMOT_S3_BUCKET` (an S3 bucket
-you control; there is no default). `FILMOT_AWS_PROFILE` (default: boto3's
-default credentials) and `FILMOT_AWS_REGION` (default `us-east-1`) are
-optional. Without a bucket the fallback fails before downloading audio.
+Follow [AWS Transcribe setup](docs/CONFIGURATION.md#aws-transcribe-fallback)
+for the `aws` Python extra, required FFmpeg/ffprobe binaries on `PATH`, and
+AWS credentials, bucket, profile, and region settings. Without
+`FILMOT_S3_BUCKET`, fallback stops before downloading audio.
 
 ### Filmot API providers, credits, and failover
 
@@ -1767,8 +1812,9 @@ use and retained. A custom `WEBSHARE_SESSION_FILE` is not relocated.
   `completed` with an empty `result`; `yt-search`, `yt-video`, and `library list`
   use `empty`; a `yt-playlist` `partial` can contain zero rows. A `completed`
   search covers only the fetched pages; compare `scope.api_total` with
-  `scope.candidates_fetched`. The README's Python agent example applies these
-  checks to `search`.
+  `scope.candidates_fetched`. The
+  [Python agent example](docs/CLI_REFERENCE.md#example-agent-workflow-python)
+  applies these checks to `search`.
 - Raw mode affects presentation only. It does not make a read-only command log
   or make a mutating command read-only.
 

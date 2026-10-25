@@ -3,7 +3,7 @@
 > **Status:** Historical implementation plan plus the current follow-on batch.
 > The original work was later split across `filmot/commands/` modules; file
 > lists below name the current owners rather than the former monolithic CLI.
-> README command contracts and the test suite are authoritative. Do not use a
+> The [CLI reference](CLI_REFERENCE.md) command contracts and the test suite are authoritative. Do not use a
 > hard-coded historical test count as a release signal.
 
 ## Tier 1: Fundamental Workflow Changes

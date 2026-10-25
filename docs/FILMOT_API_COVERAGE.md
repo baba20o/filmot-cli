@@ -39,7 +39,7 @@ not claim to be a single API response page.
 ## Request parameter inventory
 
 Names below are the schema's names, not CLI spellings. Dictionary-based methods
-accept them directly; the [README](../README.md#discovery-searches) documents CLI
+accept them directly; the [CLI reference](CLI_REFERENCE.md#discovery-searches) documents CLI
 spellings. `exportInline=1` is fixed by the export CLI because it writes the
 returned bytes to a local file. Named formats are used instead of numeric aliases.
 
