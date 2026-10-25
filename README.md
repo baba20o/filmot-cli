@@ -2,6 +2,8 @@
 
 A powerful command-line interface for the [Filmot](https://filmot.com/) YouTube transcript search engine — Search YouTube video transcripts, get video metadata, and discover channels.
 
+Uses [Filmot's official API](https://filmot.com/api-documentation).
+
 ## Why Filmot CLI?
 
 Google lets you search *titles* and *descriptions*. Filmot lets you search **inside indexed YouTube transcripts** — a large archive of auto-generated and manual captions covering spoken video content.
@@ -88,8 +90,8 @@ filmot library compare "cobalt" --topic deep-sea-research --sort density
 ## Requirements
 
 - Python 3.9+
-- A Filmot API key from [filmot.com/api-keys](https://filmot.com/api-keys),
-  an existing RapidAPI Filmot subscription, or both
+- A key for [Filmot's official API](https://filmot.com/api-documentation),
+  available from [Filmot API keys](https://filmot.com/api-keys)
 - Optional Google Cloud YouTube Data API v3 key for `yt-search`, `yt-video`,
   `yt-playlist`, `yt-playlists`, `yt-comments`, `yt-replies`, `yt-data refresh`,
   and `channel-download`
@@ -129,23 +131,21 @@ python main.py --help
 
 ### Configure API credentials
 
-Filmot supports two API providers side by side. Create a `.env` file in the
-directory where you run Filmot:
+Start with [Filmot's official API documentation](https://filmot.com/api-documentation)
+and create a key at [Filmot API keys](https://filmot.com/api-keys). Add it to a
+`.env` file in the directory where you run Filmot:
 ```env
-# Direct Filmot API (recommended): create a key at https://filmot.com/api-keys
+# Official Filmot API: https://filmot.com/api-documentation
 FILMOT_API_KEY=your_filmot_api_key_here
-
-# Legacy RapidAPI gateway (optional; existing subscriptions keep working)
-RAPIDAPI_KEY=your_rapidapi_key_here
 
 # Optional: direct search, video/playlist/comment reads, refresh, and channel enumeration
 YOUTUBE_API_KEY=your_restricted_youtube_data_api_key_here
 ```
 
-Either Filmot key is enough for subtitle search, video metadata, and channel
-lookup. Features served only by the direct API need `FILMOT_API_KEY`. The
-Filmot listing on RapidAPI is private and invite-only for new users, so new
-setups should use a direct key.
+`FILMOT_API_KEY` enables all Filmot API features. The CLI calls this provider
+`direct`. Existing RapidAPI subscriptions remain supported as legacy
+compatibility for subtitle search, video metadata, and channel lookup; see
+[provider routing](#api-providers-routing-and-credits) below.
 For credentials shared across projects, use Filmot's per-user `config.env`
 instead. See [Storage and configuration](#storage-and-configuration).
 Restrict `YOUTUBE_API_KEY` to the YouTube Data API and the hosts/IPs that run
@@ -156,17 +156,22 @@ opportunities and their admission gates live in the
 
 ### API providers, routing, and credits
 
+The `direct` provider is Filmot's official API. With only `FILMOT_API_KEY`
+configured, the default `auto` policy uses it for every Filmot API request.
+Legacy RapidAPI subscribers can additionally set `RAPIDAPI_KEY`; when both
+keys are configured, shared routes keep the legacy-first order shown below.
+
 | Policy | Subtitle search, video metadata, channel lookup | Direct-only features |
 | --- | --- | --- |
-| `auto` (default) | RapidAPI when configured, then the direct API | Direct API |
-| `direct` | Direct API | Direct API |
-| `rapidapi` | RapidAPI | Unavailable, with a clear error |
+| `auto` (default) | Official API; legacy RapidAPI first if configured | Official API |
+| `direct` | Official API | Official API |
+| `rapidapi` (legacy) | Legacy RapidAPI | Unavailable, with a clear error |
 
 Choose a policy with `FILMOT_API_PROVIDER=auto|direct|rapidapi`, or for one
 command with `filmot --api-provider direct COMMAND ...`. The `auto` policy is
 cost-aware: the direct API charges credits from a monthly allowance (an
 unscoped subtitle-search page costs 5 credits, or 1 when `--channel-id` names
-one to five channels), while a RapidAPI plan counts requests.
+one to five channels), while a legacy RapidAPI plan counts requests.
 
 Under `auto`, a request that fails because the provider rejected its
 credentials, ran out of quota, lacks the route, returned a server error or a
@@ -179,7 +184,7 @@ After any command that used the Filmot API, a one-line summary is printed on
 stderr:
 
 ```text
-Filmot API: direct 1 request, 1 credit (7,980 credits left; resets 2026-11-19) | rapidapi 1 request | failover rapidapi -> direct on /getsearchchannels (auth)
+Filmot API: direct 1 request, 1 credit (7,980 credits left; resets 2026-11-19)
 ```
 
 `--raw` results carry the same details under `_filmot.api`: requests and cache
@@ -915,8 +920,9 @@ Filmot falls back to that index, before any AWS fallback. That covers a blocked
 IP or proxy, captions that are now disabled, and a video that has been removed.
 This applies to `transcript`, `download`, `search --bulk-download`,
 `research`, and `channel-download`. Each fallback is one `/getvideos` lookup:
-it goes through RapidAPI under `auto` routing, or costs 2 credits on the direct
-API. It is skipped when no Filmot key is configured.
+it costs 2 credits on the official API. Under `auto`, a configured legacy
+RapidAPI key takes precedence for this shared route. The lookup is skipped
+when no Filmot key is configured.
 
 | `--source` | Behavior |
 | --- | --- |
@@ -1848,7 +1854,7 @@ The inventory reports Filmot and YouTube API keys separately as only
 | 35 | Canada | 13 | Australia | 116 | Japan |
 | 189 | South Korea | 166 | Russia | 155 | Mexico |
 
-> See the [Filmot API documentation](https://filmot.com/api) for a complete list of 250+ country codes.
+> See the [official Filmot API documentation](https://filmot.com/api-documentation) for supported country codes.
 
 ## Project Structure
 
@@ -2098,13 +2104,16 @@ REPL running. `--sort density` sorts on the client, so it is available only in
 
 ## API Authentication
 
-Transcript-index operations require a RapidAPI key for the Filmot Tube
-Metadata Archive API:
+Filmot API operations use `FILMOT_API_KEY` for the
+[official Filmot API](https://filmot.com/api-documentation):
 
-1. Create a free account at [RapidAPI](https://rapidapi.com/)
-2. Subscribe to the [Filmot API](https://filmot.com/api)
-3. Copy your API key from the dashboard
-4. Add it to your per-user `config.env` (recommended) or project `.env`
+1. Create a key at [Filmot API keys](https://filmot.com/api-keys).
+2. Set `FILMOT_API_KEY` in your per-user `config.env` (recommended) or project `.env`.
+3. Run `filmot config` to check configuration without printing the key.
+
+`RAPIDAPI_KEY` is only for existing legacy gateway subscriptions. It supports
+shared routes but does not enable official-API-only features such as `titles`,
+`find-channels`, and `subtitle-export`.
 
 Direct `yt-search`, `yt-video`, `yt-playlist`, `yt-playlists`, `yt-comments`,
 `yt-replies`, `yt-data refresh`, and `channel-download` additionally require a restricted
@@ -2427,6 +2436,6 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - [Filmot](https://filmot.com/) - YouTube subtitle search engine
-- [RapidAPI](https://rapidapi.com/) - API marketplace
+- [Filmot's official API](https://filmot.com/api-documentation) - API documentation
 - [Click](https://click.palletsprojects.com/) - CLI framework
 - [Rich](https://rich.readthedocs.io/) - Terminal formatting library

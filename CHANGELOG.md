@@ -337,6 +337,8 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- API onboarding and public guides now link to Filmot's official API
+  documentation and identify RapidAPI as legacy compatibility.
 - Repository hygiene now ignores local environment variants, audit notes,
   exports, databases and common development caches while allowing reviewed test
   fixtures. Source distributions include linked public docs, nested test helpers,

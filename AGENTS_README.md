@@ -1601,18 +1601,24 @@ optional. Without a bucket the fallback fails before downloading audio.
 
 ### Filmot API providers, credits, and failover
 
-Filmot can use the direct API (`FILMOT_API_KEY`) and the legacy RapidAPI
-gateway (`RAPIDAPI_KEY`) side by side. Under the default `auto` policy, subtitle
-search, video metadata, and channel lookup go to RapidAPI when it is configured
-and fail over to the direct API on credential, quota, availability, server, or
-network failures. Direct-only features always use the direct API. Pin one
+Use [Filmot's official API](https://filmot.com/api-documentation) with
+`FILMOT_API_KEY`; the CLI calls this provider `direct`. Create a key at
+[Filmot API keys](https://filmot.com/api-keys). With only that key configured,
+the default `auto` policy sends every Filmot request to the official API.
+
+The legacy RapidAPI gateway (`RAPIDAPI_KEY`) remains supported for existing
+subscriptions. When configured, `auto` sends subtitle search, video metadata,
+and channel lookup there first, then fails over to the official API on
+credential, quota, availability, server, or network failures. Direct-only
+features always use the official API. Pin one
 provider with `filmot --api-provider direct|rapidapi COMMAND ...` or
 `FILMOT_API_PROVIDER`. Endpoint overrides (`FILMOT_API_BASE_URL`,
 `RAPIDAPI_HOST`) are honored only from the process environment or the per-user
 `config.env`, never a project `.env`. For a provider whose key is set, a
 non-https base URL or a malformed host stops the command before any request,
-with a `ProviderConfigurationError`. A
-project `.env` also cannot set the per-user config location or TLS trust
+with a `ProviderConfigurationError`, unless the other provider is explicitly
+pinned; invalid unused-provider configuration does not block a pinned request.
+A project `.env` also cannot set the per-user config location or TLS trust
 variables, and its `${VAR}` references are not expanded. It cannot set
 `PYTHON*` variables either. Path settings (`WEBSHARE_SESSION_FILE`,
 `FILMOT_RATE_LIMIT_DB`, `FILMOT_DATA_DIR`, and the like) never expand variable
@@ -1665,8 +1671,8 @@ key are not propagated. This boundary is defense in depth—never put secrets in
 queries, titles, notes, or committed artifacts, and rotate a key if exposure is
 suspected.
 
-Run `filmot config` for a credential-safe preflight. It reports the direct
-Filmot, RapidAPI, and YouTube API keys separately as `configured` or
+Run `filmot config` for a credential-safe preflight. It reports the official
+Filmot, legacy RapidAPI, and YouTube API keys separately as `configured` or
 `not configured`, plus the active provider policy and how legacy and
 direct-only routes resolve. It never prints a key or a fragment of one.
 
