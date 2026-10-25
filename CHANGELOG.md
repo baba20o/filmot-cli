@@ -16,6 +16,21 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Added
 
+- OpenAPI field selection for `titles`, `find-channels`, and `channel-videos`
+  through `--columns`/`--all`, including subtitle-specific limits and channel
+  listing `--lang`. Title searches request all non-subtitle metadata by default.
+- Server exports from `titles --output` and `find-channels --output`, plus
+  `FilmotClient.export_metadata_search()` and `export_advanced_channel_search()`.
+  Subtitle export accepts `--columns all` and explicit manual-language guessing.
+- A [Filmot API coverage audit](docs/FILMOT_API_COVERAGE.md) mapping seven
+  endpoints, 100 request parameters, enrichment fields and deliberate limits.
+- Filmot discovery enrichment preserves video duration, metadata-search dislike
+  counts, description, language/flag/license semantics and snapshot dates.
+  Enrichment tracks schema coverage and cumulative provenance; default library
+  backfill includes older schemas and discovery-only imports without replacing
+  known metadata. Completed negative lookups are recorded separately and retried
+  only through explicit selectors; provider failures remain eligible.
+
 - Direct Filmot API support (`FILMOT_API_KEY`, `X-API-Key`,
   `https://apiv1.filmot.com/api/v1`) alongside the legacy RapidAPI gateway.
   The default `auto` policy routes subtitle search, video metadata, and channel
@@ -322,6 +337,17 @@ recorded in `docs/FIELD_TEST_LOG.md`.
 
 ### Fixed
 
+- Selected-column metadata and channel responses no longer require omitted
+  base fields; malformed present fields and nested subtitle tracks are checked.
+- Later malformed export pages preserve earlier pages and the failed-page
+  continuation. CSV headers are checked across pages, large/multiline fields
+  are preserved, ZIP metadata entries must be unique, and merged channel JSON
+  retains per-page envelope metadata. JSON merging handles escaped Unicode.
+- Download rejects failed/interrupted discovery envelopes and preserves partial
+  upstream failures and continuation while processing usable candidates.
+- Pinned API requests ignore invalid host configuration for an unused provider.
+- Imported canonical Filmot metadata is validated alongside raw API fields;
+  invalid IDs that were never requested do not receive completed-lookup receipts.
 - `filmot interactive` could not search: every search failed on keywords the
   client does not take (`sort`, `order`), and `cache stats` was missing. REPL
   searches now take `filmot search` option names, report an unknown option or

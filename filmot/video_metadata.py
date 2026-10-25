@@ -14,7 +14,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .api import VIDEO_BATCH_LIMIT, VIDEO_METADATA_COLUMNS
 from .api_providers import ProviderConfigurationError, configured_secrets
-from .api_usage import valid_timestamp
+from .filmot_metadata import (
+    FILMOT_METADATA_LOOKUP_PROFILE,
+    caption_languages,
+    creative_commons,
+    filmot_metadata_fields,
+)
 from .redaction import redact_sensitive_text
 
 
@@ -22,48 +27,6 @@ ENRICH_ON_SAVE_ENV = "FILMOT_ENRICH_ON_SAVE"
 OUTCOME_STATUSES = ("updated", "unchanged", "not_returned", "failed")
 
 _VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
-
-
-def caption_languages(value: Any) -> List[str]:
-    """Split Filmot's whitespace-separated caption-language list, keeping order."""
-    if not isinstance(value, str):
-        return []
-    return list(dict.fromkeys(value.split()))
-
-
-def creative_commons(value: Any) -> Optional[bool]:
-    """Read ``CC``/``""`` (current endpoints) or ``2``/``1`` (legacy search)."""
-    if isinstance(value, bool):
-        return None
-    if value in ("CC", 2, "2"):
-        return True
-    if value in ("", 1, "1"):
-        return False
-    return None
-
-
-def _flag(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if value in (1, "1"):
-        return True
-    if value in (0, "0"):
-        return False
-    return None
-
-
-def _count(value: Any) -> Optional[int]:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
-def _text(value: Any) -> Optional[str]:
-    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _redacted_error(error: BaseException) -> str:
@@ -90,38 +53,11 @@ def video_candidate(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     video_id = row.get("id") or row.get("videoid")
     if not isinstance(video_id, str) or not _VIDEO_ID.fullmatch(video_id):
         return None
-    observed = _text(row.get("lastfetchdate"))
-    candidate: Dict[str, Any] = {
+    return {
         "video_id": video_id,
         "provider": "filmot",
-        "title": _text(row.get("title")),
-        "description": _text(row.get("description")),
-        "channel_title": _text(row.get("channelname")),
-        "channel_id": _text(row.get("channelid")),
-        "published_at": _text(row.get("uploaddate")),
-        "views": _count(row.get("viewcount")),
-        "likes": _count(row.get("likecount")),
-        "category": _text(row.get("category")),
-        "is_unlisted": _flag(row.get("isunlisted")),
-        "is_livestream": _flag(row.get("islivestream")),
-        "creative_commons": creative_commons(row.get("license")),
-        "channel_subscribers": _count(row.get("channelsubcount")),
-        "channel_country": _text(row.get("channelcountryname")),
-        "partial_metadata": _flag(row.get("ispartialdata")),
-        # Never metadata_observed_at: that name means a YouTube observation to
-        # the metadata lifecycle.
-        "filmot_observed_at": observed if observed and valid_timestamp(observed) else None,
+        **filmot_metadata_fields(row),
     }
-    # A blank list is Filmot reporting no captions of that kind; null means it
-    # does not know, so that part stays unrecorded for a later lookup to fill.
-    languages = {
-        part: caption_languages(row[field])
-        for part, field in (("automatic", "autosubs"), ("manual", "manualsubs"))
-        if isinstance(row.get(field), str)
-    }
-    if languages:
-        candidate["caption_languages"] = languages
-    return {key: value for key, value in candidate.items() if value is not None}
 
 
 def fetch_video_candidates(
@@ -177,15 +113,43 @@ def _apply_candidates(
     enriched_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     outcomes: List[Dict[str, Any]] = []
     for topic, video_id in records:
+        if not isinstance(video_id, str) or not _VIDEO_ID.fullmatch(video_id):
+            outcomes.append({
+                "topic": topic, "video_id": video_id, "status": "failed",
+                "error": "InvalidVideoID: expected an 11-character YouTube video ID",
+                "error_type": "InvalidVideoID",
+            })
+            continue
         found = candidates.get(video_id)
         if found is None:
             outcome = {"topic": topic, "video_id": video_id, "status": "not_returned"}
             if video_id in lost:
                 outcome.update(status="failed", error=lost[video_id])
+            else:
+                # A completed lookup with no matching row is useful evidence:
+                # do not repeatedly charge for it in the default selection.
+                # It is not a metadata observation and supplies no field values.
+                try:
+                    library.enrich_metadata(
+                        video_id, topic, {"video_id": video_id, "provider": "filmot"},
+                        provenance={
+                            "provider": "filmot",
+                            "lookup_profile": FILMOT_METADATA_LOOKUP_PROFILE,
+                            "lookup_status": "not_returned",
+                            "lookup_at": enriched_at,
+                        },
+                        filmot_snapshot=True,
+                    )
+                except Exception as error:
+                    outcome.update(status="failed", error=_redacted_error(error))
             outcomes.append(outcome)
             continue
         candidate, provider = found
-        provenance = {"provider": "filmot", "enriched_at": enriched_at}
+        provenance = {
+            "provider": "filmot", "enriched_at": enriched_at,
+            "lookup_profile": FILMOT_METADATA_LOOKUP_PROFILE,
+            "lookup_status": "returned", "lookup_at": enriched_at,
+        }
         if candidate.get("filmot_observed_at"):
             provenance["observed_at"] = candidate["filmot_observed_at"]
         if provider:

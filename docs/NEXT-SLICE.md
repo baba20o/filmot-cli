@@ -1,5 +1,25 @@
 # Filmot: next implementation slice and follow-up backlog
 
+Current navigation (2026-10-25): the September slice below is historical scope,
+not a snapshot of today's entire CLI. Subsequent PRs #8–#18 added direct Filmot
+providers, indexed transcripts, richer metadata, channel discovery and exports,
+bounded local passage reading, and transport/output hardening. The
+[Filmot API coverage and commit audit](FILMOT_API_COVERAGE.md) tracks the supplied
+OpenAPI contract and the integration gaps addressed after `42e3ce1`.
+The outstanding N-series research backlog below remains separate from that API
+coverage work; its live release checks have not been rerun by the contract audit.
+
+Follow-ups from the October contract audit:
+
+- Run a separately budgeted live compatibility smoke check for enriched fields
+  and export formats; deterministic fixtures do not establish current provider
+  behavior or account-specific field availability.
+- Consider one consistent partial-result exit policy across commands. Discovery
+  currently exits 0 for usable partial results, while a partial discovery piped
+  into `download` exits 1; inspect status as well as process exit codes.
+- Add compact CSV only with inheritance-aware page decoding. Ordinary CSV,
+  JSON/JSONL and ZIP already cover the export workflow.
+
 Updated 2026-09-12. **Status: implemented but unreleased; the live playlist
 handoff and public-comment/reply slice are complete, while the remaining
 recent-upload/search/channel and API-policy operator checks still precede

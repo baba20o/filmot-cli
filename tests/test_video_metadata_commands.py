@@ -261,7 +261,7 @@ def test_library_enrich_dry_run_previews_without_requests_or_events(two_records,
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["summary"] == {
-        "scope": "never-enriched", "dry_run": True, "selected_records": 2,
+        "scope": "needs-enrichment", "dry_run": True, "selected_records": 2,
         "selected_videos": 2, "truncated_videos": 0, "unreadable_records": 0,
         "planned_calls": 1,
     }
@@ -306,6 +306,21 @@ def test_library_enrich_selectors_choose_exact_or_all_records(two_records, run):
         everything = run("library", "enrich", "--all", "--dry-run", "--raw")
     assert json.loads(remaining.stdout)["summary"]["selected_records"] == 1
     assert json.loads(everything.stdout)["summary"]["selected_records"] == 2
+
+
+def test_missing_lookup_receipts_skip_default_selection_but_allow_explicit_retries(two_records, run):
+    with patch("filmot.api.FilmotClient", return_value=lookup_client([])):
+        missing = run("library", "enrich", "--raw")
+    assert json.loads(missing.stdout)["summary"]["not_returned"] == 2
+
+    with patch("filmot.api.FilmotClient", side_effect=AssertionError("no default retry")):
+        default = run("library", "enrich", "--raw")
+        all_rows = run("library", "enrich", "--all", "--dry-run", "--raw")
+        exact = run("library", "enrich", "--video", VIDEO_ID, "--dry-run", "--raw")
+    assert default.exit_code == 0, default.output
+    assert json.loads(default.stdout)["summary"]["selected_records"] == 0
+    assert json.loads(all_rows.stdout)["summary"]["selected_records"] == 2
+    assert json.loads(exact.stdout)["summary"]["selected_records"] == 1
 
 
 def test_library_enrich_reports_lookup_failures_and_truncation(two_records, run):

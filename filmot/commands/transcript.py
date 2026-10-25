@@ -53,6 +53,11 @@ def _load_discovery_candidate(
         raise ValueError("non-finite JSON constant: {}".format(value))
 
     artifact = json_mod.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+    handoff = _discovery_handoff(artifact)
+    if handoff.get("status") in ("failed", "interrupted"):
+        raise ValueError("Discovery artifact reports {}; acquire a successful result first".format(
+            handoff["status"]
+        ))
     candidates = normalize_candidates(artifact)
     matches = [
         candidate for candidate in candidates
@@ -144,6 +149,7 @@ def _apply_discovery_metadata(
         topic,
         candidate,
         provenance=provenance,
+        filmot_snapshot=provider == "filmot",
     )
 
 
@@ -1022,6 +1028,18 @@ def _render_download(outcome: CommandResult[dict]) -> None:
     """Render final pipeline-download messages captured in the outcome."""
     for markup in outcome.data.get("human_messages") or []:
         console.print(markup)
+    for warning in outcome.warnings:
+        console.print(Text(warning, style="yellow"))
+    for error in outcome.errors:
+        console.print(Text(error.message, style="red"))
+    discovery = outcome.data.get("discovery") or {}
+    if discovery.get("status") == "partial":
+        if discovery.get("next_page") is not None:
+            console.print(Text("Discovery was incomplete; resume {} with --page {}.".format(
+                discovery.get("command") or "the source command", discovery["next_page"],
+            )))
+        elif discovery.get("continuation") or discovery.get("coverage"):
+            console.print("Discovery was incomplete; retain the source artifact's continuation to resume it.")
 
 
 @click.command("transcript")
@@ -1621,20 +1639,27 @@ def transcript(ctx, video_id: str, lang: str, timestamps: bool, chunk: float,
 
                 metadata = {
                     "title": video_title,
+                    "description": video_metadata.get("description"),
                     "channel": video_channel,
                     "channel_id": video_metadata.get("channel_id"),
                     "published_at": video_metadata.get("published_at"),
                     "views": video_metadata.get("views"),
                     "likes": video_metadata.get("likes"),
                     "comments": video_metadata.get("comments"),
-                    "youtube_duration": video_metadata.get("duration"),
+                    ("video_duration_seconds" if video_metadata.get("provider") == "filmot"
+                     else "youtube_duration"): (
+                        provider_fields.get("video_duration_seconds")
+                        if video_metadata.get("provider") == "filmot"
+                        else video_metadata.get("duration")
+                    ),
                     "discovery_provider": video_metadata.get("provider"),
                     "discovery_provenance": (
                         video_metadata.get("provenance") or {}
                     ),
                     "provider_fields": provider_fields,
                     "views_observed_at": provider_fields.get(
-                        "metadata_observed_at"
+                        "filmot_observed_at" if video_metadata.get("provider") == "filmot"
+                        else "metadata_observed_at"
                     ),
                     "metadata_expires_at": provider_fields.get(
                         "metadata_expires_at"
@@ -2743,6 +2768,40 @@ def channel_search(channel_slug: str, query: str, limit: int):
 
 # ========== SESSIONS (LEDGER) ==========
 
+def _discovery_handoff(artifact: object) -> dict:
+    """Keep a producer's outcome and pagination beside its downloadable rows."""
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("_filmot"), dict):
+        return {}
+    metadata = artifact["_filmot"]
+    handoff = {key: metadata[key] for key in ("command", "status", "errors", "warnings")
+               if key in metadata}
+    for key in ("next_page", "next_page_token", "continuation", "coverage",
+                "first_page", "pages_fetched", "exhausted"):
+        if key in artifact:
+            handoff[key] = artifact[key]
+    return _redact_diagnostic(handoff)
+
+
+def _discovery_handoff_errors(handoff: dict) -> list[ErrorDetail]:
+    errors = []
+    reported = handoff.get("errors")
+    for error in reported if isinstance(reported, list) else []:
+        if isinstance(error, dict):
+            errors.append(ErrorDetail(
+                type=str(error.get("type") or "DiscoveryError"),
+                message=str(error.get("message") or "Discovery input is incomplete"),
+                stage="input-discovery",
+                details={"command": handoff.get("command"), "source_stage": error.get("stage")},
+            ))
+    if not errors:
+        errors.append(ErrorDetail(
+            type="IncompleteDiscovery",
+            message="Discovery input reports {}.".format(handoff.get("status")),
+            stage="input-discovery",
+        ))
+    return errors
+
+
 @click.command("download")
 @session_option
 @click.option("--topic", "-t", required=True, help="Library topic to save transcripts under")
@@ -2816,6 +2875,17 @@ def download(
     # Wrap in expected format if needed
     if isinstance(results, list):
         results = {"result": results}
+
+    discovery = _discovery_handoff(results)
+    if discovery.get("status") in ("failed", "interrupted"):
+        outcome = CommandResult(
+            "download", ResultStatus.FAILED,
+            {"topic": topic, "discovery_ref": discovery_ref, "discovery": discovery},
+            errors=_discovery_handoff_errors(discovery),
+        )
+        log_result("download", outcome, topic=topic, data=outcome.data)
+        _render_download(outcome)
+        raise click.exceptions.Exit(1)
 
     if no_proxy:
         from ..transcript import disable_proxy
@@ -2905,21 +2975,21 @@ def download(
     selected = int(summary.get("selected", 0))
     failed = int(summary.get("failed", 0))
     metadata_failures = int(summary.get("metadata_failures", 0))
-    if selected == 0:
+    discovery_partial = discovery.get("status") == "partial"
+    warnings = []
+    if discovery_partial:
+        status = ResultStatus.PARTIAL
+        warnings.append("Available discovery rows were processed; the source discovery is incomplete.")
+    elif selected == 0:
         status = ResultStatus.EMPTY
-        warnings = []
     elif failed or metadata_failures:
         status = ResultStatus.PARTIAL
-        warnings = []
-        if failed:
-            warnings.append(f"{failed} selected transcript download(s) failed")
-        if metadata_failures:
-            warnings.append(
-                f"{metadata_failures} YouTube metadata lifecycle registration(s) failed"
-            )
     else:
         status = ResultStatus.COMPLETED
-        warnings = []
+    if failed:
+        warnings.append(f"{failed} selected transcript download(s) failed")
+    if metadata_failures:
+        warnings.append(f"{metadata_failures} discovery metadata update(s) failed")
     outcome = CommandResult(
         command="download",
         status=status,
@@ -2931,9 +3001,11 @@ def download(
             "dedupe": dedupe,
             "no_proxy": no_proxy,
             "discovery_ref": discovery_ref,
+            **({"discovery": discovery} if discovery else {}),
             **summary,
             "human_messages": progress_console.final_messages,
         },
+        errors=_discovery_handoff_errors(discovery) if discovery_partial else [],
         warnings=warnings,
     )
     log_result(
@@ -2948,10 +3020,13 @@ def download(
             "dedupe": dedupe,
             "no_proxy": no_proxy,
             "discovery_ref": discovery_ref,
+            **({"discovery": discovery} if discovery else {}),
             **summary,
         },
     )
     _render_download(outcome)
+    if discovery_partial:
+        raise click.exceptions.Exit(1)
 
 
 # ========== PROXY POOL ==========

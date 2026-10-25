@@ -699,6 +699,8 @@ class FilmotClient:
         page: Optional[int] = None,
         only_with_subtitles: bool = False,
         columns: Optional[Any] = None,
+        lang: Optional[str] = None,
+        flags: Optional[int] = None,
     ) -> Any:
         """
         Get channels' indexed videos, newest first (direct API only; 3 credits).
@@ -706,12 +708,14 @@ class FilmotClient:
         Args:
             channel_ids: Up to 10 UC channel IDs, as a list or comma-separated string
             count_per_channel: Videos per channel per page; channels times this
-                may not exceed 200
+                may not exceed 200, or 10 when columns includes subtitles/all
             page: One-based page, applied to each channel independently; a
                 page past the end returns no videos
             only_with_subtitles: Return only videos known to have subtitles
             columns: Optional extra fields, as a list or comma-separated string
                 (the ``/getvideos`` fields, e.g. ``VIDEO_METADATA_COLUMNS``)
+            lang: Optional subtitle base-language token
+            flags: Legacy description flag (0 or 1); prefer columns
 
         Returns:
             Video records in ``/getvideos`` shape
@@ -727,6 +731,10 @@ class FilmotClient:
             params["onlyWithSubtitles"] = "true"
         if columns:
             params["columns"] = columns if isinstance(columns, str) else ",".join(columns)
+        if lang:
+            params["lang"] = lang
+        if flags is not None:
+            params["flags"] = flags
         return self.get("/getchannelvideos", params=params)
 
     def search_metadata(self, params: Dict[str, Any]) -> Any:
@@ -770,6 +778,14 @@ class FilmotClient:
             An :class:`ExportBody` with the page's bytes, or an error dict
         """
         return self._request("GET", "/getsubtitlesearch", params=dict(params), raw_body=True)
+
+    def export_metadata_search(self, params: Dict[str, Any]) -> Any:
+        """One metadata-search export page as bytes, preserving its selected format."""
+        return self._request("GET", "/getmetadatasearch", params=dict(params), raw_body=True)
+
+    def export_advanced_channel_search(self, params: Dict[str, Any]) -> Any:
+        """One notable-channel JSON or JSONL export page as bytes."""
+        return self._request("GET", "/getadvancedchannelsearch", params=dict(params), raw_body=True)
 
     def search_subtitles(
         self,

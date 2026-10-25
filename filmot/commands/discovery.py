@@ -23,9 +23,11 @@ from ..cli_support import (
 )
 from ..discovery_search import (
     CHANNEL_PAGE_LIMIT,
+    CHANNEL_COLUMNS,
     CHANNEL_RESULT_WINDOW,
     CHANNEL_SORTS,
     DEFAULT_EXPORT_COLUMNS,
+    DEFAULT_TITLE_COLUMNS,
     EXPORT_COLUMNS,
     EXPORT_FORMATS,
     EXPORT_PAGE_LIMIT,
@@ -33,8 +35,12 @@ from ..discovery_search import (
     FILTER_CHANNEL_LIMIT,
     GROWTH_WINDOWS,
     TITLE_LAST_PAGE,
+    TITLE_COLUMNS,
     TITLE_PAGE_LIMIT,
+    TITLE_SUBTITLE_LAST_PAGE,
+    TITLE_SUBTITLE_PAGE_LIMIT,
     TITLE_SORTS,
+    VIDEO_BASE_COLUMNS,
     ExportFormatError,
     channel_filter,
     drop_unset,
@@ -72,6 +78,76 @@ def _split(value: Optional[str]) -> List[str]:
 def _check_dates(command: str, start: Optional[str], end: Optional[str], raw: bool) -> None:
     if start and end and start > end:
         _usage_error(command, "the start date must not be later than the end date", raw=raw)
+
+
+def _bounded_text(command: str, option: str, value: Optional[str], limit: int, raw: bool) -> None:
+    if value is not None and len(value) > limit:
+        _usage_error(command, "{} accepts at most {} characters".format(option, limit), raw=raw)
+
+
+def _columns(command, value, everything, allowed, raw, *, required=(), default=None):
+    if everything and value is not None:
+        _usage_error(command, "use --all or --columns, not both", raw=raw)
+    if everything:
+        return "all"
+    if value is None:
+        return ",".join(default) if default else None
+    selected = _split(value)
+    if selected == ["all"]:
+        return "all"
+    unknown = [column for column in selected if column not in allowed]
+    if not selected or unknown:
+        _usage_error(
+            command, "--columns must name fields from {} or all".format(", ".join(allowed)), raw=raw,
+        )
+    return ",".join(dict.fromkeys([*required, *selected]))
+
+
+def _export_options(command, output, fmt, allowed, raw):
+    if fmt and not output:
+        _usage_error(command, "--format needs --output", raw=raw)
+    if not output:
+        return None
+    selected = export_format(output, fmt)
+    if selected not in allowed:
+        _usage_error(command, "export format must be {}".format(", ".join(allowed)), raw=raw)
+    return selected
+
+
+def _finish_export(command, output, fmt, filters, event, exported, raw):
+    """Persist validated pages and report a typed summary, including partial exports."""
+    error = exported.get("error")
+    if error and not exported["bodies"]:
+        _failed(
+            command, event, raw=raw, stage=error.get("stage", "api"), message=str(error["error"]),
+            error_type=str(error.get("error_type") or "FilmotAPIError"), payload=error,
+        )
+    path = Path(output)
+    written = exported["rows"] > 0
+    content = merge_export_pages(fmt, exported["bodies"]) if written else b""
+    if written:
+        try:
+            write_atomically(path, content)
+        except OSError as failure:
+            _failed(
+                command, event, raw=raw, stage="write-output", message="Could not write {}: {}".format(path, failure),
+                error_type=type(failure).__name__,
+            )
+    data = {
+        "output": str(path), "written": written, "format": fmt, "filters": filters,
+        "first_page": event["page"], "per_page": event["per_page"],
+        "pages_fetched": exported["pages_fetched"], "rows": exported["rows"], "bytes": len(content),
+        "exhausted": exported["exhausted"], "next_page": exported["next_page"],
+        "last_page_reached": exported["last_page_reached"],
+    }
+    outcome = _outcome(command, data, exported["rows"], error)
+    if _finish(command, outcome, raw, {**event, "rows": exported["rows"], "bytes": len(content)}):
+        return
+    if written:
+        console.print("Wrote {} records to {}".format(exported["rows"], escape(str(path))))
+    else:
+        console.print("[yellow]No matches; nothing was written.[/yellow]")
+    _paging_note(data, error)
 
 
 def _check_channel_filters(command: str, included: Optional[str], excluded: Optional[str], raw: bool) -> None:
@@ -133,7 +209,7 @@ def _outcome(command: str, data: Dict[str, Any], found: Any, error: Optional[Dic
             errors=[ErrorDetail(
                 type=str(error.get("error_type") or "FilmotAPIError"),
                 message=str(error["error"]),
-                stage="api",
+                stage=str(error.get("stage") or "api"),
             )],
         )
     return CommandResult(
@@ -221,14 +297,18 @@ def _video_filters(function):
     help="Order by a field; id is when Filmot indexed the video, avg_ratio is vocabulary ease.",
 )
 @click.option("--order", type=click.Choice(["asc", "desc"]), help="Sort order.")
-@click.option("--page", "-p", default=1, show_default=True, type=click.IntRange(1, TITLE_LAST_PAGE), help="First page.")
+@click.option("--columns", help="Selected metadata fields; base video identity fields are retained.")
+@click.option("--all", "everything", is_flag=True, help="All metadata and raw subtitles (at most 10 videos per page).")
+@click.option("--output", "-o", type=click.Path(dir_okay=False), help="Write a server export to this file.")
+@click.option("--format", "-f", "fmt", type=click.Choice(EXPORT_FORMATS), help="Export format; requires --output.")
+@click.option("--page", "-p", default=1, show_default=True, type=click.IntRange(1, TITLE_SUBTITLE_LAST_PAGE), help="First page (max 500, or 5000 with raw subtitles).")
 @click.option("--pages", default=1, show_default=True, type=click.IntRange(1, MAX_PAGES), help="Pages to fetch.")
-@click.option("--per-page", default=50, show_default=True, type=click.IntRange(1, TITLE_PAGE_LIMIT), help="Videos per page.")
+@click.option("--per-page", type=click.IntRange(1, TITLE_PAGE_LIMIT), help="Videos per page (default 50, or 10 with raw subtitles).")
 @click.option("--raw", is_flag=True, help="Output one versioned JSON result; its videos array pipes into `filmot download`.")
 def titles(query, channel_id, exclude_channels, min_views, max_views, min_likes, max_likes,
            min_duration, max_duration, start_date, end_date, category, exclude, license_type,
            country, caption_lang, only_caption_langs, detected_lang, detected_in_captions,
-           unlisted, live, partial, sort, order, page, pages, per_page, raw):
+           unlisted, live, partial, sort, order, columns, everything, output, fmt, page, pages, per_page, raw):
     """Search video titles and metadata in Filmot's index.
 
     QUERY is a title expression (implicit AND, |, "exact phrases", grouping,
@@ -242,6 +322,17 @@ def titles(query, channel_id, exclude_channels, min_views, max_views, min_likes,
       filmot titles "fusion reactor" --raw | filmot download -t fusion
     """
     start, end = _date(start_date), _date(end_date)
+    selected = _columns(
+        "titles", columns, everything, TITLE_COLUMNS, raw,
+        required=VIDEO_BASE_COLUMNS, default=DEFAULT_TITLE_COLUMNS,
+    )
+    subtitles = selected == "all" or "subtitles" in _split(selected)
+    last_page = TITLE_SUBTITLE_LAST_PAGE if subtitles else TITLE_LAST_PAGE
+    page_limit = TITLE_SUBTITLE_PAGE_LIMIT if subtitles else TITLE_PAGE_LIMIT
+    per_page = per_page if per_page is not None else (TITLE_SUBTITLE_PAGE_LIMIT if subtitles else 50)
+    if page > last_page or per_page > page_limit:
+        _usage_error("titles", "this selection supports --page up to {} and --per-page up to {}".format(last_page, page_limit), raw=raw)
+    fmt = _export_options("titles", output, fmt, EXPORT_FORMATS, raw)
     _check_dates("titles", start, end, raw)
     _check_channel_filters("titles", channel_id, exclude_channels, raw)
     if only_caption_langs and not caption_lang:
@@ -265,7 +356,9 @@ def titles(query, channel_id, exclude_channels, min_views, max_views, min_likes,
     })
     if not (query or channel_id or exclude_channels or criteria):
         _usage_error("titles", "give a title query or at least one filter", raw=raw)
-    event = {"query": query, "filters": criteria, "page": page, "pages": pages, "raw": raw}
+    event = {"query": query, "filters": criteria, "page": page, "pages": pages, "per_page": per_page, "raw": raw}
+    if output:
+        event.update(output=str(output), format=fmt)
 
     def fetch(client):
         with _status("[bold green]Resolving channels...", raw=raw):
@@ -276,12 +369,21 @@ def titles(query, channel_id, exclude_channels, min_views, max_views, min_likes,
             **criteria,
             "sortField": sort,
             "sortOrder": (order or "desc") if sort else None,
+            "columns": selected,
         })
         if pages > 1 and not raw:
             stderr_console.print("[dim]Fetching up to {} pages ({} credit{} each)...[/dim]".format(
                 pages, *(("1", "") if scoped(channels["included"]) else ("3", "s")),
             ))
         with _status("[bold green]Searching titles...", raw=raw):
+            if output:
+                return filters, fetch_export_pages(
+                    lambda number: client.export_metadata_search(
+                        dict(filters, page=number, perPageCount=per_page, format=fmt, exportInline=1),
+                    ),
+                    fmt, per_page=per_page, first_page=page, pages=pages,
+                    stop_on_short=False, last_page=last_page,
+                )
             return filters, fetch_pages(
                 lambda number: client.search_metadata(
                     dict(filters, page=number, perPageCount=per_page),
@@ -289,10 +391,12 @@ def titles(query, channel_id, exclude_channels, min_views, max_views, min_likes,
                 result_rows,
                 first_page=page,
                 pages=pages,
-                last_page=TITLE_LAST_PAGE,
+                last_page=last_page,
             )
 
     filters, listing = _lookup("titles", event, raw, "/getmetadatasearch", fetch)
+    if output:
+        return _finish_export("titles", output, fmt, filters, event, listing, raw)
     error = listing.get("error")
     if error and not listing["rows"]:
         _failed(
@@ -347,6 +451,10 @@ def titles(query, channel_id, exclude_channels, min_views, max_views, min_likes,
 @click.option("--subs-window", type=click.Choice(GROWTH_WINDOWS), help="Days for gained-subscriber filters and sorting (default 28).")
 @click.option("--country", "countries", multiple=True, help="Channel country name; repeat for several.")
 @click.option("--auto-lang", "auto_languages", multiple=True, help="Automatic-caption language every channel must have; repeatable.")
+@click.option("--columns", help="Selected channel fields; channelid is retained.")
+@click.option("--all", "everything", is_flag=True, help="Include every channel field, including descriptions and topics.")
+@click.option("--output", "-o", type=click.Path(dir_okay=False), help="Write a server export to this file.")
+@click.option("--format", "-f", "fmt", type=click.Choice(["json", "jsonl"]), help="Export format; requires --output.")
 @click.option("--sort", type=click.Choice(CHANNEL_SORTS), help="Order by a field; semantic_score is match relevance.")
 @click.option("--order", type=click.Choice(["asc", "desc"]), help="Sort order (default desc).")
 @click.option("--page", "-p", default=1, show_default=True, type=click.IntRange(min=1), help="First page.")
@@ -357,7 +465,7 @@ def find_channels(description, topics, min_subscribers, max_subscribers, min_vie
                   min_videos, max_videos, min_avg_duration, max_avg_duration, created_after,
                   created_before, first_video_after, first_video_before, min_gained_views,
                   max_gained_views, views_window, min_gained_subs, max_gained_subs, subs_window,
-                  countries, auto_languages, sort, order, page, pages, per_page, raw):
+                  countries, auto_languages, columns, everything, output, fmt, sort, order, page, pages, per_page, raw):
     """Find notable channels in Filmot's index by size, growth, place, and topic.
 
     Filmot indexes about 63 million notable channels; only the first 10,000
@@ -370,6 +478,17 @@ def find_channels(description, topics, min_subscribers, max_subscribers, min_vie
       filmot find-channels --country Canada --sort gainedsubcount --subs-window 90
       filmot find-channels --description sqlite --auto-lang en --raw
     """
+    selected = _columns("find-channels", columns, everything, CHANNEL_COLUMNS, raw, required=("channelid",))
+    fmt = _export_options("find-channels", output, fmt, ("json", "jsonl"), raw)
+    _bounded_text("find-channels", "--description", description, 500, raw)
+    _bounded_text("find-channels", "--topics", topics, 500, raw)
+    languages = _split(",".join(auto_languages))
+    if auto_languages and not languages:
+        _usage_error("find-channels", "--auto-lang must name a language", raw=raw)
+    if len(languages) > 100:
+        _usage_error("find-channels", "--auto-lang accepts at most 100 languages", raw=raw)
+    for language in languages:
+        _bounded_text("find-channels", "--auto-lang", language, 20, raw)
     dates = {
         "channelCreatedAfter": _date(created_after),
         "channelCreatedBefore": _date(created_before),
@@ -410,15 +529,26 @@ def find_channels(description, topics, min_subscribers, max_subscribers, min_vie
         "minGainedSubCount": min_gained_subs, "maxGainedSubCount": max_gained_subs,
         "gainedSubPeriod": int(subs_window) if subs_window else None,
         "countries": ",".join(countries) or None,
-        "autoLanguages": ",".join(auto_languages) or None,
+        "autoLanguages": ",".join(languages) or None,
         "sortField": sort,
         "sortOrder": (order or "desc") if sort else None,
+        "columns": selected,
     })
-    event = {"filters": filters, "page": page, "pages": pages, "raw": raw}
+    event = {"filters": filters, "page": page, "pages": pages, "per_page": per_page, "raw": raw}
+    if output:
+        event.update(output=str(output), format=fmt)
     last_page = (CHANNEL_RESULT_WINDOW - 1) // per_page + 1
 
     def fetch(client):
         with _status("[bold green]Finding channels...", raw=raw):
+            if output:
+                return fetch_export_pages(
+                    lambda number: client.export_advanced_channel_search(
+                        dict(filters, page=number, perPageCount=per_page, format=fmt),
+                    ),
+                    fmt, per_page=per_page, first_page=page, pages=pages,
+                    stop_on_short=False, last_page=last_page,
+                )
             return fetch_pages(
                 lambda number: client.search_advanced_channels(
                     dict(filters, page=number, perPageCount=per_page),
@@ -430,6 +560,8 @@ def find_channels(description, topics, min_subscribers, max_subscribers, min_vie
             )
 
     listing = _lookup("find-channels", event, raw, "/getadvancedchannelsearch", fetch)
+    if output:
+        return _finish_export("find-channels", output, fmt, filters, event, listing, raw)
     error = listing.get("error")
     if error and not listing["rows"]:
         _failed(
@@ -494,13 +626,17 @@ def _display_found_channels(channels: Sequence[Dict[str, Any]], window: int) -> 
 )
 @click.option(
     "--subtitles", is_flag=True,
-    help="Include each match's full subtitles (ZIP: one .srt per video; not with csv).",
+    help="Include each match's full subtitles (ZIP: one .srt per video).",
 )
 @click.option("--no-snippets", is_flag=True, help="Leave out the matched-text snippets (hits).")
 @click.option("--columns", help="Comma-separated fields to export (see the docs); defaults to Filmot's set.")
 @click.option("--lang", "-l", help="Subtitle language code.")
 @click.option("--title", help="Additional title expression.")
 @click.option("--manual-subs", is_flag=True, help="Search manual subtitles instead of automatic ones.")
+@click.option(
+    "--no-guess-video-language/--guess-video-language", default=None,
+    help="Include manual subtitle matches regardless of the likely spoken language, or require a likely match.",
+)
 @click.option("--detected-lang", help="Detected spoken-language code.")
 @click.option("--country", type=click.IntRange(min=1), help="Filmot channel-country ID (e.g. 217 for the US).")
 @_channel_options
@@ -515,7 +651,7 @@ def _display_found_channels(channels: Sequence[Dict[str, Any]], window: int) -> 
 @click.option("--per-page", default=100, show_default=True, type=click.IntRange(1, EXPORT_PAGE_LIMIT), help="Matches per page.")
 @click.option("--raw", is_flag=True, help="Output one versioned JSON summary of the written file")
 def subtitle_export(query, output, fmt, subtitles, no_snippets, columns, lang, title, manual_subs,
-                    detected_lang, country, channel_id, exclude_channels, min_views, max_views,
+                    no_guess_video_language, detected_lang, country, channel_id, exclude_channels, min_views, max_views,
                     min_likes, max_likes, min_duration, max_duration, start_date, end_date,
                     category, exclude, license_type, sort, order, page, pages, per_page, raw):
     """Export subtitle-search matches to a CSV, JSON, JSON Lines, or ZIP file.
@@ -531,6 +667,9 @@ def subtitle_export(query, output, fmt, subtitles, no_snippets, columns, lang, t
       filmot subtitle-export "gpu" --lang en --pages 3 --per-page 500 -o gpu.jsonl
     """
     fmt = export_format(output, fmt)
+    _bounded_text("subtitle-export", "--lang", lang, 20, raw)
+    if not query.strip():
+        _usage_error("subtitle-export", "query must not be empty", raw=raw)
     start, end = _date(start_date), _date(end_date)
     _check_dates("subtitle-export", start, end, raw)
     _check_channel_filters("subtitle-export", channel_id, exclude_channels, raw)
@@ -538,20 +677,22 @@ def subtitle_export(query, output, fmt, subtitles, no_snippets, columns, lang, t
         _usage_error("subtitle-export", "--order needs --sort", raw=raw)
     if order and sort in ("channelvariety", "bm25match"):
         _usage_error("subtitle-export", "--sort {} has its own order; drop --order".format(sort), raw=raw)
-    if subtitles and fmt == "csv":
-        _usage_error("subtitle-export", "--subtitles needs --format zip, json, or jsonl", raw=raw)
     selected = _split(columns)
-    unknown = [column for column in selected if column not in EXPORT_COLUMNS]
+    all_columns = selected == ["all"]
+    unknown = [] if all_columns else [column for column in selected if column not in EXPORT_COLUMNS]
     if unknown:
         _usage_error(
             "subtitle-export",
             "unknown --columns {}; choose from {}".format(", ".join(unknown), ", ".join(EXPORT_COLUMNS)),
             raw=raw,
         )
-    if subtitles:
+    if columns is not None and not selected:
+        _usage_error("subtitle-export", "--columns must name at least one field or all", raw=raw)
+    if subtitles and not all_columns:
         selected = [*(selected or DEFAULT_EXPORT_COLUMNS), "subtitles"]
     criteria = drop_unset({
         "lang": lang, "title": title, "searchManualSubs": 1 if manual_subs else None,
+        "noGuessVideoLanguage": None if no_guess_video_language is None else int(no_guess_video_language),
         "detectedLang": detected_lang, "country": country,
         "minViews": min_views, "maxViews": max_views, "minLikes": min_likes, "maxLikes": max_likes,
         "startDuration": min_duration, "endDuration": max_duration,

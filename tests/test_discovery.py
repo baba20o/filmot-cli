@@ -47,7 +47,10 @@ def test_filmot_aliases_normalize_without_losing_observed_zero():
         "url": None,
         "provider": "filmot",
         "provenance": {},
-        "provider_fields": {"hits": [{"start": 4, "token": "field"}]},
+        "provider_fields": {
+            "video_duration_seconds": 90,
+            "hits": [{"start": 4, "token": "field"}],
+        },
     }
 
 
@@ -55,6 +58,92 @@ def test_filmot_aliases_normalize_without_losing_observed_zero():
 def test_candidate_arrays_extract_from_supported_envelopes(field):
     rows = [{"video_id": "test-synthetic-id"}]
     assert extract_candidates({field: rows}) == tuple(rows)
+
+
+def test_filmot_index_fields_normalize_before_bounded_copy():
+    source = {
+        "id": "abc12345678", "duration": 0, "dislikecount": 0,
+        "license": "", "isunlisted": 0, "islivestream": 1,
+        "ispartialdata": 0, "channelsubcount": 0,
+        "channelcountryname": "Country", "lastfetchdate": "2026-01-02",
+        "autosubs": "en es419", "manualsubs": " ",
+        "subtitles": [{"lang": "en", "isauto": 1, "transcript": [{"s": 0, "t": "Keep raw text"}]}],
+    }
+    before = deepcopy(source)
+    candidate = normalize_candidate(source)
+    fields = candidate["provider_fields"]
+    assert fields == {
+        "video_duration_seconds": 0, "dislikes": 0,
+        "creative_commons": False, "is_unlisted": False, "is_livestream": True,
+        "partial_metadata": False, "channel_subscribers": 0,
+        "channel_country": "Country", "filmot_observed_at": "2026-01-02",
+        "caption_languages": {"automatic": ["en", "es419"], "manual": []},
+    }
+    assert candidate["provenance"]["omitted_provider_fields"] == ["subtitles"]
+    assert source == before
+    assert normalize_candidate(candidate) == candidate
+
+
+@pytest.mark.parametrize("field,value", [
+    ("video_duration_seconds", -5), ("video_duration_seconds", "PT4M"),
+    ("video_duration_seconds", True), ("video_duration_seconds", float("inf")),
+    ("filmot_observed_at", "2026-99-99"), ("creative_commons", "CC"),
+    ("is_unlisted", "maybe"), ("is_livestream", 1.5),
+    ("partial_metadata", 2), ("dislikes", -1), ("dislikes", True),
+    ("channel_subscribers", -5), ("channel_country", 42),
+    ("caption_languages", {"automatic": [1, None], "manual": "en"}),
+])
+def test_canonical_filmot_extras_cannot_bypass_validation(field, value):
+    candidate = normalize_candidate({
+        "video_id": "abc12345678", "provider": "filmot",
+        "provider_fields": {field: value, "custom": {"retain": True}},
+    })
+    assert field not in candidate["provider_fields"]
+    assert candidate["provider_fields"]["custom"] == {"retain": True}
+
+
+def test_valid_canonical_filmot_extras_survive_normalization_round_trip():
+    fields = {
+        "video_duration_seconds": 0, "filmot_observed_at": "2026-01-02",
+        "creative_commons": False, "dislikes": 0, "channel_subscribers": 0,
+        "caption_languages": {"automatic": [], "manual": ["es419", "ptBR"]},
+        "is_unlisted": False, "is_livestream": True, "partial_metadata": False,
+        "custom": {"retain": True},
+    }
+    candidate = normalize_candidate({
+        "video_id": "abc12345678", "provider": "filmot", "provider_fields": fields,
+    })
+    assert candidate["duration"] == 0
+    assert candidate["provider_fields"] == fields
+    assert normalize_candidate(candidate) == candidate
+
+
+def test_explicit_raw_filmot_values_take_precedence_even_when_unknown_or_invalid():
+    candidate = normalize_candidate({
+        "id": "abc12345678", "duration": None, "license": "",
+        "channelsubcount": -1, "lastfetchdate": "invalid", "autosubs": None,
+        "dislikecount": 0,
+        "provider_fields": {
+            "video_duration_seconds": 240, "creative_commons": True,
+            "channel_subscribers": 50, "filmot_observed_at": "2026-01-02",
+            "caption_languages": {"automatic": ["en"], "manual": []}, "dislikes": 7,
+        },
+    })
+    assert candidate["provider_fields"] == {
+        "creative_commons": False, "dislikes": 0, "caption_languages": {"manual": []},
+    }
+    assert normalize_candidate(candidate) == candidate
+
+
+def test_filmot_extra_validation_does_not_change_youtube_candidates():
+    fields = {"license": "creativeCommon", "video_duration_seconds": -5,
+              "caption_languages": {"automatic": "provider-specific"}}
+    candidate = normalize_candidate({
+        "video_id": "abc12345678", "provider": "youtube", "duration": "PT4M",
+        "provider_fields": fields,
+    })
+    assert candidate["duration"] == "PT4M"
+    assert candidate["provider_fields"] == fields
 
 
 def test_bare_sequence_and_empty_envelope_arrays_are_supported():

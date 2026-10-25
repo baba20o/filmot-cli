@@ -1534,7 +1534,7 @@ def _render_library_enrich(
 )
 @click.option(
     "--all", "include_all", is_flag=True,
-    help="Recheck records Filmot already enriched (default: never-enriched only)",
+    help="Recheck all records, including completed not-returned lookups",
 )
 @click.option(
     "--max-videos", default=1000, type=click.IntRange(1, 10000),
@@ -1558,8 +1558,11 @@ def library_enrich(
     overwritten. On records with YouTube metadata, the fields YouTube owns are
     left to `filmot yt-data refresh`.
 
-    With no selector, only records Filmot has never enriched are looked up.
-    --video targets exact IDs in every topic; --all rechecks the rest.
+    With no selector, records with missing/older Filmot enrichment or only
+    imported discovery metadata are looked up. Completed lookups that return
+    no video are recorded and skipped on subsequent default runs; API failures
+    remain eligible. --video targets exact IDs in every topic; --all rechecks
+    the rest.
 
     Examples:
 
@@ -1614,13 +1617,13 @@ def library_enrich(
     eligible = [
         row for row in inventory
         if not row.get("error_type")
-        and (video_ids or include_all or row.get("enriched_at") is None)
+        and (video_ids or include_all or row.get("needs_enrichment", row.get("enriched_at") is None))
     ]
     selected, selected_ids, truncated = _bounded_metadata_targets(
         eligible, max_videos=max_videos,
     )
     summary = {
-        "scope": "explicit" if video_ids else "all" if include_all else "never-enriched",
+        "scope": "explicit" if video_ids else "all" if include_all else "needs-enrichment",
         "dry_run": dry_run,
         "selected_records": len(selected),
         "selected_videos": len(selected_ids),

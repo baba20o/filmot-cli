@@ -15,8 +15,10 @@ import io
 import json
 import os
 import re
+import threading
 import uuid
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -27,6 +29,16 @@ TITLE_SORTS = (
 )
 TITLE_PAGE_LIMIT = 200
 TITLE_LAST_PAGE = 500
+TITLE_SUBTITLE_PAGE_LIMIT = 10
+TITLE_SUBTITLE_LAST_PAGE = 5000
+VIDEO_BASE_COLUMNS = ("id", "title", "duration", "uploaddate", "channelid", "channelname")
+TITLE_COLUMNS = (
+    "category", "channelid", "channelname", "id", "title", "uploaddate", "autosubs",
+    "manualsubs", "duration", "viewcount", "likecount", "dislikecount", "isunlisted",
+    "islivestream", "ispartialdata", "license", "channelsubcount", "channelcountryname",
+    "lastfetchdate", "subtitles", "description",
+)
+DEFAULT_TITLE_COLUMNS = tuple(column for column in TITLE_COLUMNS if column != "subtitles")
 
 CHANNEL_SORTS = (
     "joindate", "subcount", "totalviewcount", "avgduration", "maxvideocount",
@@ -37,6 +49,12 @@ CHANNEL_PAGE_LIMIT = 300
 # Only the first 10,000 matching channels can be paged to.
 CHANNEL_RESULT_WINDOW = 10_000
 GROWTH_WINDOWS = ("28", "90", "180", "365")
+CHANNEL_COLUMNS = (
+    "channelid", "name", "handle", "thumbnailurl", "country", "joindate", "firstvideodate",
+    "subcount", "totalviewcount", "videocount", "avgdurationseconds", "avgvideoviewcount",
+    "autolanguages", "growth", "description", "topiccloud", "matchscore", "counts",
+    "channelname", "channelsubcount", "channelcountryname",
+)
 
 EXPORT_SORTS = (
     "id", "viewcount", "likecount", "uploaddate", "duration", "chanrank",
@@ -149,10 +167,46 @@ def result_rows(response: Any) -> List[Dict[str, Any]]:
 
 _BOM = codecs.BOM_UTF8
 _COLUMN_NAME = re.compile(r"[a-z][a-z0-9_]*")
+_CSV_LIMIT_LOCK = threading.RLock()
 
 
 class ExportFormatError(ValueError):
     """An export page did not have the structure of its format."""
+
+
+def _csv_records(content: bytes) -> List[List[str]]:
+    """Strict CSV records, allowing fields as large as the received page.
+
+    The csv module's field limit is process-global. Serialize our adjustments
+    and restore the previous limit even when parsing fails.
+    """
+    try:
+        decoded = content.decode("utf-8-sig")
+        with _CSV_LIMIT_LOCK:
+            previous_limit = csv.field_size_limit()
+            try:
+                csv.field_size_limit(max(previous_limit, len(decoded)))
+                rows = [row for row in csv.reader(io.StringIO(decoded, newline=""), strict=True) if row]
+            finally:
+                csv.field_size_limit(previous_limit)
+    except (csv.Error, UnicodeDecodeError) as error:
+        raise ExportFormatError("the export page is not valid csv: {}".format(error)) from None
+    # Allow new field names alongside known columns, but refuse HTML/error text.
+    if rows and not (
+        all(_COLUMN_NAME.fullmatch(name) for name in rows[0])
+        and set(rows[0]) & set(EXPORT_COLUMNS + TITLE_COLUMNS + CHANNEL_COLUMNS)
+    ):
+        raise ExportFormatError("a CSV export page must start with a header of export columns")
+    return rows
+
+
+def _matching_csv_header(expected, rows):
+    if not rows:
+        return expected
+    header = tuple(rows[0])
+    if expected is not None and header != expected:
+        raise ExportFormatError("CSV export columns changed between pages")
+    return header
 
 
 def export_rows(fmt: str, content: bytes) -> int:
@@ -165,9 +219,14 @@ def export_rows(fmt: str, content: bytes) -> int:
     try:
         if fmt == "zip":
             with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                if "metadata.jsonl" not in archive.namelist():
-                    raise ExportFormatError("a ZIP export page must contain metadata.jsonl")
-                return _jsonl_rows(archive.read("metadata.jsonl"))
+                if archive.namelist().count("metadata.jsonl") != 1:
+                    raise ExportFormatError("a ZIP export page must contain exactly one metadata.jsonl")
+                metadata = b""
+                for entry in archive.infolist():
+                    value = archive.read(entry)
+                    if entry.filename == "metadata.jsonl":
+                        metadata = value
+                return _jsonl_rows(metadata)
         if fmt == "jsonl":
             return _jsonl_rows(content)
         if fmt == "json":
@@ -178,16 +237,9 @@ def export_rows(fmt: str, content: bytes) -> int:
             for row in rows:
                 _check_row(row)
             return len(rows)
-        rows = [row for row in csv.reader(io.StringIO(content.decode("utf-8-sig"))) if row]
-        # A header of column names that shares at least one known column;
-        # columns Filmot adds later are accepted, HTML or JSON is not.
-        if rows and not (
-            all(_COLUMN_NAME.fullmatch(name) for name in rows[0])
-            and set(rows[0]) & set(EXPORT_COLUMNS)
-        ):
-            raise ExportFormatError("a CSV export page must start with a header of export columns")
+        rows = _csv_records(content)
         return max(len(rows) - 1, 0)
-    except (ValueError, zipfile.BadZipFile, UnicodeDecodeError) as error:
+    except (ValueError, zipfile.BadZipFile, RuntimeError, NotImplementedError, OSError, EOFError, zlib.error) as error:
         if isinstance(error, ExportFormatError):
             raise
         raise ExportFormatError("the export page is not valid {}: {}".format(fmt, error)) from None
@@ -220,18 +272,32 @@ def merge_export_pages(fmt: str, pages: Sequence[bytes]) -> bytes:
         return _join_jsonl(pages)
     if fmt == "json":
         rows: List[Any] = []
+        envelopes: List[Dict[str, Any]] = []
         for page in pages:
             payload = json.loads(page.decode("utf-8-sig") or "{}")
             rows.extend(payload.get("result", []) if isinstance(payload, dict) else payload)
-        return (json.dumps({"result": rows}, ensure_ascii=False) + "\n").encode("utf-8")
+            envelopes.append({key: value for key, value in payload.items() if key != "result"}
+                             if isinstance(payload, dict) else {})
+        combined: Dict[str, Any] = {"result": rows}
+        if any(envelopes):
+            # An aggregate is not a single API page. Keep each page's envelope
+            # in request order without assigning it to the combined results.
+            combined["pages"] = envelopes
+        return (json.dumps(combined, ensure_ascii=True) + "\n").encode("utf-8")
     if fmt == "csv":
-        merged = [pages[0] if pages[0].endswith(b"\n") else pages[0] + b"\n"]
-        for page in pages[1:]:
-            # Later pages repeat the BOM and header row.
-            rows = page.decode("utf-8-sig").split("\n", 1)[1:]
-            if rows and rows[0]:
-                merged.append((rows[0] if rows[0].endswith("\n") else rows[0] + "\n").encode("utf-8"))
-        return b"".join(merged)
+        merged = io.StringIO(newline="")
+        writer = csv.writer(merged)
+        header = None
+        for page in pages:
+            records = _csv_records(page)
+            matching_header = _matching_csv_header(header, records)
+            if records:
+                if header is None:
+                    writer.writerow(records[0])
+                writer.writerows(records[1:])
+            header = matching_header
+        prefix = _BOM if pages and pages[0].startswith(_BOM) else b""
+        return prefix + merged.getvalue().encode("utf-8")
     return _merge_zips(pages)
 
 
@@ -271,39 +337,59 @@ def fetch_export_pages(
     first_page: int,
     pages: int,
     on_page: Optional[Callable[[int, int], None]] = None,
+    stop_on_short: bool = True,
+    last_page: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Up to ``pages`` export pages from ``first_page``.
 
-    A page with fewer than ``per_page`` records ends the export, as Filmot
-    documents for this endpoint. Returns the page ``bodies``, ``rows``,
+    Subtitle exports end at a short page. Metadata and channel exports pass
+    ``stop_on_short=False`` and their ``last_page``: short pages can be followed
+    by more results. Returns the page ``bodies``, ``rows``,
     ``pages_fetched``, ``exhausted``, and ``next_page``; a failed page adds the
-    API's ``error`` and keeps the pages before it.
+    API's ``error`` and keeps the pages before it. A malformed later page
+    likewise preserves prior pages and points ``next_page`` at the failed page.
     """
     bodies: List[bytes] = []
     rows = 0
     page = first_page
     exhausted = False
     error = None
-    while len(bodies) < pages:
+    csv_header = None
+    while len(bodies) < pages and (last_page is None or page <= last_page):
         body = fetch(page)
         if isinstance(body, dict):
             error = body
             break
-        count = export_rows(fmt, body.content)
+        try:
+            if fmt == "csv":
+                records = _csv_records(body.content)
+                csv_header = _matching_csv_header(csv_header, records)
+                count = max(len(records) - 1, 0)
+            else:
+                count = export_rows(fmt, body.content)
+        except ExportFormatError as failure:
+            if not bodies:
+                raise
+            error = {"error": str(failure), "error_type": "ExportFormatError", "stage": "invalid-response"}
+            break
         bodies.append(body.content)
         rows += count
         if on_page is not None:
             on_page(page, count)
         page += 1
-        if count < per_page:
+        if count == 0 or (stop_on_short and count < per_page):
             exhausted = True
             break
+    last_page_reached = (
+        not exhausted and error is None and last_page is not None and page > last_page
+    )
     result: Dict[str, Any] = {
         "bodies": bodies,
         "rows": rows,
         "pages_fetched": len(bodies),
-        "exhausted": exhausted,
-        "next_page": None if exhausted else page,
+        "exhausted": exhausted or last_page_reached,
+        "next_page": None if exhausted or last_page_reached else page,
+        "last_page_reached": last_page_reached,
     }
     if error is not None:
         result["error"] = error

@@ -1372,6 +1372,7 @@ def _bulk_download_transcripts(
                 provider_fields = {}
             metadata = {
                 "title": title,
+                "description": video.get("description"),
                 "channel": channel,
                 "channel_id": video.get("channel_id"),
                 "published_at": video.get("published_at"),
@@ -1383,12 +1384,17 @@ def _bulk_download_transcripts(
                 "views": video.get("views"),
                 "likes": video.get("likes"),
                 "comments": video.get("comments"),
-                "youtube_duration": video.get("duration"),
+                ("video_duration_seconds" if video.get("provider") == "filmot"
+                 else "youtube_duration"): (
+                    provider_fields.get("video_duration_seconds")
+                    if video.get("provider") == "filmot" else video.get("duration")
+                ),
                 "discovery_provider": video.get("provider"),
                 "discovery_provenance": video.get("provenance") or {},
                 "provider_fields": provider_fields,
                 "views_observed_at": provider_fields.get(
-                    "metadata_observed_at"
+                    "filmot_observed_at" if video.get("provider") == "filmot"
+                    else "metadata_observed_at"
                 ),
                 "metadata_expires_at": provider_fields.get(
                     "metadata_expires_at"
@@ -1442,6 +1448,33 @@ def _bulk_download_transcripts(
                     console.print(
                         "  [yellow]Metadata lifecycle registration failed; "
                         "run `filmot yt-data refresh --video {}` later.[/yellow]".format(
+                            escape(str(video_id))
+                        )
+                    )
+            elif video.get("provider") == "filmot":
+                try:
+                    enrichment = library.enrich_metadata(
+                        video_id, topic, video,
+                        filmot_snapshot=True,
+                        provenance={"discovery_ref": discovery_ref},
+                    )
+                    log_event(
+                        "metadata_enrichment", topic=topic, video_id=video_id,
+                        status="completed", source="bulk_download",
+                        discovery_ref=discovery_ref, provider="filmot",
+                        filled_fields=enrichment.get("filled_fields"),
+                    )
+                except Exception as metadata_error:
+                    metadata_failure_count += 1
+                    log_event(
+                        "metadata_enrichment", topic=topic, video_id=video_id,
+                        status="failed", source="bulk_download",
+                        discovery_ref=discovery_ref, provider="filmot",
+                        error=_whole_word_summary(metadata_error, 500),
+                    )
+                    console.print(
+                        "  [yellow]Filmot discovery metadata could not be enriched; "
+                        "run `filmot library enrich --video {}` later.[/yellow]".format(
                             escape(str(video_id))
                         )
                     )

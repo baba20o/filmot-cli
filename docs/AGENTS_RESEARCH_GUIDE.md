@@ -7,6 +7,14 @@ superconductors, fusion energy, brain-computer interfaces, deep-sea mining,
 solid-state batteries, and more. These are investigation heuristics, not an
 automatic truth classifier.*
 
+For the [official Filmot API](https://filmot.com/api-documentation) discovery
+surfaces, field selection, exports, paging
+limits, and metadata provenance, see the
+[API coverage audit](FILMOT_API_COVERAGE.md). Use `titles --raw` for video
+candidates, `find-channels --all --raw` for richer channel profiles, and
+`library read` for bounded local passages. A partial discovery input remains
+partial when downloaded; keep its continuation for a separate resume.
+
 ---
 
 ## The Core Problem

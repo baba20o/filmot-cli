@@ -1,8 +1,11 @@
 """Filmot /getvideos columns: parsing, batched lookups, and fill-only library enrichment."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from filmot.api import VIDEO_METADATA_COLUMNS
 from filmot.api_providers import ProviderConfigurationError
@@ -83,6 +86,7 @@ def test_candidate_maps_every_recorded_column():
         "published_at": "2026-01-01",
         "views": 1763636326,
         "likes": 18945568,
+        "video_duration_seconds": row()["duration"],
         "category": "Music",
         "is_unlisted": False,
         "is_livestream": False,
@@ -211,10 +215,12 @@ def test_enrichment_fills_unknown_metadata_with_snapshot_provenance(tmp_path):
     assert "views" in marker["filled_fields"]
     assert "metadata_enrichment" not in record
 
-    before = path.read_bytes()
+    before = read(path)
     again = enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient([row()]))
     assert again["unchanged"] == 1
-    assert path.read_bytes() == before
+    after = read(path)
+    assert after["metadata"] == before["metadata"]
+    assert after["filmot_enrichment"]["field_observations"] == before["filmot_enrichment"]["field_observations"]
 
 
 def test_unknown_caption_parts_stay_fillable_by_later_snapshots(tmp_path):
@@ -231,7 +237,8 @@ def test_unknown_caption_parts_stay_fillable_by_later_snapshots(tmp_path):
 
     record = read(path)
     assert record["metadata"]["caption_languages"] == {"manual": ["de", "en"], "automatic": ["en"]}
-    assert record["filmot_enrichment"]["filled_fields"] == ["caption_languages.automatic"]
+    assert "caption_languages.automatic" in record["filmot_enrichment"]["filled_fields"]
+    assert "caption_languages" in record["filmot_enrichment"]["filled_fields"]
     assert summary["outcomes"][0]["conflicts"] == 1
 
 
@@ -245,6 +252,281 @@ def test_existing_counts_keep_their_own_observation_date(tmp_path):
     assert metadata["views"] == 5
     assert metadata["views_observed_at"] == saved_date
     assert summary["outcomes"][0]["conflicts"] >= 1
+
+
+def test_snapshot_observations_keep_per_field_dates_across_fills(tmp_path):
+    library, path = saved(tmp_path)
+    records = [("topic", VIDEO_ID)]
+    enrich_saved_transcripts(library, records, FakeClient([row(likecount=None)]))
+    first = read(path)["filmot_enrichment"]
+    enrich_saved_transcripts(library, records, FakeClient([row(
+        likecount=0, lastfetchdate="2026-02-01",
+    )]))
+    after = read(path)
+    marker = after["filmot_enrichment"]
+    assert marker["schema"] == "filmot.index-metadata/v1"
+    assert marker["field_observations"]["views"]["observed_at"] == "2026-01-02"
+    assert marker["field_observations"]["likes"]["observed_at"] == "2026-02-01"
+    assert set(first["filled_fields"]) < set(marker["filled_fields"])
+    assert after["metadata"]["likes"] == 0
+    assert after["metadata"]["views_observed_at"] == "2026-01-02"
+
+
+def test_filmot_discovery_save_uses_index_date_and_distinct_duration(tmp_path):
+    from filmot.discovery import normalize_candidate
+
+    candidate = normalize_candidate(row(dislikecount=0, duration=0))
+    library = TranscriptLibrary(data_dir=tmp_path)
+    path = library.save(VIDEO_ID, "topic", "Transcript", metadata={
+        "discovery_provider": "filmot", "provider_fields": candidate["provider_fields"],
+        "views": candidate["views"], "duration_seconds": 20,
+    })
+    library.enrich_metadata(VIDEO_ID, "topic", candidate)
+    record = read(path)
+    assert record["metadata"]["views_observed_at"] == "2026-01-02"
+    assert record["metadata"]["video_duration_seconds"] == 0
+    assert record["metadata"]["duration_seconds"] == 20
+    assert record["metadata"]["dislikes"] == 0
+    assert record["metadata"]["creative_commons"] is False
+    assert "youtube_license" not in record["metadata"]
+    assert "metadata_enrichment" not in record
+    assert record["filmot_enrichment"]["observed_at"] == "2026-01-02"
+
+
+def test_filmot_discovery_infers_protection_of_youtube_owned_fields(tmp_path):
+    from filmot.discovery import normalize_candidate
+
+    library = TranscriptLibrary(data_dir=tmp_path)
+    path = library.save(VIDEO_ID, "topic", "Transcript", metadata={})
+    library.replace_youtube_metadata(VIDEO_ID, "topic", {
+        "video_id": VIDEO_ID, "provider": "youtube", "title": "YouTube title",
+        "metadata_observed_at": OBSERVED, "metadata_expires_at": EXPIRES,
+    })
+    before = read(path)
+    result = library.enrich_metadata(VIDEO_ID, "topic", normalize_candidate(row()))
+    after = read(path)
+    assert result["deferred_to_youtube"] is True
+    assert after["metadata"]["title"] == "YouTube title"
+    assert "description" not in after["metadata"]
+    assert after["metadata_lifecycle"] == before["metadata_lifecycle"]
+    assert after["metadata"]["creative_commons"] is False
+    assert "youtube_license" not in after["metadata"]
+
+
+def test_unavailable_dislikes_and_unknown_snapshot_dates_stay_unknown(tmp_path):
+    assert "dislikes" not in video_candidate(row(dislikecount=-1))
+    library = TranscriptLibrary(data_dir=tmp_path)
+    path = library.save(VIDEO_ID, "topic", "Transcript", metadata={
+        "discovery_provider": "filmot", "views": 0,
+    })
+    assert read(path)["metadata"].get("views_observed_at") is None
+
+
+def test_direct_filmot_enrichment_validates_canonical_extras_and_preserves_unknown_fields(tmp_path):
+    library, path = saved(tmp_path)
+    invalid = {
+        "video_duration_seconds": "PT4M", "filmot_observed_at": "invalid",
+        "creative_commons": "CC", "channel_subscribers": -5, "dislikes": True,
+        "is_unlisted": "maybe", "caption_languages": {"automatic": [None]},
+    }
+    library.enrich_metadata(VIDEO_ID, "topic", {
+        "video_id": VIDEO_ID, "provider": "filmot",
+        "provider_fields": {**invalid, "custom": {"retain": True}},
+    })
+    record = read(path)
+    assert not set(invalid).intersection(record["metadata"])
+    assert record["metadata"]["provider_fields"] == {"custom": {"retain": True}}
+    assert "observed_at" not in record["filmot_enrichment"]
+
+
+def test_direct_filmot_raw_alias_precedence_includes_null_and_blank(tmp_path):
+    library, path = saved(tmp_path)
+    library.enrich_metadata(VIDEO_ID, "topic", {
+        "video_id": VIDEO_ID, "provider": "filmot", "duration": None, "license": "",
+        "lastfetchdate": None, "autosubs": None,
+        "provider_fields": {
+            "video_duration_seconds": 240, "creative_commons": True,
+            "filmot_observed_at": "2026-01-02",
+            "caption_languages": {"automatic": ["en"], "manual": []},
+        },
+    })
+    metadata = read(path)["metadata"]
+    assert "video_duration_seconds" not in metadata
+    assert "filmot_observed_at" not in metadata
+    assert metadata["creative_commons"] is False
+    assert metadata["caption_languages"] == {"manual": []}
+    assert metadata["provider_fields"] == {
+        "creative_commons": False, "caption_languages": {"manual": []},
+    }
+
+
+def test_completed_unchanged_lookup_advances_only_receipt_time(tmp_path):
+    library, path = saved(tmp_path)
+    records = [("topic", VIDEO_ID)]
+    with patch("filmot.video_metadata.datetime") as clock:
+        clock.now.return_value = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        enrich_saved_transcripts(library, records, FakeClient([row()]))
+        before = read(path)
+        clock.now.return_value = datetime(2026, 10, 2, tzinfo=timezone.utc)
+        result = enrich_saved_transcripts(library, records, FakeClient([row()]))
+    after = read(path)
+    assert result["unchanged"] == 1 and result["updated"] == 0
+    assert after["filmot_enrichment"]["lookup_at"] == "2026-10-02T00:00:00Z"
+    assert after["filmot_enrichment"]["lookup_status"] == "returned"
+    for key in ("enriched_at", "observed_at", "filled_fields", "field_observations"):
+        assert after["filmot_enrichment"][key] == before["filmot_enrichment"][key]
+    for key in ("metadata", "source", "transcript", "segments", "saved_at"):
+        assert after[key] == before[key]
+
+
+def test_discovery_import_preserves_status_and_time_of_last_complete_lookup(tmp_path):
+    library, path = saved(tmp_path)
+    enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient([]))
+    receipt = read(path)["filmot_enrichment"]
+    library.enrich_metadata(VIDEO_ID, "topic", video_candidate(row()))
+    marker = read(path)["filmot_enrichment"]
+    assert marker["lookup_status"] == "not_returned"
+    assert marker["lookup_at"] == receipt["lookup_at"]
+    assert marker["observed_at"] == "2026-01-02"
+
+
+@pytest.mark.parametrize("invalid", ["invalid", "", "abc12345678\n"])
+def test_invalid_ids_are_failed_without_requests_or_lookup_receipts(tmp_path, invalid):
+    library = MagicMock()
+    client = FakeClient()
+    result = enrich_saved_transcripts(library, [("topic", invalid)], client)
+    assert result["failed"] == 1 and result["not_returned"] == 0
+    assert result["outcomes"][0]["error_type"] == "InvalidVideoID"
+    assert client.calls == []
+    library.enrich_metadata.assert_not_called()
+
+
+def test_schema_upgrade_is_eligible_once_without_changing_existing_values(tmp_path):
+    library, path = saved(tmp_path)
+    enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient([row()]))
+    record = read(path)
+    record["filmot_enrichment"].pop("schema")
+    path.write_text(json.dumps(record), encoding="utf-8")
+    assert library.filmot_enrichment_inventory()[0]["needs_enrichment"] is True
+    result = enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient([row()]))
+    assert result["updated"] == 1
+    assert library.filmot_enrichment_inventory()[0]["needs_enrichment"] is False
+    assert read(path)["metadata"] == record["metadata"]
+
+
+def test_imported_rows_need_one_complete_column_lookup_even_when_it_fills_nothing(tmp_path):
+    library, path = saved(tmp_path)
+    library.enrich_metadata(VIDEO_ID, "topic", video_candidate(row()))
+    assert library.filmot_enrichment_inventory()[0]["needs_enrichment"] is True
+    before = read(path)
+    enriched = enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient([row()]))
+    assert enriched["updated"] == 1
+    assert enriched["outcomes"][0]["filled_fields"] == []
+    assert library.filmot_enrichment_inventory()[0]["needs_enrichment"] is False
+    after = read(path)
+    assert after["metadata"] == before["metadata"]
+    assert after["filmot_enrichment"]["lookup_profile"] == "video-metadata"
+    library.enrich_metadata(VIDEO_ID, "topic", video_candidate(row(dislikecount=0)))
+    assert library.filmot_enrichment_inventory()[0]["needs_enrichment"] is False
+
+
+@pytest.mark.parametrize("imported", [False, True])
+def test_completed_missing_lookup_is_recorded_without_inventing_observations(tmp_path, imported):
+    library, path = saved(tmp_path)
+    if imported:
+        library.enrich_metadata(VIDEO_ID, "topic", video_candidate(row(likecount=None)))
+    before = read(path)
+    assert library.filmot_enrichment_inventory()[0]["needs_enrichment"] is True
+
+    result = enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient([]))
+
+    after = read(path)
+    marker = after["filmot_enrichment"]
+    assert (result["not_returned"], result["updated"], result["failed"]) == (1, 0, 0)
+    assert marker["lookup_status"] == "not_returned"
+    assert marker["lookup_profile"] == "video-metadata"
+    assert marker["schema"] == "filmot.index-metadata/v1"
+    assert marker["lookup_at"].endswith("Z")
+    assert library.filmot_enrichment_inventory()[0]["needs_enrichment"] is False
+    for field in ("metadata", "source", "transcript", "segments", "saved_at"):
+        assert after[field] == before[field]
+    if imported:
+        for field in ("filled_fields", "observed_fields", "field_observations", "observed_at", "enriched_at"):
+            assert marker[field] == before["filmot_enrichment"][field]
+    else:
+        assert "observed_at" not in marker
+        assert "enriched_at" not in marker
+        assert marker["filled_fields"] == []
+        assert marker["field_observations"] == {}
+
+    # An explicit successful recheck can fill metadata and replaces the
+    # negative receipt while retaining older field dates and values.
+    again = enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient([
+        row(likecount=0, lastfetchdate="2026-02-01"),
+    ]))
+    final = read(path)
+    assert again["updated"] == 1
+    assert final["filmot_enrichment"]["lookup_status"] == "returned"
+    assert final["filmot_enrichment"]["observed_at"] == "2026-02-01"
+    assert final["metadata"]["likes"] == 0
+    if imported:
+        assert final["metadata"]["views_observed_at"] == "2026-01-02"
+        assert final["filmot_enrichment"]["field_observations"]["views"] == (
+            before["filmot_enrichment"]["field_observations"]["views"]
+        )
+
+
+@pytest.mark.parametrize("imported", [False, True])
+@pytest.mark.parametrize("response", [RuntimeError("offline"), {"error": "quota_exhausted"}])
+def test_failed_lookup_does_not_record_completion_or_suppress_retries(tmp_path, imported, response):
+    library, path = saved(tmp_path)
+    if imported:
+        library.enrich_metadata(VIDEO_ID, "topic", video_candidate(row()))
+    before = path.read_bytes()
+
+    result = enrich_saved_transcripts(library, [("topic", VIDEO_ID)], FakeClient(response))
+
+    assert result["failed"] == 1
+    assert result["not_returned"] == 0
+    assert path.read_bytes() == before
+    assert library.filmot_enrichment_inventory()[0]["needs_enrichment"] is True
+
+
+def test_successful_recheck_clears_negative_receipt_even_without_field_changes(tmp_path):
+    library, path = saved(tmp_path)
+    records = [("topic", VIDEO_ID)]
+    enrich_saved_transcripts(library, records, FakeClient([row()]))
+    before = read(path)
+    enrich_saved_transcripts(library, records, FakeClient([]))
+    negative = read(path)
+    assert negative["filmot_enrichment"]["lookup_status"] == "not_returned"
+    assert negative["filmot_enrichment"]["api_provider"] == before["filmot_enrichment"]["api_provider"]
+
+    result = enrich_saved_transcripts(library, records, FakeClient([row()]))
+
+    after = read(path)
+    assert result["updated"] == 1
+    assert result["outcomes"][0]["filled_fields"] == []
+    assert after["filmot_enrichment"]["lookup_status"] == "returned"
+    assert after["filmot_enrichment"]["field_observations"] == before["filmot_enrichment"]["field_observations"]
+    assert after["metadata"] == before["metadata"]
+
+
+@pytest.mark.parametrize("fields,top_level,expected", [
+    ({"filmot_observed_at": "not-a-date"}, {}, None),
+    ({}, {"filmot_observed_at": "2026-99-99"}, None),
+    ({"filmot_observed_at": "2026-01-02"}, {}, "2026-01-02"),
+    ({"lastfetchdate": "2026-01-02", "filmot_observed_at": "bad"}, {}, "2026-01-02"),
+])
+def test_direct_save_derives_only_valid_filmot_snapshot_dates(tmp_path, fields, top_level, expected):
+    library = TranscriptLibrary(data_dir=tmp_path)
+    path = library.save(VIDEO_ID, "topic", "Transcript text.", metadata={
+        "views": 3, "discovery_provider": "filmot", "provider_fields": fields, **top_level,
+    })
+
+    record = read(path)
+    assert record["metadata"]["views_observed_at"] == expected
+    assert record["source"].get("views_observed_at") == expected
 
 
 def test_lookup_failures_are_failures_not_missing_videos(tmp_path):

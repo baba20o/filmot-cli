@@ -112,6 +112,46 @@ def test_video_contract_flags_drift_in_consumed_optional_columns(field, value):
     assert caught.value.path == "$[0].{}".format(field)
 
 
+@pytest.mark.parametrize("endpoint,row", [
+    ("/getmetadatasearch", {}),
+    ("/getmetadatasearch", {"title": "Only the selected field"}),
+    ("/getmetadatasearch", {"duration": None, "dislikecount": 0}),
+    ("/getadvancedchannelsearch", {"name": "Only the selected field"}),
+])
+def test_selected_search_columns_do_not_require_unselected_fields(endpoint, row):
+    payload = {"result": [row]}
+    assert validate_api_response(endpoint, payload) is payload
+
+
+@pytest.mark.parametrize("value", ["unavailable", True, 1.5])
+def test_metadata_search_validates_present_dislike_count(value):
+    with pytest.raises(FilmotAPIContractError) as caught:
+        validate_api_response("/getmetadatasearch", {"result": [{"dislikecount": value}]})
+    assert caught.value.path == "$.result[0].dislikecount"
+
+
+@pytest.mark.parametrize("track,path", [
+    ({"lang": 5, "isauto": 1, "transcript": []}, ".lang"),
+    ({"lang": "en", "isauto": 2, "transcript": []}, ".isauto"),
+    ({"lang": "en", "isauto": 1, "transcript": [{"s": True, "t": "x"}]}, ".transcript[0].s"),
+    ({"lang": "en", "isauto": 1, "transcript": [{"s": 0, "t": None}]}, ".transcript[0].t"),
+])
+def test_metadata_search_validates_nested_subtitle_tracks(track, path):
+    with pytest.raises(FilmotAPIContractError) as caught:
+        validate_api_response("/getmetadatasearch", {"result": [{"subtitles": [track]}]})
+    assert caught.value.path == "$.result[0].subtitles[0]" + path
+
+
+def test_nested_tracks_and_unknown_fields_are_preserved_verbatim():
+    row = {"subtitles": [{"lang": "es419", "isauto": 0, "transcript": [
+        {"s": 1.5, "t": "caption", "future": {"nested": True}},
+    ]}]}
+    payload = {"result": [row]}
+    before = json.dumps(payload)
+    assert validate_api_response("/getmetadatasearch", payload) is payload
+    assert json.dumps(payload) == before
+
+
 def _set(payload, path, value):
     target = payload
     for key in path[:-1]:

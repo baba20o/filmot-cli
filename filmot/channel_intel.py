@@ -18,6 +18,7 @@ PROFILE_CHANNEL_LIMIT = 20
 LISTING_CHANNEL_LIMIT = 10
 # /getchannelvideos: channels times countPerChannel on one page.
 LISTING_PAGE_LIMIT = 200
+LISTING_SUBTITLE_PAGE_LIMIT = 10
 
 # /getchannels columns for each option. History and video statistics cost 3
 # credits; the profile, about text, growth, and word cloud cost 1.
@@ -170,6 +171,7 @@ def fetch_channel_videos(
     pages: int = 1,
     only_with_subtitles: bool = False,
     columns: Any = None,
+    lang: Optional[str] = None,
     on_page: Optional[Callable[[int, int], None]] = None,
 ) -> Dict[str, Any]:
     """Up to ``pages`` consecutive listing pages from ``first_page``, newest first.
@@ -188,12 +190,14 @@ def fetch_channel_videos(
     exhausted = False
     error = None
     while pages_fetched < pages:
+        language = {"lang": lang} if lang is not None else {}
         response = client.get_channel_videos(
             channel_ids,
             count_per_channel=count,
             page=page,
             only_with_subtitles=only_with_subtitles,
             columns=columns,
+            **language,
         )
         if isinstance(response, dict) and response.get("error"):
             error = response

@@ -258,6 +258,40 @@ def test_channel_videos_refuses_more_than_200_videos_per_page(run):
     assert client.listing_calls == []
 
 
+@pytest.mark.parametrize("selection", [["--all"], ["--columns", "subtitles,lastfetchdate"]])
+def test_channel_videos_subtitle_selection_adjusts_default_count_and_keeps_tracks(run, selection):
+    rows = listing_rows()
+    rows[0]["subtitles"] = [{"lang": "en", "isauto": 1, "transcript": [{"s": 1.5, "t": "Full text"}]}]
+    client = FakeClient(pages=[rows])
+
+    result = run(client, "channel-videos", LTT, OTHER, *selection, "--lang", "en", "--raw")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["videos"][0]["subtitles"] == rows[0]["subtitles"]
+    assert payload["count_per_channel"] == 5
+    assert client.listing_calls[0]["count_per_channel"] == 5
+    assert client.listing_calls[0]["lang"] == "en"
+
+
+@pytest.mark.parametrize("options", [
+    ["--columns", "all", "--count", "11"],
+    ["--all", "--count", "20"],
+    ["--columns", "invented"],
+    ["--columns", "all,title"],
+    ["--all", "--columns", "description"],
+    ["--lang", "x" * 21],
+])
+def test_channel_videos_refuses_invalid_subtitle_requests_before_listing(run, options):
+    client = FakeClient()
+
+    result = run(client, "channel-videos", LTT, *options, "--raw")
+
+    assert result.exit_code != 0
+    assert json.loads(result.stdout)["_filmot"]["status"] == "failed"
+    assert client.listing_calls == []
+
+
 def test_channel_videos_keeps_earlier_pages_when_a_later_one_fails(run):
     failure = {"error": "service unavailable", "error_type": "FilmotServiceError"}
     client = FakeClient(pages=[listing_rows(), failure])
@@ -269,6 +303,16 @@ def test_channel_videos_keeps_earlier_pages_when_a_later_one_fails(run):
     assert payload["_filmot"]["status"] == "partial"
     assert payload["_filmot"]["errors"][0]["type"] == "FilmotServiceError"
     assert (len(payload["videos"]), payload["pages_fetched"], payload["next_page"]) == (3, 1, 2)
+
+
+def test_impossible_subtitle_count_is_rejected_before_paid_handle_resolution(run):
+    client = FakeClient()
+
+    result = run(client, "channel-videos", "@LinusTechTips", "--all", "--count", "11", "--raw")
+
+    assert result.exit_code == 1
+    assert client.searches == []
+    assert client.listing_calls == []
 
 
 def test_channel_videos_fails_when_the_first_page_fails(run):

@@ -38,6 +38,10 @@ import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict, Union
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from .filmot_metadata import (
+    FILMOT_CANONICAL_METADATA_FIELDS, FILMOT_RAW_METADATA_FIELDS, filmot_metadata_fields,
+)
+
 
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -104,6 +108,17 @@ _FILMOT_METADATA_FIELDS = (
 # limits still apply.  Flattened fields precede their raw API containers because
 # they are the stable boundary emitted by ``youtube_search._video_detail``.
 _PROVIDER_FIELD_PRIORITY = (
+    "filmot_observed_at",
+    "video_duration_seconds",
+    "dislikes",
+    "caption_languages",
+    "creative_commons",
+    "partial_metadata",
+    "is_unlisted",
+    "is_livestream",
+    "channel_subscribers",
+    "channel_country",
+    "category",
     "metadata_observed_at",
     "metadata_expires_at",
     "observed_at",
@@ -764,6 +779,7 @@ def _provider_fields(
     record: Mapping[str, Any],
     *,
     limits: ProviderFieldLimits,
+    filmot: bool = False,
 ) -> Dict[str, Any]:
     unbounded: Dict[str, Any] = {}
     existing = record.get("provider_fields")
@@ -787,6 +803,17 @@ def _provider_fields(
         if key_text in _CANONICAL_ALIASES or _is_credential_key(key_text):
             continue
         unbounded[key_text] = value
+
+    if filmot:
+        original = dict(existing) if isinstance(existing, Mapping) else {}
+        original.update(record)
+        normalized = filmot_metadata_fields(original)
+        for key in (*FILMOT_RAW_METADATA_FIELDS, *FILMOT_CANONICAL_METADATA_FIELDS, "subtitles"):
+            unbounded.pop(key, None)
+        unbounded.update({
+            key: value for key, value in normalized.items()
+            if key not in _CANONICAL_ALIASES
+        })
 
     # Dict insertion order is observable to the global copy budget.  Reserve
     # the front of that budget for time-sensitive and interpretive YouTube
@@ -895,6 +922,23 @@ def _normalize_record(
     else:
         url = _safe_url(raw_url)
 
+    normalized_provenance = _merge_provenance(
+        artifact_provenance, record.get("provenance"), provenance, limits=limits,
+    )
+    provider_input = _mapping_at(record, "provider_fields")
+    if normalized_provider == "filmot" and (
+        "subtitles" in record or "subtitles" in provider_input
+    ):
+        # A bounded metadata candidate cannot retain full caption tracks. Make
+        # omission explicit instead of turning real transcripts into empty lists.
+        normalized_provenance["omitted_provider_fields"] = ["subtitles"]
+
+    normalized_provider_fields = _provider_fields(
+        record, limits=limits, filmot=normalized_provider == "filmot",
+    )
+    if normalized_provider == "filmot" and "duration" not in record and "duration_seconds" not in record:
+        duration = normalized_provider_fields.get("video_duration_seconds", duration)
+
     normalized: DiscoveryCandidate = {
         "video_id": video_id,
         "title": title,
@@ -908,13 +952,8 @@ def _normalize_record(
         "duration": duration,
         "url": url,
         "provider": normalized_provider,
-        "provenance": _merge_provenance(
-            artifact_provenance,
-            record.get("provenance"),
-            provenance,
-            limits=limits,
-        ),
-        "provider_fields": _provider_fields(record, limits=limits),
+        "provenance": normalized_provenance,
+        "provider_fields": normalized_provider_fields,
     }
     return normalized, []
 

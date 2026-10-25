@@ -367,7 +367,7 @@ def test_channel_endpoints_send_documented_parameters(transport):
     )
     client.get_channel_videos(
         "UCdirect000000000000000a", count_per_channel=50, page=2,
-        only_with_subtitles=True, columns=("viewcount", "manualsubs"),
+        only_with_subtitles=True, columns=("viewcount", "manualsubs"), lang="en", flags=0,
     )
     client.get_channel_videos("UCdirect000000000000000a")
 
@@ -382,6 +382,7 @@ def test_channel_endpoints_send_documented_parameters(transport):
     assert listing["params"] == {
         "channelID": "UCdirect000000000000000a", "countPerChannel": 50, "page": 2,
         "onlyWithSubtitles": "true", "columns": "viewcount,manualsubs",
+        "lang": "en", "flags": 0,
     }
     assert defaults["params"] == {"channelID": "UCdirect000000000000000a"}
 
@@ -421,6 +422,21 @@ def test_exports_return_bytes_and_are_never_served_from_the_cache(transport):
     assert [call["url"] for call in transport.calls] == [
         "https://direct.filmot.invalid/api/v1/getsubtitlesearch",
     ] * 2
+
+
+@pytest.mark.parametrize("method,endpoint", [
+    ("export_metadata_search", "getmetadatasearch"),
+    ("export_advanced_channel_search", "getadvancedchannelsearch"),
+])
+def test_discovery_byte_exports_preserve_format_and_skip_cache(transport, method, endpoint):
+    content = b'{"id":"abc"}\n'
+    transport.queues["direct"] += [FakeResponse(200, content=content, headers=CREDITS)] * 2
+    client = make_client(transport, use_cache=True)
+    for _ in range(2):
+        assert getattr(client, method)({"format": "jsonl", "columns": "all"}).content == content
+    assert len(transport.calls) == 2
+    assert all(call["url"].endswith("/" + endpoint) for call in transport.calls)
+    assert all(call["params"] == {"format": "jsonl", "columns": "all"} for call in transport.calls)
 
 
 def _zip_holding(text):

@@ -15,6 +15,7 @@ from ..channel_intel import (
     DATED_GROUPS,
     LISTING_CHANNEL_LIMIT,
     LISTING_PAGE_LIMIT,
+    LISTING_SUBTITLE_PAGE_LIMIT,
     PROFILE_CHANNEL_LIMIT,
     VIDEO_STAT_GROUPS,
     ChannelReferenceError,
@@ -488,7 +489,7 @@ def _display_video_stats(stats: Dict[str, Any]) -> None:
 @click.argument("channels", nargs=-1, required=True)
 @click.option(
     "--count", "-n", default=20, show_default=True, type=click.IntRange(1, LISTING_PAGE_LIMIT),
-    help="Videos per channel on each page; channels times --count may not exceed 200.",
+    help="Videos per channel; total at most 200, or 10 with raw subtitles (default reduced to fit).",
 )
 @click.option(
     "--page", default=1, show_default=True, type=click.IntRange(min=1),
@@ -499,6 +500,9 @@ def _display_video_stats(stats: Dict[str, Any]) -> None:
     help="Pages to fetch, stopping early at the end of the listing; each costs 3 credits.",
 )
 @click.option("--with-subtitles", is_flag=True, help="Only videos Filmot knows have subtitles.")
+@click.option("--columns", help="Comma-separated video fields, or all (includes raw subtitle tracks).")
+@click.option("--all", "all_columns", is_flag=True, help="Include all fields and raw subtitle tracks.")
+@click.option("--lang", help="Subtitle base-language token (at most 20 characters).")
 @click.option(
     "--raw", is_flag=True,
     help="Output one versioned JSON result; its videos array pipes into `filmot download`.",
@@ -509,6 +513,9 @@ def channel_videos(
     page: int,
     pages: int,
     with_subtitles: bool,
+    columns: Optional[str],
+    all_columns: bool,
+    lang: Optional[str],
     raw: bool,
 ):
     """List up to 10 channels' videos from Filmot's index, newest first.
@@ -526,6 +533,30 @@ def channel_videos(
     """
     from ..ledger import log_result
 
+    if columns is not None and all_columns:
+        _usage_error("channel-videos", "--columns and --all cannot be combined", raw=raw)
+    selected_columns = (
+        "all" if all_columns else
+        [field.strip() for field in columns.split(",") if field.strip()]
+        if columns is not None else VIDEO_METADATA_COLUMNS
+    )
+    allowed = set(VIDEO_METADATA_COLUMNS) | {
+        "id", "title", "channelid", "channelname", "uploaddate", "duration", "subtitles", "all",
+    }
+    if selected_columns != "all":
+        unknown = set(selected_columns) - allowed
+        if not selected_columns or unknown or ("all" in selected_columns and len(selected_columns) > 1):
+            _usage_error("channel-videos", "--columns requires known video fields or all alone", raw=raw)
+    subtitles = selected_columns == "all" or "all" in selected_columns or "subtitles" in selected_columns
+    if lang is not None and (not lang.strip() or len(lang) > 20):
+        _usage_error("channel-videos", "--lang must contain 1 to 20 characters", raw=raw)
+    explicit_count = click.get_current_context().get_parameter_source("count") != click.core.ParameterSource.DEFAULT
+    page_limit = LISTING_SUBTITLE_PAGE_LIMIT if subtitles else LISTING_PAGE_LIMIT
+    if explicit_count and count > page_limit:
+        _usage_error(
+            "channel-videos", "--count may not exceed {} with this field selection".format(page_limit),
+            raw=raw,
+        )
     references = _references("channel-videos", channels, raw=raw)
     event = {
         "channels": references,
@@ -533,17 +564,21 @@ def channel_videos(
         "first_page": page,
         "pages": pages,
         "only_with_subtitles": with_subtitles,
+        "columns": selected_columns,
+        "lang": lang,
         "raw": raw,
     }
 
     def fetch(client):
         with _status("[bold green]Looking up channels...", raw=raw):
             resolved = resolve_channels(references, client, limit=LISTING_CHANNEL_LIMIT)
-        if len(resolved) * count > LISTING_PAGE_LIMIT:
+        effective_count = min(count, page_limit // len(resolved)) if subtitles and not explicit_count else count
+        event["count_per_channel"] = effective_count
+        if len(resolved) * effective_count > page_limit:
             _usage_error(
                 "channel-videos",
                 "channels times --count may not exceed {} (got {} x {})".format(
-                    LISTING_PAGE_LIMIT, len(resolved), count,
+                    page_limit, len(resolved), effective_count,
                 ),
                 raw=raw,
             )
@@ -555,15 +590,16 @@ def channel_videos(
             listing = fetch_channel_videos(
                 client,
                 [entry["channel_id"] for entry in resolved],
-                count=count,
+                count=effective_count,
                 first_page=page,
                 pages=pages,
                 only_with_subtitles=with_subtitles,
-                columns=VIDEO_METADATA_COLUMNS,
+                columns=selected_columns,
+                lang=lang,
             )
-        return resolved, listing
+        return resolved, listing, effective_count
 
-    resolved, listing = _lookup("channel-videos", event, raw, "/getchannelvideos", fetch)
+    resolved, listing, count = _lookup("channel-videos", event, raw, "/getchannelvideos", fetch)
     error = listing.get("error")
     if error and not listing["videos"]:
         _api_failure("channel-videos", event, raw, error)

@@ -136,8 +136,10 @@ def configured_providers(require: bool = False) -> Dict[str, Provider]:
     """Return configured providers; with ``require``, enforce the selected policy.
 
     A provider whose endpoint fails ``endpoint_problem`` is left out, and
-    ``require`` raises that problem, so its key is never sent anywhere.
+    ``require`` raises that problem unless another provider is explicitly
+    pinned. An unused provider cannot block the selected provider's requests.
     """
+    policy = selected_policy() if require else None
     providers: Dict[str, Provider] = {}
     direct_key = (config.DIRECT_API_KEY or "").strip()
     if direct_key:
@@ -150,7 +152,7 @@ def configured_providers(require: bool = False) -> Dict[str, Provider]:
                 key_env="FILMOT_API_KEY",
                 _headers=(("X-API-Key", direct_key),),
             )
-        elif require:
+        elif require and policy != RAPIDAPI:
             raise ProviderConfigurationError(problem)
     rapid_key = (config.RAPIDAPI_KEY or "").strip()
     host = (config.API_HOST or "").strip()
@@ -164,10 +166,9 @@ def configured_providers(require: bool = False) -> Dict[str, Provider]:
                 key_env="RAPIDAPI_KEY",
                 _headers=(("x-rapidapi-key", rapid_key), ("x-rapidapi-host", host)),
             )
-        elif require:
+        elif require and policy != DIRECT:
             raise ProviderConfigurationError(problem)
     if require:
-        policy = selected_policy()
         if not providers:
             raise ProviderConfigurationError(NO_CREDENTIALS_MESSAGE)
         if policy == DIRECT and DIRECT not in providers:

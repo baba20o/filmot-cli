@@ -189,7 +189,9 @@ without printing credentials. Responses are cached separately per provider.
 keys, are sent. You can set them only in the process environment or the
 per-user `config.env`. For a provider whose key is set, the base URL must use
 `https://` and the host must be a bare host name with an optional port.
-Otherwise the command stops before sending any request.
+Otherwise the command stops before sending any request, unless the other
+provider is explicitly pinned; invalid configuration for an unused provider
+does not block a pinned request.
 
 When Filmot loads its configuration, it reads a project `.env` with these
 limits:
@@ -1072,14 +1074,12 @@ failure does not discard the transcript; the command reports a partial result,
 and the explicitly recorded YouTube provenance makes the record eligible for
 later adoption by `yt-data refresh`.
 
-`download` reads only the candidate array; it does not check the upstream
-`_filmot.status`. For example, when `yt-video`'s first metadata batch fails,
-its raw failure (exit 1) still contains `videos: []`; `download` reports "No
-videos to download" and exits 0, and a plain shell pipeline reports only that
-last exit status. A `partial` upstream result is downloaded as the incomplete
-candidate set it contains. In unattended scripts, write raw discovery output to
-a file, stop on a nonzero exit, check `_filmot.status`, and only then redirect
-the file into `download`.
+`download` checks a versioned input's `_filmot.status` before acquisition.
+Failed or interrupted discovery cannot become a successful empty download.
+Partial discovery can supply usable candidates, but its errors and continuation
+remain in the download outcome, which exits nonzero after processing them.
+Bare arrays and legacy envelopes remain supported. In unattended scripts,
+retain the discovery artifact so its continuation can be resumed separately.
 
 ### Saved YouTube Metadata Lifecycle
 
@@ -1141,7 +1141,8 @@ Every library save (`transcript --save-to`, `search --bulk-download`,
 `download`, and `research`) looks up the videos it just saved in Filmot's index.
 It makes one call per 200 videos and fills in missing fields: title and channel
 when they were unknown, description, view and like counts, category, caption
-languages, license, flags, and channel details. Known values are never
+languages, license, flags, video duration, and channel details. Metadata-search
+discoveries also retain dislike counts when supplied. Known values are never
 overwritten. Counts filled this way carry Filmot's snapshot date in
 `views_observed_at`, and the record keeps a `filmot_enrichment` block saying
 what was filled, when, and through which provider. The lookup is best effort:
@@ -1153,7 +1154,7 @@ Records saved before this feature, or while it was off, can be repaired in
 batches:
 
 ```bash
-# Preview: records Filmot never enriched, and how many calls they need
+# Preview: records needing a complete metadata lookup, and their call budget
 filmot library enrich --dry-run
 
 # Enrich one topic, or exact videos in every topic
@@ -1163,6 +1164,22 @@ filmot library enrich --video dQw4w9WgXcQ,aqz-KE-bpKQ --raw
 # Recheck records Filmot already enriched, within a video budget
 filmot library enrich --all --max-videos 400
 ```
+
+Filmot discovery metadata already supplied to `download` or
+`transcript --discovery` is preserved even with automatic lookup disabled.
+Its license and flags keep Filmot semantics, and its counts retain the index
+snapshot date. `video_duration_seconds` describes the video; transcript
+`duration_seconds` still describes acquired captions. The enrichment marker
+tracks its schema, cumulative filled fields and per-field observation dates.
+Default backfill includes missing/older schemas and discovery-only imports that
+have not had a complete-column lookup. A completed lookup with no returned video
+records `lookup_status: not_returned` and is skipped on later default runs;
+provider failures remain eligible. `--all` or `--video` explicitly rechecks
+completed lookups, including partial or missing observations, without
+overwriting known values. Lookup time is distinct from the index snapshot date:
+`lookup_status` describes the last full lookup, even if a later discovery import
+adds metadata. Imported canonical fields receive the same validation as raw
+Filmot fields; invalid durations, dates, flags and counts remain unknown.
 
 On a record with YouTube Data API metadata (a YouTube discovery, or any
 `yt-data` lifecycle), Filmot fills only fields YouTube does not provide:
@@ -1510,6 +1527,12 @@ subtitles. If a later page fails, the earlier pages are kept and the result is
 into `download`; transcripts for removed videos then come from
 [Filmot's subtitle index](#transcripts-from-filmots-index).
 
+Listings request all non-subtitle metadata by default. `--columns` selects
+fields, while `--all` (or `--columns all`) also requests complete subtitle
+tracks. `--lang en` filters those tracks by base language. With raw subtitles,
+channels times `--count` may not exceed 10; an omitted count is reduced to fit
+the selected channels, while an excessive explicit count is rejected.
+
 ### Discovery Searches
 
 Three more searches use the direct Filmot API, so they need `FILMOT_API_KEY`.
@@ -1544,6 +1567,26 @@ Filmot indexed the video), `viewcount`, `likecount`, `dislikecount`,
 and Filmot serves pages up to 500. Paging stops at the first empty page. Raw
 output keeps a `videos` array that pipes into `download`.
 
+All non-subtitle metadata, including descriptions and dislike counts, is
+requested by default. `--columns` selects fields while retaining video identity
+fields. `--all` also includes raw subtitle tracks: this changes the default and
+maximum page size to 10 and permits pages through 5000. Raw output preserves
+the tracks; library discovery handoff keeps metadata and acquires transcripts
+through the transcript routes separately.
+
+Use `--output FILE` to write a server export; `--format json|jsonl|csv|zip`
+overrides the extension. For example, `filmot titles sqlite --all -o sqlite.zip`
+includes subtitles, and `filmot titles sqlite -o sqlite.jsonl` exports metadata.
+With `--output --raw`, stdout describes the written file rather than emitting
+download candidates. JSON/JSONL retain structured subtitle tracks; ZIP carries
+subtitle files, while CSV preserves the server's serialized field values.
+
+One-page export files preserve the response bytes. Multi-page exports combine
+records; JSON uses a `result` array and, when the provider supplies envelope
+metadata, a `pages` array of those per-page fields. For channel searches this
+retains each page's `page`, `perpagecount` and `maxresults`. An aggregate file
+is not a single API response page.
+
 #### Find Notable Channels
 
 `find-channels` filters Filmot's index of about 63 million notable channels by
@@ -1568,6 +1611,14 @@ codes, all required). A window option or `--order` without a filter or sort it
 affects is refused. Pass the channel IDs it finds to `channel` or
 `channel-videos`.
 
+`--columns` selects response fields (retaining `channelid`); `--all` requests
+every field, including descriptions and topic clouds even without corresponding
+text filters. `--output channels.jsonl` exports JSON Lines; JSON is also
+supported through `--format json`. Description/topic expressions accept at
+most 500 characters, and `--auto-lang` accepts at most 100 tokens of 20
+characters each. Search uses text mode; the schema marks semantic modes as
+unavailable.
+
 #### Export Subtitle-Search Matches
 
 `subtitle-export` has Filmot build a CSV, JSON, JSON Lines, or ZIP export of
@@ -1585,12 +1636,14 @@ filmot subtitle-export "gpu" --lang en --pages 3 --per-page 500 -o gpu.jsonl
 ```
 
 `--subtitles` adds each matching video's full subtitles: one `.srt` file per
-video in a ZIP, or a `subtitles` field in JSON and JSON Lines. It is refused for
-CSV. `--no-snippets` leaves out the matched-text `hits`, and `--columns` picks
+video in a ZIP, or a `subtitles` field in structured exports. CSV retains
+server-serialized fields, including quoted multiline values. `--no-snippets`
+leaves out the matched-text `hits`, and `--columns` picks
 fields from `category`, `channelid`, `channelname`, `id`, `title`, `uploaddate`,
 `autosubs`, `manualsubs`, `duration`, `viewcount`, `likecount`, `isunlisted`,
 `license`, `channelsubcount`, `channelcountryname`, `lang`, `hits`,
-`subtitles`, and `description`. The filters match `search` (`--lang`, `--title`,
+`subtitles`, and `description`; `--columns all` selects everything, including
+subtitles. The filters match `search` (`--lang`, `--title`,
 `--manual-subs`, `--country`, `--detected-lang`, the view, like, duration, and
 date ranges, `--category`, `--exclude`, and `--license`), with `--sort`
 including `bm25match` (text relevance) and `channelvariety`. Those two use their
@@ -1599,12 +1652,26 @@ own order, so `--order` is refused with them. A page with fewer matches than
 anything is written. A CSV must start with a header row of column names that
 includes known export columns. JSON Lines rows must not be error objects. A ZIP
 must hold `metadata.jsonl`, with every entry readable. A page that fails these
-checks, such as an HTML error page, fails the export and leaves the output file
-untouched. An export with no matches writes nothing
+checks on the first page, such as an HTML error page, fails the export and leaves
+the output file untouched. An export with no matches writes nothing
 and reports `written: false`. If a later page fails, the pages before it are
 still written and the result is `partial`. Its `next_page` says where to
 continue, which should go to a different file. Filmot's compact CSV format is
 not offered, because its rows inherit values from earlier rows.
+
+CSV page headers must agree before their rows are admitted; long and multiline
+subtitle fields are parsed without the default small CSV field limit. A ZIP
+page must contain exactly one `metadata.jsonl` and readable entries. Invalid
+later pages preserve the valid prefix and its continuation.
+
+For manual captions, `--no-guess-video-language` includes matches regardless
+of whether the caption language probably matches the spoken language;
+`--guess-video-language` explicitly requires that match. Omitting both keeps
+the server default. `--lang` accepts at most 20 characters.
+
+The [Filmot API coverage audit](docs/FILMOT_API_COVERAGE.md) maps all seven
+documented endpoints, request parameters, enrichment fields, and intentional
+format restrictions to these commands and the Python client.
 
 ### Channel Corpus: Download & Mine Channel Uploads
 
@@ -2246,8 +2313,9 @@ uses `channels`, `channel` uses `requested`, `channels`, and `missing`,
 `channel-videos` uses `channels`, paging fields, and a `videos` array that
 `download` accepts, `titles` uses `query`, `filters`, paging fields, and a
 `videos` array that `download` accepts, `find-channels` uses `filters`, paging
-fields, `max_results`, and `channels`, `subtitle-export` summarizes the written
-file (`output`, `format`, `rows`, `bytes`, and paging fields), and `yt-search`
+fields, `max_results`, and `channels`. With `--output`, `titles` and
+`find-channels` instead summarize the written file, as `subtitle-export` does
+(`output`, `format`, `rows`, `bytes`, and paging fields), and `yt-search`
 uses `videos` plus effective `request`,
 `coverage`, and `enrichment` objects. `yt-playlists` uses `channel`,
 `playlists`, `request`, `coverage`, `api_calls`, and `continuation`;
@@ -2285,8 +2353,9 @@ inventory; use run counters and checkpoints to distinguish new work.
 ### Example Agent Workflow (Python)
 
 Check the exit code and `_filmot` metadata before reading rows. A failed or
-interrupted result can still carry an empty domain array, and `partial` exits
-0. Status rules differ by command: `search` reports a clean zero-match search
+interrupted result can still carry an empty domain array. Most discovery
+commands exit 0 for `partial`; `download` exits nonzero when its input discovery
+was incomplete. Status rules differ by command: `search` reports a clean zero-match search
 as `completed` with an empty `result`, while commands such as `yt-search`,
 `yt-video`, and `library list` use `empty`.
 

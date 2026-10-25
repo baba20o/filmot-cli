@@ -280,9 +280,25 @@ _OPTIONAL_VIDEO_FIELDS: dict[str, Tuple[ExpectedType, str]] = {
     "isunlisted": ((int, bool), "int or bool"),
     "islivestream": ((int, bool), "int or bool"),
     "ispartialdata": ((int, bool), "int or bool"),
-    # Raw caption tracks; index_transcript reads each track and line defensively.
+    # Track contents are checked separately after validating the container.
     "subtitles": (list, "array"),
 }
+
+
+def _validate_subtitle_tracks(endpoint: str, path: str, tracks: Any) -> None:
+    for index, value in enumerate(_expect_list(endpoint, path, tracks)):
+        track_path = "{}[{}]".format(path, index)
+        track = _expect_mapping(endpoint, track_path, value)
+        _expect_field(endpoint, track_path, track, "lang", str)
+        automatic = _expect_field(endpoint, track_path, track, "isauto", int)
+        if automatic not in (0, 1):
+            _fail(endpoint, track_path + ".isauto", "0 or 1", automatic)
+        lines = _expect_field(endpoint, track_path, track, "transcript", list)
+        for line_index, line_value in enumerate(lines):
+            line_path = "{}.transcript[{}]".format(track_path, line_index)
+            line = _expect_mapping(endpoint, line_path, line_value)
+            _expect_field(endpoint, line_path, line, "s", (int, float), "number")
+            _expect_field(endpoint, line_path, line, "t", str)
 
 
 def _validate_video_record(endpoint: str, value: Any, path: str) -> None:
@@ -305,6 +321,30 @@ def _validate_video_record(endpoint: str, value: Any, path: str) -> None:
     for field, (expected_type, label) in _OPTIONAL_VIDEO_FIELDS.items():
         if video.get(field) is not None:
             _expect_field(endpoint, path, video, field, expected_type, label)
+    if video.get("subtitles") is not None:
+        _validate_subtitle_tracks(endpoint, path + ".subtitles", video["subtitles"])
+
+
+def _validate_metadata_search(endpoint: str, payload: Any) -> None:
+    """MetadataExportVideo permits every field to be omitted by columns."""
+    response = _expect_mapping(endpoint, "$", payload)
+    if _validate_error_response(endpoint, response):
+        return
+    results = _expect_field(endpoint, "$", response, "result", list)
+    fields = {
+        **_OPTIONAL_VIDEO_FIELDS,
+        **{field: (str, "string") for field in (
+            "id", "title", "channelid", "channelname", "uploaddate",
+        )},
+        "duration": ((int, float), "number"),
+        "dislikecount": (int, "int"),
+    }
+    for index, value in enumerate(results):
+        path = "$.result[{}]".format(index)
+        video = _expect_mapping(endpoint, path, value)
+        _optional_fields(endpoint, path, video, fields)
+        if video.get("subtitles") is not None:
+            _validate_subtitle_tracks(endpoint, path + ".subtitles", video["subtitles"])
 
 
 def _validate_get_videos(endpoint: str, payload: Any) -> None:
@@ -425,9 +465,12 @@ def _validate_video_stats(endpoint: str, path: str, value: Any) -> None:
         _validate_video_stats(endpoint, "{}.months[{}]".format(path, index), month)
 
 
-def _validate_channel_record(endpoint: str, value: Any, path: str) -> None:
+def _validate_channel_record(
+    endpoint: str, value: Any, path: str, *, projected: bool = False,
+) -> None:
     channel = _expect_mapping(endpoint, path, value)
-    _expect_field(endpoint, path, channel, "channelid", str)
+    if not projected or "channelid" in channel:
+        _expect_field(endpoint, path, channel, "channelid", str)
     _optional_fields(endpoint, path, channel, _OPTIONAL_CHANNEL_FIELDS)
     counts = channel.get("counts")
     if counts is not None:
@@ -469,6 +512,8 @@ def _validate_channel_record(endpoint: str, value: Any, path: str) -> None:
         term = _expect_mapping(endpoint, term_path, term)
         _expect_field(endpoint, term_path, term, "text", str)
         _expect_field(endpoint, term_path, term, "weight", *_NUMBER)
+        if "lang" in term:
+            _expect_field(endpoint, term_path, term, "lang", str)
     for field, changes in (channel.get("channelchanges") or {}).items():
         # The CLI lists every array here; a non-array addition is skipped.
         if changes is None or (field not in _HISTORY_FIELDS and not _is_sequence(changes)):
@@ -514,7 +559,7 @@ def _validate_advanced_channel_search(endpoint: str, payload: Any) -> None:
     results = _expect_field(endpoint, "$", response, "result", list, "array")
     for index, value in enumerate(results):
         path = "$.result[{}]".format(index)
-        _validate_channel_record(endpoint, value, path)
+        _validate_channel_record(endpoint, value, path, projected=True)
         _optional_fields(endpoint, path, value, _OPTIONAL_CHANNEL_FINDER_FIELDS)
 
 
@@ -523,9 +568,9 @@ _VALIDATORS: dict[str, Callable[[str, Any], None]] = {
     "getsearchchannels": _validate_search_channels,
     "getvideos": _validate_get_videos,
     "getchannels": _validate_get_channels,
-    # Channel listings and metadata searches carry /getvideos records.
+    # Listings carry Video records; metadata-search fields are selectable.
     "getchannelvideos": _validate_get_videos,
-    "getmetadatasearch": _validate_get_videos,
+    "getmetadatasearch": _validate_metadata_search,
     "getadvancedchannelsearch": _validate_advanced_channel_search,
 }
 

@@ -174,6 +174,15 @@ def test_a_short_page_is_not_taken_as_the_end():
     assert (listing["exhausted"], listing["next_page"]) == (False, 4)
 
 
+def test_listing_forwards_subtitle_language_on_every_page():
+    client = ListingClient([rows("a"), []])
+
+    fetch_channel_videos(client, [LTT], count=10, pages=2, columns="subtitles", lang="en")
+
+    assert [call["lang"] for call in client.calls] == ["en", "en"]
+    assert all(call["columns"] == "subtitles" for call in client.calls)
+
+
 def test_videos_repeated_across_pages_are_listed_once():
     client = ListingClient([rows("a", "b"), rows("b", "c")])
 

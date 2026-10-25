@@ -1,6 +1,7 @@
 """Paging, export parsing and merging, and filters for Filmot discovery searches."""
 
 import io
+import csv
 import json
 import zipfile
 from unittest.mock import patch
@@ -211,6 +212,94 @@ def test_export_paging_ends_at_a_short_page_and_keeps_pages_before_a_failure():
     assert calls == [1, 2] and seen == [(1, 2), (2, 1)]
     assert (failed["rows"], failed["bodies"], failed["next_page"]) == (2, [page], 5)
     assert failed["error"] == failure
+
+
+def test_malformed_export_page_preserves_valid_pages_and_retry_cursor():
+    first = b'{"id":"a"}\n'
+    fetch, calls = pages_of(ExportBody(first, ""), ExportBody(b"not-json", ""))
+    result = fetch_export_pages(fetch, "jsonl", per_page=1, first_page=4, pages=3)
+    assert calls == [4, 5]
+    assert result["bodies"] == [first] and result["rows"] == 1
+    assert result["pages_fetched"] == 1 and result["next_page"] == 5
+    assert result["error"]["error_type"] == "ExportFormatError"
+    assert not result["exhausted"]
+
+
+def test_metadata_export_waits_for_empty_page_or_last_page():
+    body = ExportBody(b'{"id":"a"}\n', "")
+    fetch, calls = pages_of(body, body)
+    result = fetch_export_pages(fetch, "jsonl", per_page=10, first_page=499, pages=4,
+                                stop_on_short=False, last_page=500)
+    assert calls == [499, 500]
+    assert result["rows"] == 2 and result["last_page_reached"]
+    assert result["exhausted"] and result["next_page"] is None
+
+
+def test_metadata_csv_supports_selected_metadata_fields():
+    assert export_rows("csv", b"dislikecount\n0\n-1\n") == 2
+
+
+def test_csv_long_fields_restore_the_process_limit_even_after_parse_failure():
+    original = csv.field_size_limit()
+    field = b"x" * (original + 100)
+    assert export_rows("csv", b'id,subtitles\na,"' + field + b'"\n') == 1
+    assert csv.field_size_limit() == original
+    with pytest.raises(ExportFormatError):
+        export_rows("csv", b'id,subtitles\na,"' + field)
+    assert csv.field_size_limit() == original
+
+
+def test_csv_header_drift_is_rejected_before_adding_the_failed_page():
+    first = b"id,title\na,First\n"
+    changed = b"title,id\nSecond,b\n"
+    fetch, calls = pages_of(ExportBody(first, ""), ExportBody(changed, ""))
+    result = fetch_export_pages(fetch, "csv", per_page=1, first_page=4, pages=3)
+    assert calls == [4, 5]
+    assert result["bodies"] == [first] and result["rows"] == 1
+    assert result["next_page"] == 5 and result["pages_fetched"] == 1
+    assert result["error"]["error_type"] == "ExportFormatError"
+    with pytest.raises(ExportFormatError, match="columns changed"):
+        merge_export_pages("csv", [first, changed])
+
+
+def test_csv_merge_handles_cr_records_and_empty_final_pages():
+    merged = merge_export_pages("csv", [b'id,title\ra,"First\rline"\r', b'id,title\rb,Second\r', b""])
+    assert list(csv.reader(io.StringIO(merged.decode(), newline=""))) == [
+        ["id", "title"], ["a", "First\rline"], ["b", "Second"],
+    ]
+
+
+def test_json_merging_retains_page_metadata_in_source_order_and_escaped_surrogates():
+    first = b'{"result":[{"channelid":"a"}],"page":2,"perpagecount":1,"maxresults":10000}'
+    second = b'{"result":[{"channelid":"b","name":"\\ud800"}],"page":3,"perpagecount":1,"maxresults":10000}'
+    assert export_rows("json", second) == 1
+    assert merge_export_pages("json", [first]) == first
+    merged = json.loads(merge_export_pages("json", [first, second]))
+    assert [row["channelid"] for row in merged["result"]] == ["a", "b"]
+    assert merged["result"][1]["name"] == "\ud800"
+    assert merged["pages"] == [
+        {"page": 2, "perpagecount": 1, "maxresults": 10000},
+        {"page": 3, "perpagecount": 1, "maxresults": 10000},
+    ]
+    assert "page" not in merged
+
+
+def test_duplicate_zip_metadata_and_unreadable_caption_entries_are_rejected():
+    duplicate = io.BytesIO()
+    with zipfile.ZipFile(duplicate, "w") as archive:
+        archive.writestr("metadata.jsonl", '{"id":"a"}\n')
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr("metadata.jsonl", '{"id":"b"}\n')
+    with pytest.raises(ExportFormatError, match="exactly one"):
+        export_rows("zip", duplicate.getvalue())
+
+    damaged = bytearray(zip_of('{"id":"a"}\n', subs__a="caption payload"))
+    damaged[damaged.index(b"caption payload")] = ord("X")
+    first = zip_of('{"id":"b"}\n')
+    fetch, _ = pages_of(ExportBody(first, ""), ExportBody(bytes(damaged), ""))
+    result = fetch_export_pages(fetch, "zip", per_page=1, first_page=1, pages=2)
+    assert result["bodies"] == [first] and result["next_page"] == 2
+    assert result["error"]["error_type"] == "ExportFormatError"
 
 
 # ------------------------------------------------------------------ files

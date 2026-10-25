@@ -33,6 +33,11 @@ from .paths import (
     publish_file_exclusive,
 )
 from .redaction import redact_sensitive_value
+from .filmot_metadata import (
+    FILMOT_CANONICAL_METADATA_FIELDS, FILMOT_ENRICHMENT_SCHEMA,
+    FILMOT_FIELD_ALIASES, FILMOT_METADATA_LOOKUP_PROFILE,
+    FILMOT_RAW_METADATA_FIELDS, filmot_metadata_fields,
+)
 
 
 _WINDOWS_RESERVED_NAMES = frozenset({
@@ -1042,7 +1047,17 @@ class TranscriptLibrary:
                 normalized_metadata.get("views") is not None
                 and normalized_metadata.get("views_observed_at") is None
             ):
-                normalized_metadata["views_observed_at"] = saved_at
+                if normalized_metadata.get("discovery_provider") == "filmot":
+                    fields = normalized_metadata.get("provider_fields")
+                    fields = fields if isinstance(fields, dict) else {}
+                    snapshot = dict(fields)
+                    if normalized_metadata.get("filmot_observed_at") is not None:
+                        snapshot["filmot_observed_at"] = normalized_metadata["filmot_observed_at"]
+                    normalized_metadata["views_observed_at"] = filmot_metadata_fields(snapshot).get(
+                        "filmot_observed_at"
+                    )
+                else:
+                    normalized_metadata["views_observed_at"] = saved_at
 
             data = {
                 "video_id": video_id,
@@ -1105,6 +1120,7 @@ class TranscriptLibrary:
             )
         if provenance is not None and not isinstance(provenance, dict):
             raise ValueError("provenance must be an object or null")
+        filmot_snapshot = filmot_snapshot or str(candidate.get("provider") or "").casefold() == "filmot"
 
         safe_id = self._sanitize_video_id(video_id)
         topic_dir = self.transcripts_dir / self._normalize_topic(topic)
@@ -1130,6 +1146,28 @@ class TranscriptLibrary:
             for key, value in candidate.items()
             if not _metadata_value_missing(value)
         })
+        if filmot_snapshot:
+            observed_candidate.update({
+                key: candidate[key] for key in FILMOT_RAW_METADATA_FIELDS if key in candidate
+            })
+            normalized = filmot_metadata_fields(observed_candidate)
+            for key in FILMOT_CANONICAL_METADATA_FIELDS:
+                observed_candidate.pop(key, None)
+            observed_candidate.update(normalized)
+            # The library also accepts callers that bypass discovery. Replace
+            # recognized provider extras with validated canonical observations.
+            provider_keys = set(provider_fields)
+            for key in FILMOT_RAW_METADATA_FIELDS | FILMOT_CANONICAL_METADATA_FIELDS:
+                provider_fields.pop(key, None)
+            canonical_provider_keys = {
+                FILMOT_FIELD_ALIASES.get(key, key) for key in provider_keys
+            }
+            if provider_keys.intersection({"autosubs", "manualsubs"}):
+                canonical_provider_keys.add("caption_languages")
+            provider_fields.update({
+                key: value for key, value in normalized.items()
+                if key in FILMOT_CANONICAL_METADATA_FIELDS and key in canonical_provider_keys
+            })
 
         aliases = {
             "title": "title",
@@ -1196,7 +1234,14 @@ class TranscriptLibrary:
             "channel_country": "channel_country",
             "partial_metadata": "partial_metadata",
             "filmot_observed_at": "filmot_observed_at",
+            "video_duration_seconds": "video_duration_seconds",
+            "dislikes": "dislikes",
         }
+        if filmot_snapshot:
+            # Filmot duration is seconds and its license is CC/blank; neither
+            # belongs to the YouTube API's duration/license vocabulary.
+            aliases.pop("duration")
+            aliases.pop("license")
 
         with exclusive_file_guard(guard_path):
             with open(file_path, "r", encoding="utf-8") as handle:
@@ -1316,7 +1361,38 @@ class TranscriptLibrary:
             if existing_provider_fields:
                 metadata["provider_fields"] = existing_provider_fields
 
-            if not filled:
+            prior_observation = raw.get("filmot_enrichment")
+            prior_observation = prior_observation if isinstance(prior_observation, dict) else {}
+            lookup_status = (provenance or {}).get("lookup_status")
+            negative_lookup = filmot_snapshot and lookup_status == "not_returned"
+            complete_lookup = (
+                (provenance or {}).get("lookup_profile") == FILMOT_METADATA_LOOKUP_PROFILE
+                and lookup_status in {"returned", "not_returned"}
+            )
+            same_lookup_contract = (
+                prior_observation.get("schema") == FILMOT_ENRICHMENT_SCHEMA
+                and prior_observation.get("lookup_profile") == FILMOT_METADATA_LOOKUP_PROFILE
+            )
+            receipt_only = filmot_snapshot and complete_lookup and not filled and same_lookup_contract and (
+                lookup_status == prior_observation.get("lookup_status")
+            )
+            preserve_snapshot = filmot_snapshot and complete_lookup and not filled and same_lookup_contract
+            upgrade_observation = filmot_snapshot and (
+                prior_observation.get("schema") != FILMOT_ENRICHMENT_SCHEMA
+                or (
+                    (provenance or {}).get("lookup_profile") == FILMOT_METADATA_LOOKUP_PROFILE
+                    and prior_observation.get("lookup_profile") != FILMOT_METADATA_LOOKUP_PROFILE
+                )
+                or (
+                    lookup_status in {"returned", "not_returned"}
+                    and lookup_status != prior_observation.get("lookup_status")
+                )
+                or (
+                    complete_lookup
+                    and (provenance or {}).get("lookup_at") != prior_observation.get("lookup_at")
+                )
+            )
+            if not filled and not upgrade_observation:
                 return {
                     "status": "noop",
                     "path": str(file_path),
@@ -1327,7 +1403,13 @@ class TranscriptLibrary:
 
             raw["metadata"] = metadata
             raw["source"] = source
-            observation = dict(provenance or {})
+            observation = dict(prior_observation) if negative_lookup or preserve_snapshot else {}
+            observation.update({
+                key: value for key, value in (provenance or {}).items()
+                if not preserve_snapshot or key in {
+                    "provider", "lookup_profile", "lookup_status", "lookup_at",
+                }
+            })
             observation.setdefault(
                 "provider", str(candidate.get("provider") or "unknown")
             )
@@ -1340,6 +1422,45 @@ class TranscriptLibrary:
                     "expires_at", observed_candidate["metadata_expires_at"]
                 )
             observation["filled_fields"] = list(filled)
+            if filmot_snapshot:
+                observation["schema"] = FILMOT_ENRICHMENT_SCHEMA
+                if prior_observation.get("lookup_profile") == FILMOT_METADATA_LOOKUP_PROFILE:
+                    for key in ("lookup_profile", "lookup_status", "lookup_at"):
+                        if key in prior_observation:
+                            observation.setdefault(key, prior_observation[key])
+                if negative_lookup:
+                    # Absence has a lookup time, never a fabricated snapshot or
+                    # enrichment time. Preserve the last real observations.
+                    for key in ("observed_at", "enriched_at"):
+                        if key in prior_observation:
+                            observation[key] = prior_observation[key]
+                elif not preserve_snapshot:
+                    observation.setdefault("enriched_at", datetime.now(timezone.utc).isoformat())
+                if snapshot_date:
+                    observation.setdefault("observed_at", snapshot_date)
+                previous_fields = prior_observation.get("filled_fields") or []
+                observation["filled_fields"] = list(dict.fromkeys([*previous_fields, *filled]))
+                observed_fields = [
+                    metadata_key for candidate_key, metadata_key in aliases.items()
+                    if not _metadata_value_missing(observed_candidate.get(candidate_key))
+                ]
+                observation["observed_fields"] = sorted(set(
+                    (prior_observation.get("observed_fields") or []) + observed_fields
+                ))
+                field_observations = dict(prior_observation.get("field_observations") or {})
+                for field in previous_fields:
+                    field_observations.setdefault(field, {
+                        key: prior_observation[key]
+                        for key in ("observed_at", "enriched_at")
+                        if prior_observation.get(key)
+                    })
+                for field in filled:
+                    field_observations[field] = {
+                        key: observation[key]
+                        for key in ("observed_at", "enriched_at")
+                        if observation.get(key)
+                    }
+                observation["field_observations"] = field_observations
             raw["filmot_enrichment" if filmot_snapshot else "metadata_enrichment"] = observation
 
             temporary = _write_json_temporary(file_path, raw)
@@ -1353,7 +1474,7 @@ class TranscriptLibrary:
                         pass
 
         return {
-            "status": "updated",
+            "status": "unchanged" if receipt_only else "updated",
             "path": str(file_path),
             "filled_fields": filled,
             "conflicts": conflicts,
@@ -1380,7 +1501,10 @@ class TranscriptLibrary:
     ) -> List[Dict[str, Any]]:
         """List saved records with their Filmot enrichment marker, read-only.
 
-        ``enriched_at`` is ``None`` for a record no Filmot lookup has filled.
+        ``needs_enrichment`` includes absent/older observation schemas and
+        imported discoveries without a complete-column metadata lookup.
+        Current partial snapshots are not retried indefinitely; ``--all`` can
+        explicitly recheck them. ``enriched_at`` dates the recorded lookup.
         An unreadable record stays visible with ``error_type`` rather than
         silently shrinking the selection.
         """
@@ -1404,6 +1528,10 @@ class TranscriptLibrary:
                     "video_id": video_id or file_path.stem,
                     "path": str(file_path),
                     "enriched_at": None,
+                    "lookup_status": None,
+                    "lookup_at": None,
+                    "enrichment_schema": None,
+                    "needs_enrichment": True,
                 }
                 try:
                     with open(file_path, "r", encoding="utf-8") as handle:
@@ -1417,8 +1545,16 @@ class TranscriptLibrary:
                         raise ValueError("saved transcript video_id does not match its path")
                     row["video_id"] = record_id
                     marker = raw.get("filmot_enrichment")
-                    if isinstance(marker, dict) and isinstance(marker.get("enriched_at"), str):
-                        row["enriched_at"] = marker["enriched_at"]
+                    if isinstance(marker, dict):
+                        if isinstance(marker.get("enriched_at"), str):
+                            row["enriched_at"] = marker["enriched_at"]
+                        row["lookup_status"] = marker.get("lookup_status")
+                        row["lookup_at"] = marker.get("lookup_at")
+                        row["enrichment_schema"] = marker.get("schema")
+                        row["needs_enrichment"] = (
+                            marker.get("schema") != FILMOT_ENRICHMENT_SCHEMA
+                            or marker.get("lookup_profile") != FILMOT_METADATA_LOOKUP_PROFILE
+                        )
                 except (json.JSONDecodeError, OSError, UnicodeError, ValueError) as error:
                     row["error_type"] = type(error).__name__
                 rows.append(row)

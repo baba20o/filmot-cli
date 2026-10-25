@@ -11,6 +11,7 @@ import pytest
 from filmot.api import ExportBody
 from filmot.cli import cli
 from filmot.discovery import normalize_candidates
+from filmot.discovery_search import DEFAULT_TITLE_COLUMNS, VIDEO_BASE_COLUMNS
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "filmot_api"
@@ -54,6 +55,9 @@ class FakeClient:
         self.export_calls.append(dict(params))
         return self.exports.pop(0)
 
+    export_metadata_search = export_subtitle_search
+    export_advanced_channel_search = export_subtitle_search
+
 
 @pytest.fixture
 def run(stream_runner):
@@ -86,6 +90,7 @@ def test_titles_sends_every_filter_under_its_api_name(run):
         "captionLanguages": "en,fr", "capLangExactMatch": 1, "detectedLanguage": "en",
         "qDetectedLangInCapLangs": "true", "unlisted": 0, "live": 1, "completeData": 0,
         "sortField": "viewcount", "sortOrder": "desc", "page": 1, "perPageCount": 30,
+        "columns": ",".join(DEFAULT_TITLE_COLUMNS),
     }]
 
 
@@ -276,7 +281,6 @@ def test_an_export_with_no_matches_leaves_an_existing_file_alone(run, tmp_path):
 
 
 @pytest.mark.parametrize("arguments,message", [
-    (["--subtitles"], "--subtitles needs --format zip, json, or jsonl"),
     (["--columns", "id,votes"], "unknown --columns votes"),
     (["--order", "asc"], "--order needs --sort"),
     (["--sort", "bm25match", "--order", "asc"], "--sort bm25match has its own order"),
@@ -329,3 +333,206 @@ def test_a_write_failure_is_reported_as_such(run, tmp_path):
     assert result.exit_code == 1
     error = json.loads(result.stdout)["_filmot"]["errors"][0]
     assert (error["type"], error["stage"]) == ("PermissionError", "write-output")
+
+
+def test_titles_selects_enrichment_without_losing_video_identity(run):
+    client = FakeClient(metadata=[metadata_page()])
+    result = run(client, "titles", "gpu", "--columns", "description,dislikecount", "--raw")
+    assert result.exit_code == 0, result.output
+    assert client.metadata_calls[0]["columns"].split(",") == [*VIDEO_BASE_COLUMNS, "description", "dislikecount"]
+
+
+@pytest.mark.parametrize("selection", [("--all",), ("--columns", "all"), ("--columns", "subtitles")])
+def test_titles_raw_subtitles_adjust_default_size_and_allow_page_5000(run, selection):
+    client = FakeClient(metadata=[metadata_page()])
+    result = run(client, "titles", "gpu", *selection, "--page", "5000", "--pages", "2", "--raw")
+    assert result.exit_code == 0, result.output
+    assert len(client.metadata_calls) == 1
+    assert client.metadata_calls[0]["perPageCount"] == 10
+    assert json.loads(result.stdout)["last_page_reached"] is True
+
+
+@pytest.mark.parametrize("args", [
+    ("--page", "501"), ("--all", "--per-page", "11"),
+    ("--columns", "votes"), ("--columns", ","), ("--all", "--columns", "title"),
+    ("--format", "jsonl"),
+])
+def test_titles_rejects_invalid_selection_and_conditional_limits_before_requests(run, args):
+    client = FakeClient()
+    result = run(client, "titles", "gpu", *args, "--raw")
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout)["_filmot"]["errors"][0]["stage"] == "validate-request"
+    assert not client.metadata_calls and not client.export_calls
+
+
+@pytest.mark.parametrize("selection,expected", [
+    (("--all",), "all"), (("--columns", "description,topiccloud"), "channelid,description,topiccloud"),
+])
+def test_find_channels_requests_enriched_fields(run, selection, expected):
+    client = FakeClient(channels=[fixture("advanced_channel_search.json")])
+    result = run(client, "find-channels", *selection, "--raw")
+    assert result.exit_code == 0, result.output
+    assert client.channel_calls[0]["columns"] == expected
+
+
+@pytest.mark.parametrize("arguments", [
+    ("--description", "x" * 501), ("--topics", "x" * 501),
+    ("--auto-lang", "x" * 21), ("--auto-lang", ","),
+    tuple(item for n in range(101) for item in ("--auto-lang", "en")),
+    ("--columns", "unsupported"), ("--format", "jsonl"),
+])
+def test_find_channels_rejects_out_of_contract_options_before_requests(run, arguments):
+    client = FakeClient()
+    result = run(client, "find-channels", *arguments, "--raw")
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout)["_filmot"]["errors"][0]["stage"] == "validate-request"
+    assert not client.channel_calls and not client.export_calls
+
+
+@pytest.mark.parametrize("option,expected", [("--no-guess-video-language", 1), ("--guess-video-language", 0)])
+def test_subtitle_export_selects_all_and_manual_language_policy(run, tmp_path, option, expected):
+    client = FakeClient(exports=[jsonl("a")])
+    result = run(client, "subtitle-export", "gpu", "--manual-subs", option,
+                 "--columns", "all", "--subtitles", "-o", str(tmp_path / "all.jsonl"), "--raw")
+    assert result.exit_code == 0, result.output
+    assert client.export_calls[0]["columns"] == "all"
+    assert client.export_calls[0]["noGuessVideoLanguage"] == expected
+    assert client.export_calls[0]["searchManualSubs"] == 1
+
+
+def test_subtitle_export_rejects_overlong_language_before_requests(run, tmp_path):
+    client = FakeClient()
+    result = run(client, "subtitle-export", "gpu", "--lang", "x" * 21, "-o", str(tmp_path / "m.jsonl"), "--raw")
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout)["_filmot"]["errors"][0]["stage"] == "validate-request"
+    assert not client.export_calls
+
+
+@pytest.mark.parametrize("command,args", [("titles", ("gpu",)), ("find-channels", ())])
+def test_discovery_exports_continue_past_short_pages(run, tmp_path, command, args):
+    client = FakeClient(exports=[jsonl("a"), jsonl("b"), jsonl()])
+    path = tmp_path / "matches.jsonl"
+    result = run(client, command, *args, "--output", str(path), "--pages", "4", "--raw")
+    assert result.exit_code == 0, result.output
+    assert path.read_bytes() == b'{"id": "a"}\n{"id": "b"}\n'
+    assert [request["page"] for request in client.export_calls] == [1, 2, 3]
+    summary = json.loads(result.stdout)
+    assert summary["written"] and summary["exhausted"] and summary["rows"] == 2
+
+
+def test_title_zip_export_obeys_subtitle_limit(run, tmp_path):
+    client = FakeClient(exports=[zip_body("a")])
+    path = tmp_path / "matches.zip"
+    result = run(client, "titles", "gpu", "--all", "--page", "5000", "--pages", "2", "--output", str(path), "--raw")
+    assert result.exit_code == 0, result.output
+    assert client.export_calls == [{
+        "titleQuery": "gpu", "columns": "all", "page": 5000, "perPageCount": 10,
+        "format": "zip", "exportInline": 1,
+    }]
+    with zipfile.ZipFile(path) as archive:
+        assert "subs/a.a.en.srt" in archive.namelist()
+
+
+def test_find_channel_json_export_stops_at_result_window(run, tmp_path):
+    body = ExportBody(b'{"result":[{"channelid":"UCtest"}],"page":34,"maxresults":10000}', "")
+    client = FakeClient(exports=[body])
+    path = tmp_path / "channels.json"
+    result = run(client, "find-channels", "--all", "--per-page", "300", "--page", "34", "--pages", "2", "-o", str(path), "--raw")
+    assert result.exit_code == 0, result.output
+    assert len(client.export_calls) == 1
+    assert json.loads(path.read_bytes())["result"][0]["channelid"] == "UCtest"
+    assert json.loads(result.stdout)["last_page_reached"] is True
+
+
+def test_malformed_later_export_page_keeps_valid_prefix_and_cursor(run, tmp_path):
+    client = FakeClient(exports=[jsonl("a", "b"), ExportBody(b"<html>broken</html>", "")])
+    path = tmp_path / "partial.jsonl"
+    result = run(client, "subtitle-export", "gpu", "--pages", "2", "--per-page", "2", "-o", str(path), "--raw")
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert path.read_bytes() == b'{"id": "a"}\n{"id": "b"}\n'
+    assert payload["_filmot"]["status"] == "partial"
+    assert payload["next_page"] == 2
+    assert payload["_filmot"]["errors"][0]["stage"] == "invalid-response"
+
+
+def test_subtitle_export_all_columns_preserves_multiline_csv_across_pages(run, tmp_path):
+    import csv
+
+    first = b'id,subtitles\r\na,"line one\nline two"\r\n'
+    second = b'id,subtitles\r\nb,"another line\nlast line"\r\n'
+    client = FakeClient(exports=[ExportBody(first, "text/csv"), ExportBody(second, "text/csv")])
+    path = tmp_path / "subtitles.csv"
+    result = run(client, "subtitle-export", "gpu", "--columns", "all", "--subtitles",
+                 "--pages", "2", "--per-page", "1", "-o", str(path), "--raw")
+    assert result.exit_code == 0, result.output
+    assert all(request["columns"] == "all" for request in client.export_calls)
+    with path.open(newline="") as stream:
+        assert list(csv.reader(stream)) == [
+            ["id", "subtitles"], ["a", "line one\nline two"], ["b", "another line\nlast line"],
+        ]
+    assert json.loads(result.stdout)["rows"] == 2
+
+
+@pytest.mark.parametrize("bad_page", [b"title,id\nWrong,b\n", b'id,title\nb,"unterminated'])
+def test_invalid_later_csv_page_writes_only_valid_prefix_as_typed_partial(run, tmp_path, bad_page):
+    first = b"id,title\na,First\n"
+    client = FakeClient(exports=[ExportBody(first, ""), ExportBody(bad_page, "")])
+    path = tmp_path / "partial.csv"
+    result = run(client, "subtitle-export", "gpu", "--per-page", "1", "--pages", "2", "-o", str(path), "--raw")
+    assert result.exit_code == 0, result.output
+    assert path.read_bytes() == first
+    summary = json.loads(result.stdout)
+    assert summary["_filmot"]["status"] == "partial" and summary["next_page"] == 2
+    assert summary["_filmot"]["errors"][0]["type"] == "ExportFormatError"
+
+
+def test_large_csv_caption_field_is_exported_without_changing_parser_limit(run, tmp_path):
+    import csv
+
+    original_limit = csv.field_size_limit()
+    body = b'id,subtitles\na,"' + b"x" * (original_limit + 100) + b'"\n'
+    client = FakeClient(exports=[ExportBody(body, "")])
+    path = tmp_path / "large.csv"
+    result = run(client, "subtitle-export", "gpu", "--subtitles", "-o", str(path), "--raw")
+    assert result.exit_code == 0, result.output
+    assert path.read_bytes() == body
+    assert csv.field_size_limit() == original_limit
+
+
+def test_find_channel_json_export_preserves_each_page_envelope(run, tmp_path):
+    pages = [
+        {"result": [{"channelid": channel_id}], "page": page, "perpagecount": 2, "maxresults": 10000}
+        for page, channel_id in [(7, "UCfirst"), (8, "UCsecond")]
+    ]
+    pages[1]["result"][0]["name"] = "\ud800"
+    client = FakeClient(exports=[ExportBody(json.dumps(page).encode(), "") for page in pages])
+    path = tmp_path / "channels.json"
+    result = run(client, "find-channels", "--page", "7", "--pages", "2", "--per-page", "2", "-o", str(path), "--raw")
+    assert result.exit_code == 0, result.output
+    merged = json.loads(path.read_bytes())
+    assert merged["result"] == [{"channelid": "UCfirst"}, {"channelid": "UCsecond", "name": "\ud800"}]
+    assert merged["pages"] == [
+        {"page": 7, "perpagecount": 2, "maxresults": 10000},
+        {"page": 8, "perpagecount": 2, "maxresults": 10000},
+    ]
+    assert "page" not in merged and "perpagecount" not in merged
+    assert json.loads(result.stdout)["next_page"] == 9
+
+
+def test_duplicate_zip_metadata_is_a_typed_partial_without_replacing_prior_pages(run, tmp_path):
+    duplicate = io.BytesIO()
+    with zipfile.ZipFile(duplicate, "w") as archive:
+        archive.writestr("metadata.jsonl", '{"id":"b"}\n')
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr("metadata.jsonl", '{"id":"c"}\n')
+    first = zip_body("a")
+    client = FakeClient(exports=[first, ExportBody(duplicate.getvalue(), "application/zip")])
+    path = tmp_path / "partial.zip"
+    result = run(client, "subtitle-export", "gpu", "--pages", "2", "--per-page", "1", "-o", str(path), "--raw")
+    assert result.exit_code == 0, result.output
+    assert path.read_bytes() == first.content
+    summary = json.loads(result.stdout)
+    assert summary["rows"] == 1 and summary["next_page"] == 2
+    assert summary["_filmot"]["status"] == "partial"
+    assert summary["_filmot"]["errors"][0]["type"] == "ExportFormatError"
